@@ -7,13 +7,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 from telegram import Chat, Message, ReactionTypeEmoji, Update, User
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, JobQueue
 
 import main
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.user import User as BotUser
+from reaction_delivery import DeliverySettings, ReactionDelivery
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,14 +41,16 @@ class ScheduledJob:
 
 @dataclass(slots=True)
 class BotRecorder:
-    should_fail_reaction: bool = False
+    reaction_error: TelegramError | None = None
     reaction_calls: list[ReactionCall] = field(default_factory=list)
     send_message_calls: list[SendMessageCall] = field(default_factory=list)
 
-    async def set_message_reaction(self, *, chat_id: int, message_id: int, reaction: ReactionTypeEmoji) -> bool:
+    async def set_message_reaction(
+        self, *, chat_id: int, message_id: int, reaction: ReactionTypeEmoji, read_timeout: float
+    ) -> bool:
         self.reaction_calls.append(ReactionCall(chat_id=chat_id, message_id=message_id, reaction=reaction))
-        if self.should_fail_reaction:
-            raise TelegramError('reactions are unavailable')
+        if self.reaction_error is not None:
+            raise self.reaction_error
         return True
 
     async def send_message(self, *, chat_id: int, text: str, reply_to_message_id: int) -> Message:
@@ -102,17 +105,23 @@ def make_update(text: str = 'Framed #42\n🎥 🟥 🟩 ⬛ ⬛ ⬛ ⬛\n\nhttps
     return Update(update_id=1, message=message)
 
 
-def make_context(monkeypatch: pytest.MonkeyPatch, *, fail_reaction: bool = False) -> RecordedContext:
-    application = ApplicationBuilder().token('123:ABC').build()
+def make_context(monkeypatch: pytest.MonkeyPatch, *, reaction_error: TelegramError | None = None) -> RecordedContext:
+    application = ApplicationBuilder().application_class(main.ReactionApplication).token('123:ABC').build()
+    assert isinstance(application, main.ReactionApplication)
+    application.reaction_delivery = ReactionDelivery(
+        application.bot, DeliverySettings(chat_gap=0, retry_base=0), jitter=lambda: 0
+    )
     context = ContextTypes.DEFAULT_TYPE(application)
-    bot = BotRecorder(should_fail_reaction=fail_reaction)
+    bot = BotRecorder(reaction_error=reaction_error)
     job_queue = JobQueueRecorder()
     assert context.job_queue is not None
 
     async def set_message_reaction(
-        _bot: ExtBot[None], *, chat_id: int, message_id: int, reaction: ReactionTypeEmoji
+        _bot: ExtBot[None], *, chat_id: int, message_id: int, reaction: ReactionTypeEmoji, read_timeout: float
     ) -> bool:
-        return await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=reaction)
+        return await bot.set_message_reaction(
+            chat_id=chat_id, message_id=message_id, reaction=reaction, read_timeout=read_timeout
+        )
 
     async def send_message(_bot: ExtBot[None], *, chat_id: int, text: str, reply_to_message_id: int) -> Message:
         return await bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
@@ -131,6 +140,12 @@ def make_context(monkeypatch: pytest.MonkeyPatch, *, fail_reaction: bool = False
     monkeypatch.setattr(type(context.bot), 'send_message', send_message)
     monkeypatch.setattr(type(context.job_queue), 'run_once', run_once)
     return RecordedContext(context=context, bot=bot, job_queue=job_queue)
+
+
+async def finish_delivery(test_context: RecordedContext) -> None:
+    delivery = main.reaction_delivery_for(test_context.context.application)
+    await delivery.wait_idle()
+    await delivery.stop()
 
 
 def make_result_model(saved: bool):
@@ -154,6 +169,7 @@ async def test_save_results_uses_saved_reaction_when_saved(monkeypatch: pytest.M
     monkeypatch.setattr(BotUser, 'update_from_tg_user', update_from_user)
 
     await main.save_results(update, test_context.context, main.framed_pattern, result_model)
+    await finish_delivery(test_context)
 
     update_from_user.assert_awaited_once_with(update.effective_user)
     assert result_model.calls == [(99, 42, True, 2)]
@@ -175,6 +191,7 @@ async def test_save_results_uses_trophy_reaction_when_saved_on_first_frame(
     monkeypatch.setattr(BotUser, 'update_from_tg_user', update_from_user)
 
     await main.save_results(update, test_context.context, main.framed_pattern, result_model)
+    await finish_delivery(test_context)
 
     assert result_model.calls == [(99, 42, True, 1)]
     assert test_context.bot.reaction_calls == [
@@ -193,6 +210,7 @@ async def test_save_results_uses_duplicate_reaction_when_duplicate(monkeypatch: 
     monkeypatch.setattr(BotUser, 'update_from_tg_user', update_from_user)
 
     await main.save_results(update, test_context.context, main.framed_pattern, result_model)
+    await finish_delivery(test_context)
 
     assert result_model.calls == [(99, 42, True, 2)]
     assert test_context.bot.reaction_calls == [
@@ -202,28 +220,52 @@ async def test_save_results_uses_duplicate_reaction_when_duplicate(monkeypatch: 
     assert test_context.job_queue.calls == []
 
 
+@pytest.mark.parametrize('game', ['framed', 'episode'])
+@pytest.mark.parametrize(
+    ('saved', 'win_frame', 'reaction'),
+    [
+        (True, 2, main.saved_result_reaction),
+        (True, 1, main.first_frame_saved_result_reaction),
+        (False, 2, main.duplicate_result_reaction),
+    ],
+    ids=['saved', 'first-frame', 'duplicate'],
+)
+@pytest.mark.parametrize(
+    'reaction_error',
+    [None, TelegramError('reactions are unavailable'), TimedOut(), NetworkError('connection failed')],
+    ids=['reaction-succeeds', 'reaction-fails', 'reaction-times-out', 'reaction-network-error'],
+)
 @pytest.mark.asyncio
-async def test_save_results_falls_back_to_reply_when_reaction_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    update = make_update()
-    test_context = make_context(monkeypatch, fail_reaction=True)
-    result_model = make_result_model(True)
+async def test_save_results_uses_only_reactions_for_acknowledgment(
+    monkeypatch: pytest.MonkeyPatch,
+    game: str,
+    saved: bool,
+    win_frame: int,
+    reaction: ReactionTypeEmoji,
+    reaction_error: TelegramError | None,
+) -> None:
+    if game == 'framed':
+        title, icon, frame_count, pattern = 'Framed', '🎥', 6, main.framed_pattern
+    else:
+        title, icon, frame_count, pattern = 'Episode', '📺', 10, main.episode_pattern
+    frames = ['🟥'] * (win_frame - 1) + ['🟩'] + ['⬛'] * (frame_count - win_frame)
+    update = make_update(f'{title} #42\n{icon} {" ".join(frames)}\n\nhttps://{game}.wtf')
+    test_context = make_context(monkeypatch, reaction_error=reaction_error)
+    result_model = make_result_model(saved)
     update_from_user = AsyncMock()
     monkeypatch.setattr(BotUser, 'update_from_tg_user', update_from_user)
 
-    await main.save_results(update, test_context.context, main.framed_pattern, result_model)
+    await main.save_results(update, test_context.context, pattern, result_model)
+    await finish_delivery(test_context)
 
-    assert test_context.bot.reaction_calls == [
-        ReactionCall(chat_id=123, message_id=456, reaction=main.saved_result_reaction)
-    ]
-    assert test_context.bot.send_message_calls == [
-        SendMessageCall(chat_id=123, text='Спасибо, записал', reply_to_message_id=456)
-    ]
-    assert len(test_context.job_queue.calls) == 1
-    job = test_context.job_queue.calls[0]
-    assert job.callback is main.delete_message_task
-    assert job.when == timedelta(seconds=30)
-    assert job.data == 777
-    assert job.chat_id == 123
+    assert result_model.calls == [(99, 42, True, win_frame)]
+    expected_attempts = 3 if isinstance(reaction_error, NetworkError) else 1
+    assert (
+        test_context.bot.reaction_calls
+        == [ReactionCall(chat_id=123, message_id=456, reaction=reaction)] * expected_attempts
+    )
+    assert test_context.bot.send_message_calls == []
+    assert test_context.job_queue.calls == []
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import Float, ForeignKey, Integer, Select, case, cast, desc, func, text
+from sqlalchemy import Float, ForeignKey, Integer, Select, UniqueConstraint, case, cast, desc, func, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import AsyncScopedSession, Base
@@ -9,6 +10,8 @@ from .user import User
 
 class FramedResult(Base):
     __tablename__ = 'framed_result'
+    # Legacy imports need deduplication and a constraint migration; create_all does not migrate tables.
+    __table_args__ = (UniqueConstraint('user_id', 'framed_round'),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('user.id'), index=True)
@@ -22,15 +25,14 @@ class FramedResult(Base):
     async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool:
         async with AsyncScopedSession() as session:
             result = await session.execute(
-                Select(FramedResult).filter(FramedResult.user_id == user_id, FramedResult.framed_round == framed_round)
+                insert(FramedResult)
+                .values(user_id=user_id, framed_round=framed_round, won=won, win_frame=win_frame)
+                .on_conflict_do_nothing(index_elements=[FramedResult.user_id, FramedResult.framed_round])
+                .returning(FramedResult.id)
             )
-            framed_result = result.first()
-            if framed_result:
-                return False
-            framed_result = FramedResult(user_id=user_id, framed_round=framed_round, won=won, win_frame=win_frame)
-            session.add(framed_result)
+            saved = result.scalar_one_or_none() is not None
             await session.commit()
-            return True
+            return saved
 
     @staticmethod
     async def top_score():

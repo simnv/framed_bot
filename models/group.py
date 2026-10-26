@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import Select
+from sqlalchemy import Select, delete
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import BigInteger
 from telegram import Chat as TgChat
@@ -17,12 +18,12 @@ class Group(Base):
     @staticmethod
     async def update_from_tg_chat(tg_chat: TgChat) -> None:
         async with AsyncScopedSession() as session:
-            result = await session.execute(Select(Group).filter(Group.id == tg_chat.id))
-            group = result.scalars().first()
-            if not group:
-                group = Group(id=tg_chat.id)
-            group.title = tg_chat.title or ''
-            session.add(group)
+            statement = insert(Group).values(id=tg_chat.id, title=tg_chat.title or '')
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[Group.id], set_={'title': statement.excluded.title},
+                )
+            )
             await session.commit()
 
     @staticmethod
@@ -36,3 +37,9 @@ class Group(Base):
         async with AsyncScopedSession() as session:
             result = await session.execute(Select(Group))
             return list(result.scalars().all())
+
+    @staticmethod
+    async def remove(group_id: int) -> None:
+        async with AsyncScopedSession() as session:
+            await session.execute(delete(Group).where(Group.id == group_id))
+            await session.commit()

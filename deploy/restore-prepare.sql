@@ -1,0 +1,9 @@
+-- Run as bootstrap in an already-created disposable restore database only.
+REVOKE ALL ON DATABASE :"checkdb" FROM PUBLIC;
+GRANT CONNECT ON DATABASE :"checkdb" TO framed, framed_backup;
+ALTER SCHEMA public OWNER TO framed;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO framed_backup;
+ALTER DEFAULT PRIVILEGES FOR ROLE framed IN SCHEMA public GRANT SELECT ON TABLES TO framed_backup;
+ALTER DEFAULT PRIVILEGES FOR ROLE framed IN SCHEMA public GRANT SELECT ON SEQUENCES TO framed_backup;
+ALTER DEFAULT PRIVILEGES FOR ROLE framed REVOKE EXECUTE ON ROUTINES FROM PUBLIC;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, Select
+from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import AsyncScopedSession, Base
@@ -8,6 +9,8 @@ from .db import AsyncScopedSession, Base
 
 class EpisodeResult(Base):
     __tablename__ = 'episode_result'
+    # Legacy imports need deduplication and a constraint migration; create_all does not migrate tables.
+    __table_args__ = (UniqueConstraint('user_id', 'framed_round'),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('user.id'), index=True)
@@ -21,14 +24,11 @@ class EpisodeResult(Base):
     async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool:
         async with AsyncScopedSession() as session:
             result = await session.execute(
-                Select(EpisodeResult).filter(
-                    EpisodeResult.user_id == user_id, EpisodeResult.framed_round == framed_round
-                )
+                insert(EpisodeResult)
+                .values(user_id=user_id, framed_round=framed_round, won=won, win_frame=win_frame)
+                .on_conflict_do_nothing(index_elements=[EpisodeResult.user_id, EpisodeResult.framed_round])
+                .returning(EpisodeResult.id)
             )
-            framed_result = result.first()
-            if framed_result:
-                return False
-            framed_result = EpisodeResult(user_id=user_id, framed_round=framed_round, won=won, win_frame=win_frame)
-            session.add(framed_result)
+            saved = result.scalar_one_or_none() is not None
             await session.commit()
-            return True
+            return saved

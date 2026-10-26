@@ -1,9 +1,20 @@
+# ruff: noqa: E402
+# Configure redaction before importing configuration, models, or Telegram.
+import asyncio
 import json
 import logging
 import re
 from datetime import timedelta
 from enum import IntEnum
 from typing import Protocol
+
+from safe_logging import configure_logging
+
+configure_logging()
+
+from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, DB_CONNECTION_STRING
+
+configure_logging((BOT_TOKEN, DB_CONNECTION_STRING))
 
 from tabulate import tabulate
 from telegram import (
@@ -17,7 +28,7 @@ from telegram import (
     Message as TelegramMessage,
 )
 from telegram.constants import ReactionEmoji
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -33,19 +44,53 @@ from telegram.ext import (
 )
 from telegram.ext.filters import Message, MessageFilter
 
-from config import ADMIN_USER_ID, BOT_TOKEN
 from models import FramedResult, User, init_db
 from models.episode_result import EpisodeResult
 from models.group import Group
-from stats import Stats, count_stats
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+from reaction_delivery import ReactionDelivery, ReactionIntent
+from stats import Stats, get_user_stats
 
 framed_pattern = r'Framed #(?P<round>[\d]+)\n🎥(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){6})\n\nhttps:\/\/framed\.wtf'
 episode_pattern = r'Episode #(?P<round>[\d]+)\n📺(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){10})\n\nhttps:\/\/episode\.wtf'
-saved_result_reaction = ReactionTypeEmoji(ReactionEmoji.THUMBS_UP)
+saved_result_reaction = ReactionTypeEmoji(ReactionEmoji.WRITING_HAND)
 first_frame_saved_result_reaction = ReactionTypeEmoji(ReactionEmoji.TROPHY)
-duplicate_result_reaction = ReactionTypeEmoji(ReactionEmoji.THUMBS_DOWN)
+duplicate_result_reaction = ReactionTypeEmoji(ReactionEmoji.GHOST)
+
+
+class ReactionApplication(
+    Application[
+        ExtBot[None],
+        ContextTypes.DEFAULT_TYPE,
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        JobQueue[ContextTypes.DEFAULT_TYPE],
+    ]
+):
+    """Ephemeral delivery state is excluded from PicklePersistence's bot_data."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reaction_delivery = ReactionDelivery(self.bot)
+
+    async def stop(self) -> None:
+        if not self.running:
+            await super().stop()
+            return
+        # PTB.stop waits for queued handlers before post_stop. Release admission
+        # backpressure now and begin the drain deadline before that wait.
+        self.reaction_delivery.close_admissions()
+        draining = asyncio.create_task(self.reaction_delivery.stop(), name='reaction-drain')
+        try:
+            await super().stop()
+        finally:
+            await draining
+
+
+def reaction_delivery_for(application: object) -> ReactionDelivery:
+    if not isinstance(application, ReactionApplication):
+        raise TypeError('ReactionApplication is required for result delivery')
+    return application.reaction_delivery
 
 
 def saved_reaction_for(win_frame: int | None) -> ReactionTypeEmoji:
@@ -118,6 +163,12 @@ async def save_results(
     if effective_user is None or effective_chat is None or message is None or message.text is None:
         return
 
+    delivery = reaction_delivery_for(context.application)
+    existing = delivery.known_intent(effective_chat.id, message.id)
+    if existing is not None:
+        await delivery.submit(existing)
+        return
+
     await User.update_from_tg_user(effective_user)
     result = re.search(pattern, message.text)
     if result is None:
@@ -132,33 +183,7 @@ async def save_results(
 
     reaction = saved_reaction_for(data_win_frame) if saved else duplicate_result_reaction
 
-    try:
-        await context.bot.set_message_reaction(
-            chat_id=effective_chat.id,
-            message_id=message.id,
-            reaction=reaction,
-        )
-        return
-    except TelegramError:
-        logging.warning('Не удалось проставить реакцию, откатываюсь к сообщению-ответу', exc_info=True)
-
-    job_queue = context.job_queue
-
-    if saved:
-        reply_message = await context.bot.send_message(
-            chat_id=effective_chat.id,
-            text='Спасибо, записал',
-            reply_to_message_id=message.id,
-        )
-    else:
-        reply_message = await context.bot.send_message(
-            chat_id=effective_chat.id,
-            text='Твои результаты на этот раунд у меня уже есть',
-            reply_to_message_id=message.id,
-        )
-
-    if job_queue is not None:
-        job_queue.run_once(delete_message_task, timedelta(seconds=30), reply_message.id, chat_id=effective_chat.id)
+    await delivery.submit(ReactionIntent(effective_chat.id, message.id, reaction.emoji))
 
 
 async def new_framed_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -215,14 +240,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if effective_user is None or effective_chat is None or message is None:
         return
 
-    user = await User.get(effective_user.id)
+    user_stats = await get_user_stats(effective_user.id)
 
-    if not user:
+    if user_stats is None:
         await context.bot.send_message(chat_id=effective_chat.id, text='Я тебя не знаю', reply_to_message_id=message.id)
         return
 
-    framed_stats = await count_stats(user.framed_results)
-    episode_stats = await count_stats(user.episode_results)
+    framed_stats, episode_stats = user_stats
 
     text = await generate_stats_text(framed_stats, episode_stats)
 
@@ -253,7 +277,34 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     groups = await Group.get_all()
     for group in groups:
-        await context.bot.send_message(chat_id=group.id, text=announcement_text)
+        for attempt in range(3):
+            try:
+                await context.bot.send_message(chat_id=group.id, text=announcement_text)
+                break
+            except Forbidden:
+                await Group.remove(group.id)
+                logging.info('Removed unavailable announcement recipient %s', group.id)
+                break
+            except BadRequest as error:
+                if str(error).lower() in ('chat not found', 'group chat was deactivated'):
+                    await Group.remove(group.id)
+                logging.warning('Announcement rejected for recipient %s', group.id)
+                break
+            except RetryAfter as error:
+                delay = error.retry_after
+                seconds = delay.total_seconds() if isinstance(delay, timedelta) else delay
+                if attempt == 2 or seconds > 5:
+                    logging.warning('Announcement rate limit exceeded for recipient %s', group.id)
+                    break
+                await asyncio.sleep(seconds)
+            except NetworkError:
+                if attempt == 2:
+                    logging.warning('Announcement network retries exhausted for recipient %s', group.id)
+                    break
+                await asyncio.sleep(attempt + 1)
+            except TelegramError:
+                logging.warning('Announcement failed for recipient %s', group.id)
+                break
 
 
 def top_reply_markup(top_type: TopType):
@@ -353,17 +404,27 @@ async def initialize_database(
     ],
 ) -> None:
     await init_db()
+    reaction_delivery_for(_application).start()
 
 
-if __name__ == '__main__':
+async def stop_reaction_delivery(application: object) -> None:
+    await reaction_delivery_for(application).stop()
+
+
+def build_application() -> ReactionApplication:
     application = (
         ApplicationBuilder()
+        .application_class(ReactionApplication)
         .token(BOT_TOKEN)
         .rate_limiter(AIORateLimiter())
-        .persistence(PicklePersistence('bot_data'))
+        .update_queue(asyncio.Queue(maxsize=100))
+        .persistence(PicklePersistence(BOT_DATA_PATH))
         .post_init(initialize_database)
+        .post_stop(stop_reaction_delivery)
         .build()
     )
+    if not isinstance(application, ReactionApplication):
+        raise TypeError('ApplicationBuilder did not create ReactionApplication')
 
     start_handler = CommandHandler('start', start, block=False)
     application.add_handler(start_handler)
@@ -373,13 +434,13 @@ if __name__ == '__main__':
     )
     application.add_handler(announce_handler)
 
-    chat_update_handler = MessageHandler(filters.ChatType.GROUPS, update_chat_data, block=False)
+    chat_update_handler = MessageHandler(filters.ChatType.GROUPS, update_chat_data, block=True)
     application.add_handler(chat_update_handler, -1)
 
-    framed_data_handler = MessageHandler(filters.ChatType.GROUPS & FRAMED_FILTER, new_framed_data, block=False)
+    framed_data_handler = MessageHandler(filters.ChatType.GROUPS & FRAMED_FILTER, new_framed_data, block=True)
     application.add_handler(framed_data_handler)
 
-    episode_data_handler = MessageHandler(filters.ChatType.GROUPS & EPISODE_FILTER, new_episode_data, block=False)
+    episode_data_handler = MessageHandler(filters.ChatType.GROUPS & EPISODE_FILTER, new_episode_data, block=True)
     application.add_handler(episode_data_handler)
 
     stats_handler = CommandHandler('stats', stats, block=False)
@@ -391,4 +452,8 @@ if __name__ == '__main__':
     inline_top_handler = CallbackQueryHandler(inline_top, pattern=r'^{"top": [\d]+}$', block=False)
     application.add_handler(inline_top_handler)
 
-    application.run_polling()
+    return application
+
+
+if __name__ == '__main__':
+    build_application().run_polling()

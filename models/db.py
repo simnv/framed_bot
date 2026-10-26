@@ -6,7 +6,8 @@ from sqlalchemy.orm import DeclarativeBase
 from config import DB_CONNECTION_STRING
 
 engine = create_async_engine(
-    DB_CONNECTION_STRING
+    DB_CONNECTION_STRING,
+    pool_pre_ping=True,
 )
 
 

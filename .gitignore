@@ -13,3 +13,9 @@ bot_data
 .env
 .idea/
 .omo/
+.env.*
+!.env.example
+.secrets/
+.deploy/
+*.dump
+/docs/

@@ -1,0 +1,137 @@
+version: '3.8'
+x-service: &service
+  replicas: 1
+  placement:
+    constraints: ["node.hostname == ${FRAMED_NODE_HOSTNAME:?set target node hostname}"]
+  restart_policy:
+    condition: any
+    delay: 5s
+  update_config:
+    parallelism: 1
+    order: stop-first
+    failure_action: rollback
+  rollback_config:
+    parallelism: 1
+    order: stop-first
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: '3'
+services:
+  bot:
+    image: ${FRAMED_IMAGE:?set release image}
+    environment:
+      BOT_TOKEN_FILE: /run/secrets/bot_token
+      DB_CONNECTION_STRING_FILE: /run/secrets/db_url
+      ADMIN_USER_ID: ${ADMIN_USER_ID:?set admin id}
+      BOT_DATA_PATH: /data/bot_data
+    secrets:
+      - source: bot_token
+        target: bot_token
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: db_url
+        target: db_url
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+    volumes: [botdata:/data]
+    networks: [private]
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD, python, healthcheck.py]
+      interval: 30s
+      timeout: 12s
+      start_period: 90s
+      retries: 3
+    logging: *logging
+    deploy:
+      <<: *service
+      resources:
+        limits: {cpus: '0.5', memory: 256M}
+        reservations: {memory: 64M}
+  db:
+    image: postgres:18.6-trixie
+    environment:
+      POSTGRES_DB: framed
+      POSTGRES_USER: framed_bootstrap
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=trust
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_bootstrap_password
+    secrets:
+      - {source: pg_bootstrap_password, target: pg_bootstrap_password, uid: '999', gid: '999', mode: 0400}
+      - {source: pg_password, target: pg_password, uid: '999', gid: '999', mode: 0400}
+      - {source: pg_backup_password, target: pg_backup_password, uid: '999', gid: '999', mode: 0400}
+    configs:
+      - {source: init_db, target: /docker-entrypoint-initdb.d/10-framed-roles.sh, mode: 0555}
+      - {source: db_health, target: /db-health.sh, mode: 0555}
+      - {source: role_policy, target: /role-policy.sql, mode: 0444}
+    volumes: [pgdata:/var/lib/postgresql]
+    networks: [private]
+    stop_grace_period: 60s
+    healthcheck:
+      test: [CMD, /bin/sh, /db-health.sh]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging: *logging
+    deploy:
+      <<: *service
+      resources:
+        limits: {cpus: '1.0', memory: 512M}
+        reservations: {memory: 128M}
+  backup:
+    image: postgres:18.6-trixie
+    entrypoint: [/bin/sh, /backup.sh]
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_backup_password
+    secrets:
+      - {source: pg_backup_password, target: pg_backup_password, mode: 0400}
+    configs:
+      - {source: role_policy, target: /role-policy.sql, mode: 0444}
+      - source: backup_script
+        target: /backup.sh
+        mode: 0444
+    volumes: [backups:/backups]
+    networks: [private]
+    stop_grace_period: 30s
+    healthcheck:
+      test: [CMD, /bin/sh, /backup.sh, health]
+      interval: 60s
+      timeout: 5s
+      start_period: 10m
+      retries: 3
+    logging: *logging
+    deploy:
+      <<: *service
+      resources:
+        limits: {cpus: '0.5', memory: 256M}
+        reservations: {memory: 32M}
+networks:
+  private:
+    driver: overlay
+volumes:
+  pgdata: {external: true, name: framed_pgdata}
+  botdata: {external: true, name: framed_botdata}
+  backups: {external: true, name: framed_backups}
+secrets:
+  bot_token: {external: true, name: framed_bot_token_v1}
+  db_url: {external: true, name: framed_db_url_v1}
+  pg_password: {external: true, name: framed_pg_password_v1}
+  pg_bootstrap_password: {external: true, name: framed_pg_bootstrap_password_v1}
+  pg_backup_password: {external: true, name: framed_pg_backup_password_v1}
+configs:
+  role_policy:
+    file: ./role-policy.sql
+    name: framed_role_policy_${FRAMED_RELEASE:?set release}
+  init_db:
+    file: ./init-db.sh
+    name: framed_init_db_${FRAMED_RELEASE:?set release}
+  db_health:
+    file: ./db-health.sh
+    name: framed_db_health_${FRAMED_RELEASE:?set release}
+  backup_script:
+    file: ./backup.sh
+    name: framed_backup_${FRAMED_RELEASE:?set release}

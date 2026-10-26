@@ -1,24 +1,13 @@
-FROM python:3.14-slim
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_COMPILE_BYTECODE=1 \
-    UV_NO_CACHE=1 \
-    UV_PYTHON_DOWNLOADS=0 \
-    PATH="/app/.venv/bin:$PATH"
-
+FROM ghcr.io/astral-sh/uv:0.13.5 AS uv
+FROM python:3.14.9-slim-trixie
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 UV_NO_CACHE=1 UV_PYTHON_DOWNLOADS=0 PATH="/app/.venv/bin:$PATH"
 WORKDIR /app
-
-RUN addgroup --system bot && adduser --system --ingroup bot bot
-
-COPY --from=ghcr.io/astral-sh/uv:0.11.25 /uv /uvx /bin/
-
+RUN groupadd --gid 10001 bot && useradd --uid 10001 --gid 10001 --no-create-home bot && mkdir /data && chown 10001:10001 /data
+COPY --from=uv /uv /bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
-
-COPY . .
-
-RUN chown -R bot:bot /app
-USER bot
-
-CMD ["python", "main.py"]
+COPY config.py main.py reaction_delivery.py safe_logging.py stats.py ./
+COPY models/ ./models/
+COPY deploy/healthcheck.py deploy/start-bot.py deploy/role-policy.sql ./
+USER 10001:10001
+CMD ["python", "start-bot.py"]

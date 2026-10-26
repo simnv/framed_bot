@@ -4,17 +4,17 @@ version = "0.1.0"
 description = "Telegram bot for tracking Framed game results"
 requires-python = ">=3.14"
 dependencies = [
-    "asyncpg>=0.31.0",
-    "python-telegram-bot[job-queue,rate-limiter]>=22.5",
-    "sqlalchemy[asyncio]>=2.0.45",
-    "tabulate>=0.9.0",
+    "asyncpg>=0.32.0",
+    "python-telegram-bot[job-queue,rate-limiter]>=22.8",
+    "sqlalchemy[asyncio]>=2.1.6",
+    "tabulate>=0.10.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "ty>=0.0.18",
+    "pytest-asyncio>=1.4.1",
+    "ty>=0.0.92",
 ]
 
 [tool.uv]

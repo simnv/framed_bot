@@ -1,0 +1,22 @@
+SET search_path = pg_catalog;
+SELECT
+ (SELECT count(*) = 2 FROM pg_roles WHERE rolname IN ('framed','framed_backup') AND rolcanlogin AND NOT (rolsuper OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls))
+ AND NOT EXISTS (SELECT FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.member WHERE r.rolname IN ('framed','framed_backup'))
+ AND (SELECT pg_get_userbyid(datdba)='framed_bootstrap' FROM pg_database WHERE datname=current_database())
+ AND (SELECT pg_get_userbyid(nspowner)='framed' FROM pg_namespace WHERE nspname='public')
+ AND has_database_privilege('framed','framed','CONNECT')
+ AND has_database_privilege('framed_backup','framed','CONNECT')
+ AND NOT has_database_privilege('framed','framed','CREATE,TEMP')
+ AND NOT has_database_privilege('framed_backup','framed','CREATE,TEMP')
+ AND NOT has_database_privilege('framed','postgres','CONNECT,TEMP')
+ AND NOT has_database_privilege('framed_backup','postgres','CONNECT,TEMP')
+ AND NOT has_database_privilege('framed','template1','CONNECT,TEMP')
+ AND NOT has_database_privilege('framed_backup','template1','CONNECT,TEMP')
+ AND has_schema_privilege('framed','public','USAGE,CREATE')
+ AND has_schema_privilege('framed_backup','public','USAGE')
+ AND NOT has_schema_privilege('framed_backup','public','CREATE')
+ AND NOT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN ('r','p','v','m','f') AND (c.relowner <> 'framed'::regrole OR NOT has_table_privilege('framed_backup',c.oid,'SELECT') OR has_table_privilege('framed_backup',c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')))
+ AND NOT EXISTS (SELECT FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind='S' AND (c.relowner <> 'framed'::regrole OR NOT has_sequence_privilege('framed_backup',c.oid,'SELECT') OR has_sequence_privilege('framed_backup',c.oid,'USAGE,UPDATE')))
+ AND (SELECT count(DISTINCT d.defaclobjtype)=2 FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole='framed'::regrole AND d.defaclnamespace='public'::regnamespace AND d.defaclobjtype IN ('r','S') AND a.grantee='framed_backup'::regrole AND a.privilege_type='SELECT')
+ AND NOT EXISTS (SELECT FROM pg_default_acl d CROSS JOIN LATERAL aclexplode(d.defaclacl) a WHERE d.defaclrole='framed'::regrole AND d.defaclnamespace='public'::regnamespace AND d.defaclobjtype IN ('r','S') AND a.grantee='framed_backup'::regrole AND a.privilege_type <> 'SELECT')
+ AND EXISTS (SELECT FROM pg_default_acl d WHERE d.defaclrole='framed'::regrole AND d.defaclnamespace=0 AND d.defaclobjtype='f' AND NOT EXISTS (SELECT FROM aclexplode(d.defaclacl) a WHERE a.grantee=0 AND a.privilege_type='EXECUTE'));

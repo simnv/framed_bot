@@ -16,3 +16,11 @@ bot_data
 *.sqlite
 *.sqlite3
 .env
+.env.*
+.secrets/
+.deploy/
+deploy/REVIEW.md
+*.tar
+*.tar.gz
+*.dump
+/docs/
