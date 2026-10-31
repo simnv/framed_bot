@@ -9,3 +9,7 @@ os.environ['DB_CONNECTION_STRING'] = 'postgresql+asyncpg://placeholder:placehold
 os.environ['ADMIN_USER_ID'] = '1'
 os.environ.pop('BOT_TOKEN_FILE', None)
 os.environ.pop('DB_CONNECTION_STRING_FILE', None)
+
+# Tests never use a real TMDB token from the developer shell.
+os.environ.pop('TMDB_API_KEY', None)
+os.environ.pop('TMDB_API_KEY_FILE', None)

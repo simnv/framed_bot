@@ -20,7 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_config(monkeypatch: pytest.MonkeyPatch):
-    for name in ('BOT_TOKEN', 'BOT_TOKEN_FILE', 'DB_CONNECTION_STRING', 'DB_CONNECTION_STRING_FILE', 'BOT_DATA_PATH'):
+    for name in (
+        'BOT_TOKEN', 'BOT_TOKEN_FILE', 'DB_CONNECTION_STRING', 'DB_CONNECTION_STRING_FILE', 'BOT_DATA_PATH',
+        'TMDB_API_KEY', 'TMDB_API_KEY_FILE',
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('ADMIN_USER_ID', '1')
     return lambda: runpy.run_path(str(ROOT / 'config.py'))
@@ -50,6 +53,36 @@ def test_existing_environment_and_default_data_path(monkeypatch, tmp_path):
     config = load()
     assert config['BOT_TOKEN'] == 'placeholder-env-secret'
     assert config['BOT_DATA_PATH'] == 'bot_data'
+
+
+def test_tmdb_key_is_optional(monkeypatch):
+    load = load_config(monkeypatch)
+    monkeypatch.setenv('BOT_TOKEN', 'placeholder-bot-secret')
+    monkeypatch.setenv('DB_CONNECTION_STRING', 'postgresql+asyncpg://placeholder@localhost/test')
+    assert load()['TMDB_API_KEY'] is None
+    monkeypatch.setenv('TMDB_API_KEY', 'placeholder-tmdb-secret')
+    assert load()['TMDB_API_KEY'] == 'placeholder-tmdb-secret'
+
+
+def test_tmdb_key_from_secret_file(monkeypatch, tmp_path):
+    load = load_config(monkeypatch)
+    monkeypatch.setenv('BOT_TOKEN', 'placeholder-bot-secret')
+    monkeypatch.setenv('DB_CONNECTION_STRING', 'postgresql+asyncpg://placeholder@localhost/test')
+    secret = tmp_path / 'tmdb_token'
+    secret.write_text('placeholder-tmdb-file-secret\n')
+    monkeypatch.setenv('TMDB_API_KEY_FILE', str(secret))
+    assert load()['TMDB_API_KEY'] == 'placeholder-tmdb-file-secret'
+
+
+def test_unreadable_tmdb_secret_file_has_safe_error(monkeypatch, tmp_path):
+    load = load_config(monkeypatch)
+    monkeypatch.setenv('BOT_TOKEN', 'placeholder-bot-secret')
+    monkeypatch.setenv('DB_CONNECTION_STRING', 'postgresql+asyncpg://placeholder@localhost/test')
+    monkeypatch.setenv('TMDB_API_KEY_FILE', str(tmp_path / 'placeholder-private-filename'))
+    with pytest.raises(RuntimeError) as error:
+        load()
+    assert 'TMDB_API_KEY_FILE' in str(error.value)
+    assert 'placeholder-private-filename' not in str(error.value)
 
 
 @pytest.mark.parametrize('content', ['', '\n'])
@@ -132,6 +165,23 @@ def test_uncaught_exception_is_redacted():
     leaked = marker in result.stderr
     assert not leaked
     assert 'Error' in result.stderr
+
+
+def test_tmdb_key_is_redacted_in_logs():
+    marker = 'placeholder-tmdb-credential'
+    env = {key: value for key, value in os.environ.items() if key not in ('TMDB_API_KEY', 'TMDB_API_KEY_FILE')}
+    env.update(
+        TMDB_API_KEY=marker, BOT_TOKEN=os.environ['BOT_TOKEN'], ADMIN_USER_ID='1',
+        DB_CONNECTION_STRING='postgresql+asyncpg://placeholder@localhost/test',
+    )
+    result = subprocess.run(
+        [sys.executable, '-c', 'import logging, main; logging.warning("key %s", main.TMDB_API_KEY)'],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    leaked = marker in result.stderr
+    assert not leaked
+    assert 'key [REDACTED]' in result.stderr
 
 
 @pytest.mark.asyncio

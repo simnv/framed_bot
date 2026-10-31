@@ -8,6 +8,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY config.py main.py reaction_delivery.py rich_tables.py safe_logging.py stats.py ./
 COPY models/ ./models/
+COPY answers/ ./answers/
 COPY deploy/healthcheck.py deploy/start-bot.py deploy/role-policy.sql ./
 USER 10001:10001
 CMD ["python", "start-bot.py"]

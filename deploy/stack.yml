@@ -24,6 +24,7 @@ services:
     environment:
       BOT_TOKEN_FILE: /run/secrets/bot_token
       DB_CONNECTION_STRING_FILE: /run/secrets/db_url
+      TMDB_API_KEY_FILE: /run/secrets/tmdb_token
       ADMIN_USER_ID: ${ADMIN_USER_ID:?set admin id}
       BOT_DATA_PATH: /data/bot_data
     secrets:
@@ -34,6 +35,11 @@ services:
         mode: 0400
       - source: db_url
         target: db_url
+        uid: '10001'
+        gid: '10001'
+        mode: 0400
+      - source: tmdb_token
+        target: tmdb_token
         uid: '10001'
         gid: '10001'
         mode: 0400
@@ -119,6 +125,7 @@ volumes:
 secrets:
   bot_token: {external: true, name: framed_bot_token_v1}
   db_url: {external: true, name: framed_db_url_v1}
+  tmdb_token: {external: true, name: framed_tmdb_token_v1}
   pg_password: {external: true, name: framed_pg_password_v1}
   pg_bootstrap_password: {external: true, name: framed_pg_bootstrap_password_v1}
   pg_backup_password: {external: true, name: framed_pg_backup_password_v1}

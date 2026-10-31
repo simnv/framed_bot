@@ -11,9 +11,9 @@ from safe_logging import configure_logging
 
 configure_logging()
 
-from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, DB_CONNECTION_STRING
+from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, DB_CONNECTION_STRING, TMDB_API_KEY
 
-configure_logging((BOT_TOKEN, DB_CONNECTION_STRING))
+configure_logging((BOT_TOKEN, DB_CONNECTION_STRING, TMDB_API_KEY or ''))
 
 from telegram import (
     InlineKeyboardButton,

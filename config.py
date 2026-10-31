@@ -11,13 +11,21 @@ def _required_env(name: str) -> str:
 
 
 def _required_secret(name: str) -> str:
+    value = _optional_secret(name)
+    if value is None:
+        raise RuntimeError(f'Environment variable {name} or {name}_FILE is required')
+    return value
+
+
+def _optional_secret(name: str) -> str | None:
+    """Read NAME, or the file that NAME_FILE names. Return None when neither is set."""
     value = os.environ.get(name)
     if value:
         return value
     file_name = f'{name}_FILE'
     secret_path = os.environ.get(file_name)
     if not secret_path:
-        raise RuntimeError(f'Environment variable {name} or {file_name} is required')
+        return None
     try:
         value = Path(secret_path).read_text(encoding='utf-8').strip()
     except (OSError, UnicodeError, ValueError):
@@ -38,4 +46,6 @@ def _required_int_env(name: str) -> int:
 BOT_TOKEN: Final = _required_secret('BOT_TOKEN')
 DB_CONNECTION_STRING: Final = _required_secret('DB_CONNECTION_STRING')
 ADMIN_USER_ID: Final = _required_int_env('ADMIN_USER_ID')
+# Optional: without it the bot stores game answers but no TMDB title data.
+TMDB_API_KEY: Final = _optional_secret('TMDB_API_KEY')
 BOT_DATA_PATH: Final = os.environ.get('BOT_DATA_PATH') or 'bot_data'

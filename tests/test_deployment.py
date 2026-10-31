@@ -165,7 +165,7 @@ def test_postgres_backup_restart_and_container_packaging(tmp_path):
 def test_secret_preparation_preserves_and_prevalidates(tmp_path):
     import sys
     script = ROOT / 'deploy/prepare_secrets.py'
-    original = b'BOT_TOKEN=123:synthetic-only\nADMIN_USER_ID=1\nKEEP=value\n'
+    original = b'BOT_TOKEN=123:synthetic-only\nTMDB_API_KEY=synthetic-tmdb-only\nADMIN_USER_ID=1\nKEEP=value\n'
     (tmp_path / '.env').write_bytes(original)
     def prepare():
         return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True)
@@ -174,7 +174,8 @@ def test_secret_preparation_preserves_and_prevalidates(tmp_path):
     snapshot = {p.name: p.read_bytes() for p in secrets.iterdir()}
     env = (tmp_path / '.env').read_bytes()
     assert env.startswith(original)
-    assert len(snapshot) == 5
+    assert len(snapshot) == 6
+    assert snapshot['tmdb_token'] == b'synthetic-tmdb-only'
     assert len({snapshot[name] for name in ('pg_password','pg_backup_password','pg_bootstrap_password')}) == 3
     assert prepare().returncode == 0
     assert {p.name: p.read_bytes() for p in secrets.iterdir()} == snapshot
@@ -194,6 +195,10 @@ def test_secret_preparation_preserves_and_prevalidates(tmp_path):
     assert prepare().returncode != 0
     assert not (secrets / 'pg_backup_password').exists()
     assert (tmp_path / '.env').read_bytes() == original
+
+    # The stack mounts tmdb_token, so production preparation requires the key.
+    (tmp_path / '.env').write_bytes(b'BOT_TOKEN=123:synthetic-only\nADMIN_USER_ID=1\n')
+    assert prepare().returncode != 0
 
 
 def test_nonempty_pgdata_guard(tmp_path):
@@ -215,6 +220,20 @@ def test_stack_role_secret_boundaries():
     assert 'POSTGRES_USER: framed_bootstrap' in stack
     assert 'pg_isready' not in stack
     assert 'docker run --rm -i --mount type=volume,src=framed_pgdata' in (ROOT / 'deploy/start-stack.sh').read_text()
+    assert 'TMDB_API_KEY_FILE: /run/secrets/tmdb_token' in bot
+    assert '      - source: tmdb_token\n' in bot
+    assert 'tmdb_token' not in stack.split('  db:\n', 1)[1].split('\nnetworks:', 1)[0]
+    assert 'tmdb_token: {external: true, name: framed_tmdb_token_v1}' in stack
+    assert 'framed_tmdb_token_v1' in (ROOT / 'deploy/start-stack.sh').read_text()
+    assert "'tmdb_token'" in (ROOT / 'deploy/upload-secrets.py').read_text()
+
+
+def test_release_payload_includes_runtime_packages():
+    import runpy
+    files = runpy.run_path(str(ROOT / 'deploy/prepare_release.py'))['FILES']
+    for name in ('answers/__init__.py', 'models/migrations/env.py', 'models/migrations/versions/0001_baseline.py'):
+        assert name in files
+    assert 'COPY answers/ ./answers/' in (ROOT / 'Dockerfile').read_text()
 
 
 @pytest.mark.skipif(os.environ.get('FRAMED_DEPLOY_TEST') != '1', reason='Opt-in disposable Docker integration')

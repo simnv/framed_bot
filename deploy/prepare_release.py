@@ -13,7 +13,9 @@ FILES = ['Dockerfile', '.dockerignore', 'pyproject.toml', 'uv.lock', 'config.py'
          'deploy/stack.yml', 'deploy/backup.sh', 'deploy/healthcheck.py',
          'deploy/start-bot.py', 'deploy/role-policy.sql', 'deploy/restore-prepare.sql', 'deploy/init-db.sh', 'deploy/db-health.sh', 'deploy/check-empty-pgdata.sh',
          'deploy/preflight.sh', 'deploy/build-native.sh', 'deploy/start-stack.sh', 'deploy/verify.sh']
-FILES += [str(path.relative_to(ROOT)) for path in sorted((ROOT / 'models').glob('*.py'))]
+# Alembic needs models/migrations at startup, so include the package tree.
+FILES += [str(path.relative_to(ROOT)) for path in sorted((ROOT / 'models').rglob('*.py'))]
+FILES += [str(path.relative_to(ROOT)) for path in sorted((ROOT / 'answers').glob('*.py'))]
 
 
 def main():

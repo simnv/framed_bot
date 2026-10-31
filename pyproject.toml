@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "alembic>=1.17",
     "asyncpg>=0.32.0",
+    "httpx>=0.28.1",
     "python-telegram-bot[job-queue,rate-limiter]>=22.8",
     "sqlalchemy[asyncio]>=2.1.6",
 ]

@@ -7,7 +7,7 @@ HOST = os.environ['FRAMED_SSH_TARGET']
 
 
 def main():
-    for item in ('bot_token', 'db_url', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password'):
+    for item in ('bot_token', 'db_url', 'tmdb_token', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password'):
         name = f'framed_{item}_v1'
         # Cannot safely prove an existing secret has the same value: fail on collision.
         result = subprocess.run(

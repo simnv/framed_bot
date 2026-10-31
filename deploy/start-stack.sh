@@ -15,7 +15,7 @@ for name in framed_pgdata framed_botdata framed_backups; do
         }
     fi
 done
-for name in framed_bot_token_v1 framed_db_url_v1 framed_pg_password_v1 framed_pg_bootstrap_password_v1 framed_pg_backup_password_v1; do
+for name in framed_bot_token_v1 framed_db_url_v1 framed_tmdb_token_v1 framed_pg_password_v1 framed_pg_bootstrap_password_v1 framed_pg_backup_password_v1; do
     docker secret inspect "$name" >/dev/null
 done
 docker pull postgres:18.6-trixie

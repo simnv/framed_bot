@@ -26,13 +26,16 @@ def main():
     env = Path('.env')
     values = read_env(env)
     token = values['BOT_TOKEN']
+    tmdb_token = values['TMDB_API_KEY']
     admin = values['ADMIN_USER_ID']
     if not admin.isdigit() or int(admin) <= 0:
         raise ValueError('Configure a positive administrator ID')
     if not token.strip() or '\n' in token:
         raise ValueError('Invalid bot setting')
+    if not tmdb_token.strip() or '\n' in tmdb_token:
+        raise ValueError('Invalid TMDB setting')
     directory = Path('.secrets/v1')
-    names = ('bot_token', 'db_url', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password')
+    names = ('bot_token', 'db_url', 'tmdb_token', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password')
     # Validate every existing file before changing any credential or environment file.
     paths = [env, directory.parent, directory, Path('.deploy'), Path('.deploy/admin_id')]
     paths += [directory / name for name in names]
@@ -50,7 +53,7 @@ def main():
         password = parsed.password
     else:
         url = f'postgresql+asyncpg://framed:{password}@db:5432/framed'
-    payload = {'bot_token': token, 'db_url': url, 'pg_password': password,
+    payload = {'bot_token': token, 'db_url': url, 'tmdb_token': tmdb_token, 'pg_password': password,
                'pg_bootstrap_password': existing.get('pg_bootstrap_password', secrets.token_hex(32)),
                'pg_backup_password': existing.get('pg_backup_password', secrets.token_hex(32))}
     for name, value in payload.items():
