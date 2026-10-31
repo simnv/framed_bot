@@ -22,7 +22,7 @@ from models.db import Base, engine
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.group import Group
-from models.migrate import PartialSchemaError, alembic_config, upgrade_database
+from models.migrate import BASELINE_TABLES, PartialSchemaError, alembic_config, upgrade_database
 from models.user import User
 
 USER_ID = 5_000_000_123
@@ -231,7 +231,8 @@ async def migrations():
     # A schema that create_all made before Alembic keeps its rows and is adopted at the baseline.
     await drop_schema()
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        # create_all before Alembic made only the baseline tables.
+        await conn.run_sync(Base.metadata.create_all, tables=[Base.metadata.tables[name] for name in BASELINE_TABLES])
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Legacy', False))
     assert await FramedResult.save_result(USER_ID, 1, True, 2)
     await upgrade_database()
