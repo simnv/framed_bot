@@ -137,7 +137,7 @@ async def aggregate_stats():
     rich = sent[0]['rich_message']
     assert rich['skip_entity_detection'] is True
     for game in ('framed.wtf', 'episode.wtf'):
-        assert f'<td>{game}</td><td>600</td><td>300</td><td>2.00</td>' in rich['html']
+        assert f'<td><a href="https://{game}/">{game}</a></td><td>600</td><td>300</td><td>2.00</td>' in rich['html']
     assert sum(max(0, count) for count in fetched) <= 3, f'/stats materialized history rows: {fetched}'
     assert len(statements) <= 3
     assert await stats_module.get_user_stats(USER_ID + 1) is None

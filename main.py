@@ -279,7 +279,11 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if effective_chat is None or message is None:
         return
     results = await FramedResult.top_score()
-    profiles = await enrich_top_profiles(context.bot, results)
+    profiles = await enrich_top_profiles(
+        context.bot,
+        results,
+        group_chat_id=effective_chat.id if effective_chat.type in ('group', 'supergroup') else None,
+    )
     await send_rich_message(
         context.bot,
         effective_chat.id,
@@ -310,7 +314,11 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not isinstance(query_message, TelegramMessage):
         await query.answer()
         return
-    profiles = await enrich_top_profiles(context.bot, results)
+    profiles = await enrich_top_profiles(
+        context.bot,
+        results,
+        group_chat_id=query_message.chat_id if query_message.chat.type in ('group', 'supergroup') else None,
+    )
     # PTB's typed edit_message_text still requires text; the public API bridge
     # allows the new rich_message parameter without sending a plain text field.
     await context.bot.do_api_request(

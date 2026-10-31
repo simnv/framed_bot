@@ -111,9 +111,19 @@ def test_personal_stats_show_both_games_and_no_wins_without_fabricated_average()
     assert 'Средний кадр — только по победам' in rich['html']
 
 
+def test_personal_stats_game_names_link_to_the_official_sites():
+    rich = render_stats(Stats(9, 5, 2.4), Stats(4, 0, None))
+    table = TableParser(rich['html'])
+    assert table.links == [{'href': 'https://framed.wtf/'}, {'href': 'https://episode.wtf/'}]
+    assert table.rows[1][0] == 'framed.wtf'
+    assert table.rows[2][0] == 'episode.wtf'
+    assert rich['skip_entity_detection'] is True
+
+
 class TelegramRequest(BaseRequest):
-    def __init__(self):
+    def __init__(self, *, private_lookup_fails=False):
         self.calls = []
+        self.private_lookup_fails = private_lookup_fails
 
     @property
     def read_timeout(self):
@@ -141,6 +151,10 @@ class TelegramRequest(BaseRequest):
         if endpoint == 'getMe':
             result = {'id': 1, 'is_bot': True, 'first_name': 'Test', 'username': 'test_bot'}
         elif endpoint == 'getChat':
+            if self.private_lookup_fails:
+                return 400, json.dumps(
+                    {'ok': False, 'error_code': 400, 'description': 'Bad Request: chat not found'}
+                ).encode()
             result = {
                 'id': int(parameters['chat_id']),
                 'type': 'private',
@@ -155,6 +169,16 @@ class TelegramRequest(BaseRequest):
                     'gifts_from_channels': False,
                 },
             }
+        elif endpoint == 'getChatMember':
+            result = {
+                'status': 'member',
+                'user': {
+                    'id': int(parameters['user_id']),
+                    'is_bot': False,
+                    'first_name': 'Imported',
+                    'username': 'group_owner',
+                },
+            }
         elif endpoint in ('sendRichMessage', 'sendMessage'):
             result = {'message_id': 777, 'date': 1, 'chat': {'id': -123, 'type': 'group'}}
         else:
@@ -162,8 +186,9 @@ class TelegramRequest(BaseRequest):
         return 200, json.dumps({'ok': True, 'result': result}).encode()
 
 
-def command_update(text):
-    message = Message(456, datetime.now(UTC), Chat(-123, 'group'), from_user=User(99, 'Test', False), text=text)
+def command_update(text, *, chat_type='group'):
+    chat_id = 99 if chat_type == 'private' else -123
+    message = Message(456, datetime.now(UTC), Chat(chat_id, chat_type), from_user=User(99, 'Test', False), text=text)
     return Update(1, message=message)
 
 
@@ -183,8 +208,14 @@ def make_context(request, *, job_queue=True):
 
 
 @pytest.mark.asyncio
-async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(monkeypatch):
-    request = TelegramRequest()
+@pytest.mark.parametrize(
+    ('chat_type', 'private_lookup_fails'),
+    [('group', False), ('group', True), ('supergroup', True), ('private', True), ('channel', True)],
+)
+async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(
+    monkeypatch, chat_type, private_lookup_fails
+):
+    request = TelegramRequest(private_lookup_fails=private_lookup_fails)
     context = make_context(request)
     results = [SimpleNamespace(name='A < B 👨‍👩‍👧‍👦', score=42, user_id=5_000_000_123)]
     query = AsyncMock(return_value=results)
@@ -193,27 +224,38 @@ async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(monk
     process = AsyncMock(wraps=limiter.process_request)
     monkeypatch.setattr(type(limiter), 'process_request', process)
     async with context.bot:
-        await main.top(command_update('/top'), context)
+        await main.top(command_update('/top', chat_type=chat_type), context)
     query.assert_awaited_once_with()
     endpoint, params = next(call for call in request.calls if call[0] == 'sendRichMessage')
     assert endpoint == 'sendRichMessage'
+    uses_group_lookup = private_lookup_fails and chat_type in ('group', 'supergroup')
+    profile_url = 'https://t.me/fresh_owner?profile'
+    if private_lookup_fails:
+        profile_url = 'https://t.me/group_owner?profile' if uses_group_lookup else 'tg://user?id=5000000123'
     expected = render_top(TopType.TOP_SCORE, results)
-    expected['html'] = expected['html'].replace('tg://user?id=5000000123', 'https://t.me/fresh_owner?profile')
+    expected['html'] = expected['html'].replace('tg://user?id=5000000123', profile_url)
     assert json.loads(params['rich_message']) == expected
-    assert TableParser(json.loads(params['rich_message'])['html']).links == [
-        {'href': 'https://t.me/fresh_owner?profile'}
-    ]
+    assert TableParser(json.loads(params['rich_message'])['html']).links == [{'href': profile_url}]
     assert json.loads(params['reply_parameters']) == {'message_id': 456}
-    assert params['chat_id'] == '-123'
+    assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
     assert 'text' not in params and 'entities' not in params and 'parse_mode' not in params
     buttons = json.loads(params['reply_markup'])['inline_keyboard'][0]
     assert {json.loads(button['callback_data'])['top'] for button in buttons} == {2, 3, 4}
     assert any(call.kwargs['endpoint'] == 'sendRichMessage' for call in process.await_args_list)
     assert any(call.kwargs['endpoint'] == 'getChat' for call in process.await_args_list)
     assert sum(endpoint == 'getChat' for endpoint, _params in request.calls) == 1
+    member_calls = [params for endpoint, params in request.calls if endpoint == 'getChatMember']
+    assert len(member_calls) == int(uses_group_lookup)
+    if uses_group_lookup:
+        assert member_calls[0]['chat_id'] == '-123' and member_calls[0]['user_id'] == '5000000123'
+        assert any(call.kwargs['endpoint'] == 'getChatMember' for call in process.await_args_list)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('chat_type', 'private_lookup_fails'),
+    [('group', False), ('group', True), ('supergroup', True), ('private', True), ('channel', True)],
+)
 @pytest.mark.parametrize(
     ('kind', 'query_name'),
     [
@@ -223,15 +265,17 @@ async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(monk
         (TopType.TOP_ROUNDS, 'top_rounds'),
     ],
 )
-async def test_sort_callback_edits_native_table_in_place_and_acknowledges(monkeypatch, kind, query_name):
-    request = TelegramRequest()
+async def test_sort_callback_edits_native_table_in_place_and_acknowledges(
+    monkeypatch, kind, query_name, chat_type, private_lookup_fails
+):
+    request = TelegramRequest(private_lookup_fails=private_lookup_fails)
     context = make_context(request)
     results = [SimpleNamespace(name='Имя & 李', score=2, user_id=5_000_000_123)]
     queries = {}
     for name in ('top_score', 'top_average_frame', 'top_won', 'top_rounds'):
         queries[name] = AsyncMock(return_value=results)
         monkeypatch.setattr(main.FramedResult, name, queries[name])
-    command = command_update('/top')
+    command = command_update('/top', chat_type=chat_type)
     callback = CallbackQuery(
         'sort-query', command.effective_user, 'instance', message=command.message, data=json.dumps({'top': kind})
     )
@@ -245,19 +289,26 @@ async def test_sort_callback_edits_native_table_in_place_and_acknowledges(monkey
         else:
             query.assert_not_awaited()
     params = next(params for endpoint, params in request.calls if endpoint == 'editMessageText')
-    assert params['message_id'] == '456' and params['chat_id'] == '-123'
+    assert params['message_id'] == '456'
+    assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
+    uses_group_lookup = private_lookup_fails and chat_type in ('group', 'supergroup')
+    profile_url = 'https://t.me/fresh_owner?profile'
+    if private_lookup_fails:
+        profile_url = 'https://t.me/group_owner?profile' if uses_group_lookup else 'tg://user?id=5000000123'
     expected = render_top(kind, results)
-    expected['html'] = expected['html'].replace('tg://user?id=5000000123', 'https://t.me/fresh_owner?profile')
+    expected['html'] = expected['html'].replace('tg://user?id=5000000123', profile_url)
     assert json.loads(params['rich_message']) == expected
-    assert TableParser(json.loads(params['rich_message'])['html']).links == [
-        {'href': 'https://t.me/fresh_owner?profile'}
-    ]
+    assert TableParser(json.loads(params['rich_message'])['html']).links == [{'href': profile_url}]
     assert 'text' not in params and 'entities' not in params
     buttons = json.loads(params['reply_markup'])['inline_keyboard'][0]
     assert {json.loads(button['callback_data'])['top'] for button in buttons} == set(TopType) - {kind}
     assert [endpoint for endpoint, _ in request.calls][-1] == 'answerCallbackQuery'
     assert not any(endpoint == 'sendRichMessage' for endpoint, _ in request.calls)
     assert sum(endpoint == 'getChat' for endpoint, _params in request.calls) == 1
+    member_calls = [params for endpoint, params in request.calls if endpoint == 'getChatMember']
+    assert len(member_calls) == int(uses_group_lookup)
+    if uses_group_lookup:
+        assert member_calls[0]['chat_id'] == '-123' and member_calls[0]['user_id'] == '5000000123'
 
 
 @pytest.mark.asyncio

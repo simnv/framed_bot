@@ -64,12 +64,15 @@ def _valid_username(username: object) -> TypeGuard[str]:
     return isinstance(username, str) and re.fullmatch(r'[A-Za-z0-9_]{1,32}', username) is not None
 
 
-async def enrich_top_profiles(bot: Bot, results: Sequence[TopResult]) -> tuple[_ResolvedTopResult, ...]:
+async def enrich_top_profiles(
+    bot: Bot, results: Sequence[TopResult], *, group_chat_id: int | None = None
+) -> tuple[_ResolvedTopResult, ...]:
     """Resolve fresh, identity-checked public usernames for at most ten leaderboard rows.
 
-    No stored username is trusted or cached. An eight-second batch deadline also
-    bounds time spent waiting for the SDK rate limiter; unfinished lookups fall
-    back to ID mentions. Original row order, names and scores are preserved.
+    If a private chat lookup fails, try a fresh member lookup in the current group.
+    No stored username is trusted or cached. The eight-second batch deadline
+    includes both lookup methods and SDK rate limiter waits. Unfinished lookups
+    fall back to ID mentions. Original row order, names and scores are preserved.
     """
     user_ids: dict[int, None] = {}
     for result in results[:10]:
@@ -90,12 +93,37 @@ async def enrich_top_profiles(bot: Bot, results: Sequence[TopResult]) -> tuple[_
                     pool_timeout=1,
                 )
             except TelegramError, TypeError, ValueError, AttributeError:
-                return
+                chat = None
             username = getattr(chat, 'username', None)
+            chat_id = getattr(chat, 'id', None)
             if (
-                type(getattr(chat, 'id', None)) is int
-                and chat.id == user_id
+                type(chat_id) is int
+                and chat_id == user_id
                 and getattr(chat, 'type', None) == 'private'
+                and _valid_username(username)
+            ):
+                usernames[user_id] = username
+                return
+            if type(group_chat_id) is not int or group_chat_id >= 0:
+                return
+            try:
+                member = await bot.get_chat_member(
+                    group_chat_id,
+                    user_id,
+                    read_timeout=2,
+                    write_timeout=2,
+                    connect_timeout=2,
+                    pool_timeout=1,
+                )
+            except TelegramError, TypeError, ValueError, AttributeError:
+                return
+            user = getattr(member, 'user', None)
+            username = getattr(user, 'username', None)
+            member_user_id = getattr(user, 'id', None)
+            if (
+                type(member_user_id) is int
+                and member_user_id == user_id
+                and getattr(user, 'is_bot', None) is False
                 and _valid_username(username)
             ):
                 usernames[user_id] = username
@@ -134,7 +162,15 @@ class _ProfileName:
     public_username: str | None = None
 
 
-def _cell(value: str | int | float | _ProfileName | None) -> str:
+@dataclass(frozen=True, slots=True)
+class _Link:
+    text: str
+    url: str
+
+
+def _cell(value: str | int | float | _ProfileName | _Link | None) -> str:
+    if isinstance(value, _Link):
+        return f'<a href="{escape(value.url, quote=True)}">{_cell(value.text)}</a>'
     if isinstance(value, _ProfileName):
         name = _cell(value.name)
         # bool is an int subclass, but is not a Telegram user identifier.
@@ -152,7 +188,7 @@ def _average(value: float | None) -> str:
 
 def _table(
     headers: Sequence[str],
-    rows: Sequence[Sequence[str | int | float | _ProfileName | None]],
+    rows: Sequence[Sequence[str | int | float | _ProfileName | _Link | None]],
     *,
     alignments: Sequence[Literal['left', 'center', 'right']] = (),
 ) -> str:
@@ -201,7 +237,7 @@ def render_top(top_type: TopType, results: Sequence[TopResult]) -> RichMessage:
 
 def render_stats(framed_stats: GameStats, episode_stats: GameStats) -> RichMessage:
     rows = [
-        (game, stats.rounds_count, stats.rounds_won_count, _average(stats.average_frame))
+        (_Link(game, f'https://{game}/'), stats.rounds_count, stats.rounds_won_count, _average(stats.average_frame))
         for game, stats in (('framed.wtf', framed_stats), ('episode.wtf', episode_stats))
     ]
     html = '<p>Твоя статистика</p>' + _table(('Игра', 'Раунды', 'Победы', 'Средний кадр'), rows)

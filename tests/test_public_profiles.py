@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from telegram.error import Forbidden, NetworkError
+from telegram.error import BadRequest, Forbidden, NetworkError
 
 import rich_tables
 from rich_tables import TopType, enrich_top_profiles, render_top
@@ -17,6 +17,81 @@ def row(user_id, *, username='stale_owner', name='Name <b>& 👩‍💻', score=
 
 def chat(user_id, username='fresh_owner', kind='private'):
     return SimpleNamespace(id=user_id, type=kind, username=username)
+
+
+def member(user_id, username='current_member', *, is_bot=False):
+    return SimpleNamespace(user=SimpleNamespace(id=user_id, username=username, is_bot=is_bot))
+
+
+@pytest.mark.asyncio
+async def test_imported_user_unknown_to_bot_resolves_via_current_group_membership():
+    lookup = AsyncMock(side_effect=BadRequest('Chat not found'))
+    member_lookup = AsyncMock(return_value=member(42))
+    enriched = await enrich_top_profiles(
+        Mock(get_chat=lookup, get_chat_member=member_lookup), [row(42)], group_chat_id=-123
+    )
+    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    assert 'href="https://t.me/current_member?profile"' in html
+    assert 'stale_owner' not in html
+    assert 'tg://user?' not in html
+    member_lookup.assert_awaited_once_with(-123, 42, read_timeout=2, write_timeout=2, connect_timeout=2, pool_timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'response',
+    [
+        member(43),
+        member(True),
+        member('42'),
+        member(42, is_bot=True),
+        member(42, None),
+        member(42, 'bad/name'),
+        member(42, 'evil" onclick="x'),
+        member(42, 'юзер'),
+        member(42, 'a' * 33),
+        None,
+        BadRequest('User not found'),
+        Forbidden('denied'),
+        NetworkError('unavailable'),
+    ],
+)
+async def test_group_lookup_never_trusts_invalid_identity_or_stored_username(response):
+    lookup = AsyncMock(side_effect=response) if isinstance(response, Exception) else AsyncMock(return_value=response)
+    enriched = await enrich_top_profiles(
+        Mock(get_chat=AsyncMock(side_effect=BadRequest('Chat not found')), get_chat_member=lookup),
+        [row(42)],
+        group_chat_id=-123,
+    )
+    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    assert 'href="tg://user?id=42"' in html
+    assert 'https://t.me/' not in html
+    assert 'stale_owner' not in html
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('group_chat_id', [None, 0, 123, True, False, '-123', [], -1.5])
+async def test_group_lookup_requires_a_negative_integer_context(group_chat_id):
+    member_lookup = AsyncMock(return_value=member(42))
+    enriched = await enrich_top_profiles(
+        Mock(get_chat=AsyncMock(side_effect=BadRequest('Chat not found')), get_chat_member=member_lookup),
+        [row(42)],
+        group_chat_id=group_chat_id,
+    )
+    assert 'href="tg://user?id=42"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    member_lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_valid_private_chat_username_does_not_request_group_membership():
+    member_lookup = AsyncMock()
+    enriched = await enrich_top_profiles(
+        Mock(get_chat=AsyncMock(return_value=chat(42)), get_chat_member=member_lookup),
+        [row(42)],
+        group_chat_id=-123,
+    )
+    assert 'href="https://t.me/fresh_owner?profile"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    member_lookup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -88,45 +163,59 @@ async def test_duplicate_ids_coalesce_and_invalid_ids_do_not_trigger_lookup():
 
 
 @pytest.mark.asyncio
-async def test_lookup_batch_caps_at_ten_rows_and_three_concurrent_requests():
+@pytest.mark.parametrize('via_group', [False, True])
+async def test_lookup_batch_caps_at_ten_rows_and_three_concurrent_requests(via_group):
     active, peak = 0, 0
     calls = []
 
-    async def lookup(user_id, **_kwargs):
+    async def lookup(*ids, **_kwargs):
         nonlocal active, peak
+        user_id = ids[-1]
         calls.append(user_id)
         active += 1
         peak = max(peak, active)
         try:
             await asyncio.sleep(0.001)
-            return chat(user_id)
+            return member(user_id) if via_group else chat(user_id)
         finally:
             active -= 1
 
     rows = [row(user_id) for user_id in range(1, 13)]
-    enriched = await enrich_top_profiles(Mock(get_chat=lookup), rows)
+    private_lookup = AsyncMock(side_effect=BadRequest('Chat not found')) if via_group else AsyncMock(side_effect=lookup)
+    enriched = await enrich_top_profiles(
+        Mock(get_chat=private_lookup, get_chat_member=lookup), rows, group_chat_id=-123 if via_group else None
+    )
     assert calls == list(range(1, 11))
     assert peak == 3 and active == 0
     assert len(enriched) == 12
     assert 'href="tg://user?id=12"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    if via_group:
+        assert private_lookup.await_count == 10
 
 
 @pytest.mark.asyncio
-async def test_deadline_preserves_completed_lookup_and_cleans_up_remaining_requests(monkeypatch):
+@pytest.mark.parametrize('via_group', [False, True])
+async def test_deadline_preserves_completed_lookup_and_cleans_up_remaining_requests(monkeypatch, via_group):
     monkeypatch.setattr(rich_tables, '_PROFILE_LOOKUP_DEADLINE', 0.02)
     started, finished = [], []
 
-    async def lookup(user_id, **_kwargs):
+    async def lookup(*ids, **_kwargs):
+        user_id = ids[-1]
         started.append(user_id)
         try:
             if user_id == 1:
-                return chat(1, 'finished')
+                return member(1, 'finished') if via_group else chat(1, 'finished')
             await asyncio.Event().wait()
         finally:
             finished.append(user_id)
 
+    private_lookup = AsyncMock(side_effect=BadRequest('Chat not found')) if via_group else AsyncMock(side_effect=lookup)
     enriched = await asyncio.wait_for(
-        enrich_top_profiles(Mock(get_chat=lookup), [row(i) for i in range(1, 11)]),
+        enrich_top_profiles(
+            Mock(get_chat=private_lookup, get_chat_member=lookup),
+            [row(i) for i in range(1, 11)],
+            group_chat_id=-123 if via_group else None,
+        ),
         timeout=1,
     )
     assert started == finished
@@ -137,11 +226,13 @@ async def test_deadline_preserves_completed_lookup_and_cleans_up_remaining_reque
 
 
 @pytest.mark.asyncio
-async def test_caller_cancellation_propagates_after_child_requests_are_cleaned_up():
+@pytest.mark.parametrize('via_group', [False, True])
+async def test_caller_cancellation_propagates_after_child_requests_are_cleaned_up(via_group):
     started, finished = [], []
     ready = asyncio.Event()
 
-    async def lookup(user_id, **_kwargs):
+    async def lookup(*ids, **_kwargs):
+        user_id = ids[-1]
         started.append(user_id)
         if len(started) == 3:
             ready.set()
@@ -150,7 +241,14 @@ async def test_caller_cancellation_propagates_after_child_requests_are_cleaned_u
         finally:
             finished.append(user_id)
 
-    task = asyncio.create_task(enrich_top_profiles(Mock(get_chat=lookup), [row(i) for i in range(1, 11)]))
+    private_lookup = AsyncMock(side_effect=BadRequest('Chat not found')) if via_group else AsyncMock(side_effect=lookup)
+    task = asyncio.create_task(
+        enrich_top_profiles(
+            Mock(get_chat=private_lookup, get_chat_member=lookup),
+            [row(i) for i in range(1, 11)],
+            group_chat_id=-123 if via_group else None,
+        )
+    )
     await asyncio.wait_for(ready.wait(), 1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
