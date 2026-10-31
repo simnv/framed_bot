@@ -198,11 +198,11 @@ async def test_sync_job_runs_up_to_requested_or_newest_round(
     application = build_application()
     calls: list[tuple[str, int]] = []
 
-    async def sync(_sync: AnswerSync, game: str, up_to_round: int) -> None:
-        calls.append((game, up_to_round))
+    async def run(_sync: AnswerSync, game: str, limit: int) -> None:
+        calls.append((game, limit))
 
     application.answer_sync = AnswerSync(application.answer_store, AsyncMock(), None, AsyncMock(), today=lambda: TODAY)
-    monkeypatch.setattr(AnswerSync, 'sync', sync)
+    monkeypatch.setattr(AnswerSync, '_run', run)
     monkeypatch.setattr(DbAnswerStore, 'max_result_round', AsyncMock(return_value=max_round))
     context = ContextTypes.DEFAULT_TYPE(application)
     context.job = Job(main.sync_answers_job, data=main.AnswerSyncRequest('framed', request_round))
@@ -297,3 +297,67 @@ async def test_stop_cancels_answer_jobs_and_still_drains_reactions(monkeypatch: 
     assert reactions == [77]
     assert application.reaction_delivery.counts['succeeded'] == 1
     assert store.missing_rounds.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_a_stalled_newest_round_lookup_and_still_drains_reactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    application = (
+        ApplicationBuilder()
+        .application_class(main.ReactionApplication)
+        .token('123:synthetic-only')
+        .updater(None)
+        .build()
+    )
+    assert isinstance(application, main.ReactionApplication)
+    application.reaction_delivery = ReactionDelivery(
+        application.bot, DeliverySettings(chat_gap=0, retry_base=0), jitter=lambda: 0
+    )
+    reactions: list[int] = []
+
+    async def initialize(fake_bot: ExtBot[None]) -> None:
+        fake_bot._bot_user = User(1, 'Synthetic bot', True)
+
+    async def shutdown(_fake_bot: ExtBot[None]) -> None:
+        pass
+
+    async def set_message_reaction(_bot: ExtBot[None], *, chat_id: int, message_id: int, **_kwargs: object) -> bool:
+        await asyncio.sleep(0.05)
+        reactions.append(message_id)
+        return True
+
+    monkeypatch.setattr(ExtBot, 'initialize', initialize)
+    monkeypatch.setattr(ExtBot, 'shutdown', shutdown)
+    monkeypatch.setattr(ExtBot, 'set_message_reaction', set_message_reaction)
+    looking = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def stalled_lookup(_store: DbAnswerStore, _game: str) -> int | None:
+        looking.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return None
+
+    monkeypatch.setattr(DbAnswerStore, 'max_result_round', stalled_lookup)
+    application.answer_sync = AnswerSync(AsyncMock(), AsyncMock(), None, AsyncMock(), today=lambda: TODAY)
+    await application.initialize()
+    await application.start()
+    job_queue = application.job_queue
+    assert job_queue is not None
+    job_queue.run_once(main.sync_answers_job, 0, data=main.AnswerSyncRequest('framed', None))
+    await asyncio.wait_for(looking.wait(), 2)
+    await application.reaction_delivery.submit(ReactionIntent(-1, 77, '✍'))
+
+    started = time.monotonic()
+    await asyncio.wait_for(application.stop(), 3)
+    await main.stop_reaction_delivery(application)
+    await application.shutdown()
+
+    assert cancelled.is_set()
+    assert time.monotonic() - started < 2
+    assert reactions == [77]
+    assert application.reaction_delivery.counts['succeeded'] == 1

@@ -138,13 +138,15 @@ async def sync_answers_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if application.answer_sync is None:
         return
     request = job.data
-    up_to_round = request.up_to_round
-    if up_to_round is None:
-        newest = await application.answer_store.max_result_round(request.game)
-        # The stored maximum comes from player messages, so it is untrusted too.
-        up_to_round = application.answer_sync.limit(request.game, newest) if newest else None
-    if up_to_round:
-        await application.answer_sync.sync(request.game, up_to_round)
+    game = request.game
+    if request.up_to_round is not None:
+        await application.answer_sync.sync(game, request.up_to_round)
+        return
+
+    async def newest_round() -> int | None:
+        return await application.answer_store.max_result_round(game)
+
+    await application.answer_sync.sync_newest(game, newest_round)
 
 
 async def schedule_answer_sync(context: ContextTypes.DEFAULT_TYPE, game: Game, round_number: int) -> None:

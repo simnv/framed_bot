@@ -68,7 +68,16 @@ class AnswerSync:
         limit = self.limit(game, up_to_round)
         if self._closed or limit < 1:
             return
-        work = asyncio.ensure_future(self._run(game, limit))
+        await self._tracked(self._run(game, limit))
+
+    async def sync_newest(self, game: Game, newest_round: Callable[[], Awaitable[int | None]]) -> None:
+        """Sync up to the newest round that newest_round() returns; the lookup is cancelled by shutdown() too."""
+        if self._closed:
+            return
+        await self._tracked(self._run_newest(game, newest_round))
+
+    async def _tracked(self, coroutine: Awaitable[None]) -> None:
+        work = asyncio.ensure_future(coroutine)
         self._active.add(work)
         try:
             await work
@@ -90,6 +99,13 @@ class AnswerSync:
             _, still_running = await asyncio.wait(active, timeout=SHUTDOWN_TIMEOUT)
             if still_running:
                 logger.warning('%d answer syncs did not stop in time', len(still_running))
+
+    async def _run_newest(self, game: Game, newest_round: Callable[[], Awaitable[int | None]]) -> None:
+        newest = await newest_round()
+        # The stored maximum comes from player messages, so it is untrusted too.
+        limit = self.limit(game, newest) if newest else 0
+        if limit >= 1:
+            await self._run(game, limit)
 
     async def _run(self, game: Game, limit: int) -> None:
         async with self._locks[game]:

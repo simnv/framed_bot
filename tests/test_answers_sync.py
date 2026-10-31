@@ -360,3 +360,35 @@ async def test_cancel_of_the_caller_still_propagates() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await caller
+
+
+@pytest.mark.parametrize(('newest', 'limits'), [(7, [7]), (None, []), (10**12, [1696])], ids=['newest', 'none', 'huge'])
+@pytest.mark.asyncio
+async def test_sync_newest_clamps_the_looked_up_round(newest: int | None, limits: list[int]) -> None:
+    sync, store, _, _, _ = make_sync()
+
+    async def newest_round() -> int | None:
+        return newest
+
+    await sync.sync_newest('framed', newest_round)
+
+    assert store.limits == limits
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_a_stalled_newest_round_lookup() -> None:
+    sync, store, _, _, _ = make_sync()
+    started = asyncio.Event()
+
+    async def stalled() -> int | None:
+        started.set()
+        await asyncio.Event().wait()
+
+    caller = asyncio.create_task(sync.sync_newest('framed', stalled))
+    await asyncio.wait_for(started.wait(), 1)
+
+    await asyncio.wait_for(sync.shutdown(), 1)
+
+    assert await caller is None
+    assert store.limits == []
+    await sync.sync_newest('framed', stalled)
