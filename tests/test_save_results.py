@@ -11,6 +11,9 @@ from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot, JobQueue
 
 import main
+from answers import Game
+from answers.store import DbAnswerStore
+from answers.sync import AnswerSync
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.user import User as BotUser
@@ -290,3 +293,93 @@ async def test_new_episode_data_delegates_to_save_results(monkeypatch: pytest.Mo
     await main.new_episode_data(update, test_context.context)
 
     save_results.assert_awaited_once_with(update, test_context.context, main.episode_pattern, EpisodeResult)
+
+
+@dataclass(slots=True)
+class AnswerJobRecorder:
+    calls: list[tuple[object, object, str | None]] = field(default_factory=list)
+
+
+def enable_answers(
+    monkeypatch: pytest.MonkeyPatch, test_context: RecordedContext, has_answer: AsyncMock
+) -> AnswerJobRecorder:
+    application = main.answer_application_for(test_context.context.application)
+    application.answer_sync = AnswerSync(application.answer_store, AsyncMock(), None, AsyncMock())
+    monkeypatch.setattr(DbAnswerStore, 'has_answer', has_answer)
+    recorder = AnswerJobRecorder()
+
+    def run_once(_job_queue: object, callback: object, when: object, data: object = None, name: str | None = None):
+        recorder.calls.append((callback, data, name))
+
+    monkeypatch.setattr(type(test_context.context.job_queue), 'run_once', run_once)
+    return recorder
+
+
+@pytest.mark.parametrize(
+    ('text', 'pattern', 'game'),
+    [
+        ('Framed #42\n🎥 🟥 🟩 ⬛ ⬛ ⬛ ⬛\n\nhttps://framed.wtf', main.framed_pattern, 'framed'),
+        ('Episode #42\n📺 🟥 🟩 ⬛ ⬛ ⬛ ⬛ ⬛ ⬛ ⬛ ⬛\n\nhttps://episode.wtf', main.episode_pattern, 'episode'),
+    ],
+    ids=['framed', 'episode'],
+)
+@pytest.mark.asyncio
+async def test_new_round_schedules_answer_sync(
+    monkeypatch: pytest.MonkeyPatch, text: str, pattern: str, game: Game
+) -> None:
+    test_context = make_context(monkeypatch)
+    has_answer = AsyncMock(return_value=False)
+    recorder = enable_answers(monkeypatch, test_context, has_answer)
+    monkeypatch.setattr(BotUser, 'update_from_tg_user', AsyncMock())
+
+    await main.save_results(make_update(text), test_context.context, pattern, make_result_model(True))
+    await finish_delivery(test_context)
+
+    has_answer.assert_awaited_once_with(game, 42)
+    assert recorder.calls == [(main.sync_answers_job, main.AnswerSyncRequest(game, 42), f'answers-{game}')]
+    assert test_context.bot.reaction_calls == [
+        ReactionCall(chat_id=123, message_id=456, reaction=main.saved_result_reaction)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_known_round_does_not_schedule_answer_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_context = make_context(monkeypatch)
+    recorder = enable_answers(monkeypatch, test_context, AsyncMock(return_value=True))
+    monkeypatch.setattr(BotUser, 'update_from_tg_user', AsyncMock())
+
+    await main.save_results(make_update(), test_context.context, main.framed_pattern, make_result_model(True))
+    await finish_delivery(test_context)
+
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_result_does_not_check_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_context = make_context(monkeypatch)
+    has_answer = AsyncMock(return_value=False)
+    recorder = enable_answers(monkeypatch, test_context, has_answer)
+    monkeypatch.setattr(BotUser, 'update_from_tg_user', AsyncMock())
+
+    await main.save_results(make_update(), test_context.context, main.framed_pattern, make_result_model(False))
+    await finish_delivery(test_context)
+
+    has_answer.assert_not_awaited()
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_answer_check_error_does_not_change_reaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_context = make_context(monkeypatch)
+    recorder = enable_answers(monkeypatch, test_context, AsyncMock(side_effect=OSError('database is down')))
+    monkeypatch.setattr(BotUser, 'update_from_tg_user', AsyncMock())
+    result_model = make_result_model(True)
+
+    await main.save_results(make_update(), test_context.context, main.framed_pattern, result_model)
+    await finish_delivery(test_context)
+
+    assert result_model.calls == [(99, 42, True, 2)]
+    assert recorder.calls == []
+    assert test_context.bot.reaction_calls == [
+        ReactionCall(chat_id=123, message_id=456, reaction=main.saved_result_reaction)
+    ]
