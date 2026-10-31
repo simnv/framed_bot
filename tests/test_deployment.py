@@ -162,13 +162,17 @@ def test_postgres_backup_restart_and_container_packaging(tmp_path):
         docker('network', 'rm', network, check=False)
 
 
-def test_secret_preparation_preserves_and_prevalidates(tmp_path):
+def run_secret_preparation(cwd):
     import sys
-    script = ROOT / 'deploy/prepare_secrets.py'
+    script = str(ROOT / 'deploy/prepare_secrets.py')
+    return subprocess.run([sys.executable, script], cwd=cwd, capture_output=True, text=True)
+
+
+def test_secret_preparation_preserves_and_prevalidates(tmp_path):
     original = b'BOT_TOKEN=123:synthetic-only\nTMDB_API_KEY=synthetic-tmdb-only\nADMIN_USER_ID=1\nKEEP=value\n'
     (tmp_path / '.env').write_bytes(original)
     def prepare():
-        return subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True)
+        return run_secret_preparation(tmp_path)
     assert prepare().returncode == 0
     secrets = tmp_path / '.secrets/v1'
     snapshot = {p.name: p.read_bytes() for p in secrets.iterdir()}
@@ -196,9 +200,21 @@ def test_secret_preparation_preserves_and_prevalidates(tmp_path):
     assert not (secrets / 'pg_backup_password').exists()
     assert (tmp_path / '.env').read_bytes() == original
 
-    # The stack mounts tmdb_token, so production preparation requires the key.
-    (tmp_path / '.env').write_bytes(b'BOT_TOKEN=123:synthetic-only\nADMIN_USER_ID=1\n')
-    assert prepare().returncode != 0
+
+def test_secret_preparation_requires_tmdb_key(tmp_path):
+    base = b'BOT_TOKEN=123:synthetic-only\nADMIN_USER_ID=1\n'
+    (tmp_path / '.env').write_bytes(base)
+    def prepare():
+        return run_secret_preparation(tmp_path)
+    # The stack mounts tmdb_token, so production preparation fails without the key and writes nothing.
+    result = prepare()
+    assert result.returncode != 0
+    assert (tmp_path / '.env').read_bytes() == base
+    assert not (tmp_path / '.secrets').exists()
+    # With the key added to the same otherwise-valid .env, preparation succeeds.
+    (tmp_path / '.env').write_bytes(base + b'TMDB_API_KEY=synthetic-tmdb-only\n')
+    assert prepare().returncode == 0
+    assert (tmp_path / '.secrets/v1/tmdb_token').read_bytes() == b'synthetic-tmdb-only'
 
 
 def test_nonempty_pgdata_guard(tmp_path):
