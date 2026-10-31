@@ -59,17 +59,22 @@ async def _upsert_title(session: AsyncSession, data: TitleData) -> int:
     for link in (TitleGenre, TitleCompany, TitlePerson):
         await session.execute(delete(link).where(link.title_id == title_id))
     if data.genres:
-        await session.execute(insert(TitleGenre), [{'title_id': title_id, 'genre_id': key} for key, _ in data.genres])
+        await session.execute(
+            insert(TitleGenre), [{'title_id': title_id, 'genre_id': key} for key in sorted(dict(data.genres))]
+        )
     if data.companies:
         await session.execute(
-            insert(TitleCompany), [{'title_id': title_id, 'company_id': key} for key, _ in data.companies]
+            insert(TitleCompany), [{'title_id': title_id, 'company_id': key} for key in sorted(dict(data.companies))]
         )
     if data.credits:
+        credits = {}
+        for credit in data.credits:
+            credits.setdefault((credit.person_id, credit.role), credit)
         await session.execute(
             insert(TitlePerson),
             [
                 {'title_id': title_id, 'person_id': credit.person_id, 'role': credit.role, 'order': credit.order}
-                for credit in data.credits
+                for credit in credits.values()
             ],
         )
     return title_id

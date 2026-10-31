@@ -1,13 +1,18 @@
 """Run locally only after approval. Send individual secret contents over SSH stdin."""
+import argparse
 import os
 import subprocess
 from pathlib import Path
 
 HOST = os.environ['FRAMED_SSH_TARGET']
+ITEMS = ('bot_token', 'db_url', 'tmdb_token', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password')
 
 
 def main():
-    for item in ('bot_token', 'db_url', 'tmdb_token', 'pg_password', 'pg_bootstrap_password', 'pg_backup_password'):
+    parser = argparse.ArgumentParser(description='Upload named secrets, or all secrets when no names are given.')
+    parser.add_argument('items', nargs='*', choices=ITEMS)
+    args = parser.parse_args()
+    for item in dict.fromkeys(args.items or ITEMS):
         name = f'framed_{item}_v1'
         # Cannot safely prove an existing secret has the same value: fail on collision.
         result = subprocess.run(

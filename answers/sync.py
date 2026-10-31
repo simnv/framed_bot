@@ -7,6 +7,7 @@ from datetime import date
 from typing import Final, Protocol
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
 from . import GAMES, KIND_BY_GAME, Game, Kind, MatchStatus, round_limit, utc_today
 from .scraper import ScrapeError
@@ -139,6 +140,7 @@ class AnswerSync:
                     await self._store.mark_unmatched(game, answer.round)
                     continue
                 data = await tmdb.details(kind, match.tmdb_id)
+                await self._store.save_title(game, answer.round, data, match.status)
             except TmdbRateLimited:
                 logger.warning('TMDB rate limit reached; the next %s sync continues', game)
                 return
@@ -146,4 +148,6 @@ class AnswerSync:
                 # title_id stays NULL, so the next sync tries this round again.
                 logger.warning('TMDB lookup failed for %s round %d: %s', game, answer.round, error)
                 continue
-            await self._store.save_title(game, answer.round, data, match.status)
+            except SQLAlchemyError as error:
+                logger.warning('Cannot store title for %s round %d: %s', game, answer.round, type(error).__name__)
+                continue

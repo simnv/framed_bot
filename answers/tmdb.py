@@ -165,7 +165,9 @@ def title_data(kind: Kind, data: dict[str, Any]) -> TitleData:
             name = _str(data['name'])
             original_name = _optional_str(data.get('original_name')) or name
             run_times = [_int(minutes) for minutes in _list(data.get('episode_run_time', []))]
-            year, runtime = _year(data.get('first_air_date')), run_times[0] if run_times else None
+            last_episode = data.get('last_episode_to_air')
+            last_runtime = None if last_episode is None else _optional_int(_dict(last_episode).get('runtime'))
+            year, runtime = _year(data.get('first_air_date')), run_times[0] if run_times else last_runtime
             imdb_id = _optional_str(_dict(data.get('external_ids', {})).get('imdb_id'))
         return TitleData(
             tmdb_id=_int(data['id']),

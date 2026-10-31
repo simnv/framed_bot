@@ -269,6 +269,9 @@ async def answers():
 
     simon = [Credit(1, 'David Simon', 'creator', 0), Credit(1, 'David Simon', 'cast', 0)]
     wire = show(1438, 'The Wire', simon)
+    wire.genres.extend(wire.genres)
+    wire.companies.extend(wire.companies)
+    wire.credits.extend(wire.credits)
     succession = show(76331, 'Succession', [Credit(2, 'Jesse Armstrong', 'creator', 0)])
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Synthetic', False))
     assert await store.max_result_round('episode') is None

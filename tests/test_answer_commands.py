@@ -98,6 +98,31 @@ async def test_set_title_rejects_bad_arguments(monkeypatch: pytest.MonkeyPatch, 
     assert sent == [main.set_title_usage]
 
 
+@pytest.mark.parametrize(
+    'value', ['x', '²', '0', '-1', '2147483648', '9' * 5000],
+    ids=['text', 'unicode-digit', 'zero', 'negative', 'overflow', 'huge'],
+)
+@pytest.mark.parametrize('argument', [1, 2], ids=['round', 'tmdb-id'])
+@pytest.mark.asyncio
+async def test_set_title_rejects_invalid_numbers(
+    monkeypatch: pytest.MonkeyPatch, value: str, argument: int
+) -> None:
+    application = build_application()
+    details = AsyncMock(return_value=title_data())
+    enable_tmdb(monkeypatch, application, details)
+    save = AsyncMock(return_value=True)
+    monkeypatch.setattr(DbAnswerStore, 'set_manual_title', save)
+    args = ['framed', '1', '278']
+    args[argument] = value
+    context, sent = command_context(monkeypatch, application, args)
+
+    await main.set_title(private_update('/set_title'), context)
+
+    assert sent == [main.set_title_usage]
+    details.assert_not_awaited()
+    save.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_set_title_needs_tmdb_key(monkeypatch: pytest.MonkeyPatch) -> None:
     application = build_application()
@@ -106,6 +131,22 @@ async def test_set_title_needs_tmdb_key(monkeypatch: pytest.MonkeyPatch) -> None
     await main.set_title(private_update('/set_title framed 1 278'), context)
 
     assert sent == ['TMDB_API_KEY не задан']
+
+
+@pytest.mark.asyncio
+async def test_post_stop_closes_http_client_when_reaction_drain_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    application = build_application()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(500)))
+    application.http_client = client
+    monkeypatch.setattr(ReactionDelivery, 'stop', AsyncMock(side_effect=RuntimeError('drain failed')))
+
+    try:
+        with pytest.raises(RuntimeError, match='drain failed'):
+            await main.stop_reaction_delivery(application)
+        assert client.is_closed
+        assert application.http_client is None
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

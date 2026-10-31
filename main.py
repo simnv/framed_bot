@@ -348,10 +348,17 @@ async def set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     application = answer_application_for(context.application)
     args = context.args or []
     game = parse_game(args[0]) if len(args) == 3 else None
-    if game is None or not args[1].isdigit() or not args[2].isdigit():
+    if (
+        game is None
+        or re.fullmatch(r'[0-9]{1,10}', args[1]) is None
+        or re.fullmatch(r'[0-9]{1,9}', args[2]) is None
+    ):
         await context.bot.send_message(chat_id=chat.id, text=set_title_usage)
         return
     round_number, tmdb_id = int(args[1]), int(args[2])
+    if not 1 <= round_number <= 2_147_483_647 or tmdb_id < 1:
+        await context.bot.send_message(chat_id=chat.id, text=set_title_usage)
+        return
     if application.tmdb is None:
         await context.bot.send_message(chat_id=chat.id, text='TMDB_API_KEY не задан')
         return
@@ -510,8 +517,10 @@ async def initialize_database(
 
 async def stop_reaction_delivery(application: object) -> None:
     # The post_stop hook also closes the HTTP client of the answer services.
-    await reaction_delivery_for(application).stop()
-    await stop_answers(answer_application_for(application))
+    try:
+        await reaction_delivery_for(application).stop()
+    finally:
+        await stop_answers(answer_application_for(application))
 
 
 def build_application() -> ReactionApplication:

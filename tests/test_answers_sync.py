@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from answers import Game, Kind, MatchStatus
 from answers.scraper import ScrapeError
@@ -210,6 +211,33 @@ async def test_tmdb_error_keeps_title_empty_and_next_sync_retries() -> None:
     del tmdb.outcomes['Film 1']
     await sync.sync('framed', 2)
     assert store.rows[('framed', 1)] == Row('Film 1', 1, 'auto')
+
+
+@pytest.mark.parametrize('unmatched', [False, True], ids=['save-title', 'mark-unmatched'])
+@pytest.mark.asyncio
+async def test_store_error_keeps_round_pending_and_later_rounds_continue(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, unmatched: bool
+) -> None:
+    sync, store, _, _, _ = make_sync(tmdb=FakeTmdb({'Film 1': None}) if unmatched else None)
+    method = 'mark_unmatched' if unmatched else 'save_title'
+    original = getattr(store, method)
+
+    async def fail_first(game: Game, round_number: int, *args: Any) -> None:
+        if round_number == 1:
+            raise SQLAlchemyError('sensitive database parameters')
+        await original(game, round_number, *args)
+
+    monkeypatch.setattr(store, method, fail_first)
+
+    await sync.sync('framed', 2)
+
+    assert store.rows[('framed', 1)] == Row('Film 1')
+    assert store.rows[('framed', 2)] == Row('Film 2', 2, 'auto')
+    assert 'framed round 1: SQLAlchemyError' in caplog.text
+    assert 'sensitive database parameters' not in caplog.text
+    monkeypatch.setattr(store, method, original)
+    await sync.sync('framed', 2)
+    assert store.rows[('framed', 1)].match_status == ('unmatched' if unmatched else 'auto')
 
 
 @pytest.mark.asyncio

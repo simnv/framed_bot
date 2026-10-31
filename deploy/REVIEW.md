@@ -26,9 +26,19 @@ uv run --locked python deploy/prepare_release.py
 
 Credentials remain separately in `.secrets/v1/`, mode0600. External secret names use the date-free `_v1` suffix; changing the directory/name does not rotate credentials. `upload-secrets.py` requires `FRAMED_SSH_TARGET` and streams values through SSH stdin without remote plaintext staging.
 
+## Upgrade an existing stack
+
+Add `TMDB_API_KEY` to the trusted local `.env` file before this release.
+Run `uv run --locked python deploy/prepare_secrets.py` to prepare `.secrets/v1/tmdb_token`.
+Load the operator configuration and obtain approval for the secret upload.
+Run `uv run --locked python deploy/upload-secrets.py tmdb_token` to create only `framed_tmdb_token_v1`.
+Create this secret before you deploy the new stack.
+The command leaves the existing secrets unchanged and fails if the selected secret already exists.
+Without item names, the upload command still creates all six secrets.
+
 ## Reviewed behavior
 
-[stack.yml](stack.yml) defines one polling bot, a dedicated PostgreSQL database and daily backup service. Every service uses the explicit target-node constraint, stop-first updates/rollback, persistent external volumes, healthchecks, bounded logs and restart recovery. PostgreSQL has no published port. [Dockerfile](../Dockerfile) uses tested Python/uv version tags and copies only the application, models and healthcheck, including credential-safe logging. Base/tool/database images use readable tested version tags, without digest pinning; those upstream tags can move. Source archive/file hashes verify transfer integrity, and the built application image ID verifies local release identity. The bot runs as UID/GID10001 and stores state under `/data`.
+[stack.yml](stack.yml) defines one polling bot, a dedicated PostgreSQL database and daily backup service. Every service uses the explicit target-node constraint, stop-first updates/rollback, persistent external volumes, healthchecks, bounded logs and restart recovery. PostgreSQL has no published port. [Dockerfile](../Dockerfile) uses tested Python/uv version tags and copies only the application, `answers/`, models and healthcheck, including credential-safe logging. Base/tool/database images use readable tested version tags, without digest pinning; those upstream tags can move. Source archive/file hashes verify transfer integrity, and the built application image ID verifies local release identity. The bot runs as UID/GID10001 and stores state under `/data`.
 
 The bot applies Alembic migrations from [models/migrations](../models/migrations) at startup, as the `framed` role, in one transaction. A database that has all four application tables and no `alembic_version` table is stamped at the baseline revision `0001` first. A database with only some of those tables stops startup and stays unchanged. Freeze `alembic upgrade head --sql` output in the private packet for each new revision. A pre-Alembic release ignores `alembic_version`, so stop-first rollback needs no downgrade until a revision changes existing tables.
 

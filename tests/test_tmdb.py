@@ -186,6 +186,35 @@ async def test_tv_details_without_run_time_have_no_runtime() -> None:
     assert (await tmdb.details('tv', 76331)).runtime is None
 
 
+@pytest.mark.parametrize('run_times', [None, [], [60, 55]], ids=['absent', 'empty', 'preferred'])
+@pytest.mark.parametrize('last_episode', [None, {}, {'runtime': None}, {'runtime': 42}])
+@pytest.mark.asyncio
+async def test_tv_runtime_falls_back_to_last_episode(
+    run_times: list[int] | None, last_episode: dict[str, Any] | None
+) -> None:
+    body = TV_DETAILS | {'last_episode_to_air': last_episode}
+    if run_times is None:
+        del body['episode_run_time']
+    else:
+        body['episode_run_time'] = run_times
+    tmdb = tmdb_for({'/3/tv/76331': httpx.Response(200, json=body)}, [])
+
+    data = await tmdb.details('tv', 76331)
+
+    expected = 60 if run_times else (42 if last_episode == {'runtime': 42} else None)
+    assert data.runtime == expected
+
+
+@pytest.mark.parametrize('last_episode', [[], 'bad', 1, {'runtime': '42'}, {'runtime': True}, {'runtime': []}])
+@pytest.mark.asyncio
+async def test_tv_runtime_rejects_malformed_last_episode(last_episode: Any) -> None:
+    body = TV_DETAILS | {'last_episode_to_air': last_episode}
+    tmdb = tmdb_for({'/3/tv/76331': httpx.Response(200, json=body)}, [])
+
+    with pytest.raises(TmdbError, match='^TMDB tv details have an unexpected shape$'):
+        await tmdb.details('tv', 76331)
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_raises_tmdb_rate_limited() -> None:
     tmdb = tmdb_for({'/3/search/movie': httpx.Response(429)}, [])
