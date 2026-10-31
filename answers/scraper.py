@@ -41,9 +41,19 @@ def _unescape_char(match: re.Match[str]) -> str:
 
 
 def js_unescape(raw: str) -> str:
-    text = JS_ESCAPE.sub(_unescape_char, raw)
-    # \uD83C\uDFAC pairs become two surrogates; join them into one character.
-    return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+    try:
+        text = JS_ESCAPE.sub(_unescape_char, raw)
+        # \uD83C\uDFAC pairs become two surrogates; join them into one character.
+        return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+    except ValueError:  # UnicodeError is a ValueError; chr() raises ValueError too
+        raise ScrapeError('Malformed escape in answer title') from None
+
+
+def _round_id(raw: str) -> float:
+    try:
+        return float(raw)
+    except ValueError:
+        raise ScrapeError('Malformed id in answer array') from None
 
 
 def find_titles(script: str) -> list[str] | None:
@@ -52,7 +62,7 @@ def find_titles(script: str) -> list[str] | None:
     for array in TITLE_ARRAY.finditer(script):
         entries = TITLE_ENTRY.findall(array.group(1))
         # Answer arrays start at round 1; mode arrays (titleshot, one-frame) start elsewhere.
-        if float(entries[0][1]) == 1:
+        if _round_id(entries[0][1]) == 1:
             candidates.append([js_unescape(title) for title, _ in entries])
     if not candidates:
         return None
@@ -103,8 +113,11 @@ async def fetch_titles(game: Game, client: httpx.AsyncClient) -> list[str]:
     if game == 'framed':
         return extract_titles(await _get(client, base + script_path(page, APP_SCRIPT, 'App bundle')))
     runtime = await _get(client, base + script_path(page, WEBPACK_SCRIPT, 'Webpack runtime'))
+    candidates = []
     for url in chunk_urls(base, runtime):
         titles = find_titles(await _get(client, url))
         if titles is not None:
-            return checked(titles)
-    raise ScrapeError('Answer array not found in lazy chunks')
+            candidates.append(titles)
+    if len(candidates) != 1:
+        raise ScrapeError(f'Found {len(candidates)} answer arrays in lazy chunks')
+    return checked(candidates[0])

@@ -122,3 +122,50 @@ async def test_http_error_propagates() -> None:
 
 def test_js_unescape() -> None:
     assert js_unescape(r'Pok\xe9mon \u00e9 \u{1F3AC} \ud83c\udfac \"q\" it\'s') == 'Pokémon é 🎬 🎬 "q" it\'s'
+
+
+def text_client(texts: dict[str, str]) -> httpx.AsyncClient:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = texts.get(str(request.url))
+        if body is None:
+            return httpx.Response(404)
+        return httpx.Response(200, text=body)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def array_with(first_title: str = 'Film 1', first_id: str = '1') -> str:
+    entries = [f'{{title:"{first_title}",id:{first_id}}}']
+    entries += [f'{{title:"Film {number}",id:{number}}}' for number in range(2, 101)]
+    return 'var r=[' + ','.join(entries) + ']},9953:function(e,t,i){}'
+
+
+@pytest.mark.asyncio
+async def test_episode_rejects_answer_arrays_in_two_chunks() -> None:
+    texts = {
+        'https://episode.wtf/': fixture('episode_home.html'),
+        'https://episode.wtf/_next/static/chunks/webpack-fe87f2cbe8ee01db.js': (
+            'n.u=function(e){return"static/chunks/"+e+"."+{87:"0111d1a5ef9290c6",91:"0123456789abcdef"}[e]+".js"}'
+        ),
+        'https://episode.wtf/_next/static/chunks/87.0111d1a5ef9290c6.js': short_array(100),
+        'https://episode.wtf/_next/static/chunks/91.0123456789abcdef.js': short_array(100).replace('Film', 'Other'),
+    }
+    async with text_client(texts) as client:
+        with pytest.raises(ScrapeError):
+            await fetch_titles('episode', client)
+
+
+@pytest.mark.parametrize(
+    'script',
+    [array_with(first_title=r'\u{110000}'), array_with(first_title=r'\ud800'), array_with(first_id='1e')],
+    ids=['code-point-out-of-range', 'lone-surrogate', 'malformed-first-id'],
+)
+def test_extract_titles_rejects_malformed_values(script: str) -> None:
+    with pytest.raises(ScrapeError):
+        extract_titles(script)
+
+
+@pytest.mark.parametrize('raw', [r'\u{110000}', r'\ud800'], ids=['code-point-out-of-range', 'lone-surrogate'])
+def test_js_unescape_rejects_malformed_escapes(raw: str) -> None:
+    with pytest.raises(ScrapeError):
+        js_unescape(raw)
