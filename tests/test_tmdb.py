@@ -289,3 +289,37 @@ async def test_malformed_details_raise_fixed_tmdb_error(change: dict[str, Any]) 
     with pytest.raises(TmdbError) as error:
         await tmdb.details('movie', 424139)
     assert str(error.value) == 'TMDB movie details have an unexpected shape'
+
+
+@pytest.mark.parametrize(
+    'credits',
+    [
+        {'cast': [], 'crew': [{'id': 1, 'name': 'Director', 'job': ['Director']}]},
+        {'cast': [{'id': 1, 'name': 'Actor', 'order': 0}, {'id': 1, 'name': None, 'order': 1}], 'crew': []},
+    ],
+    ids=['crew-job-list', 'duplicate-cast-null-name'],
+)
+@pytest.mark.asyncio
+async def test_movie_credit_entries_are_validated_before_selection(credits: dict[str, Any]) -> None:
+    tmdb = tmdb_for({'/3/movie/424139': httpx.Response(200, json=MOVIE_DETAILS | {'credits': credits})}, [])
+
+    with pytest.raises(TmdbError) as error:
+        await tmdb.details('movie', 424139)
+    assert str(error.value) == 'TMDB movie details have an unexpected shape'
+
+
+@pytest.mark.parametrize(
+    'created_by',
+    [
+        [{'id': 1, 'name': 'Creator'}, {'id': 1, 'name': None}],
+        [{'id': True, 'name': 'Creator'}],
+    ],
+    ids=['duplicate-null-name', 'bool-id'],
+)
+@pytest.mark.asyncio
+async def test_tv_creator_entries_are_validated_before_selection(created_by: list[dict[str, Any]]) -> None:
+    tmdb = tmdb_for({'/3/tv/76331': httpx.Response(200, json=TV_DETAILS | {'created_by': created_by})}, [])
+
+    with pytest.raises(TmdbError) as error:
+        await tmdb.details('tv', 76331)
+    assert str(error.value) == 'TMDB tv details have an unexpected shape'

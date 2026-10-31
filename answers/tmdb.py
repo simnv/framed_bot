@@ -117,6 +117,15 @@ def _pairs(value: object, key: str) -> list[tuple[int, str]]:
     return [(_int(item['id']), _str(item[key])) for item in map(_dict, _list(value))]
 
 
+def _people(value: object) -> list[dict[str, Any]]:
+    """Validate every credit entry before any filtering or deduplication."""
+    people = [_dict(person) for person in _list(value)]
+    for person in people:
+        _int(person['id'])
+        _str(person['name'])
+    return people
+
+
 def _credits(data: dict[str, Any], kind: Kind) -> list[Credit]:
     credits: list[Credit] = []
     seen: set[tuple[int, Role]] = set()
@@ -129,14 +138,16 @@ def _credits(data: dict[str, Any], kind: Kind) -> list[Credit]:
             credits.append(Credit(person_id, _str(person['name']), role, order))
 
     people = _dict(data.get('credits', {}))
-    crew = [_dict(person) for person in _list(people.get('crew', []))]
+    crew = _people(people.get('crew', []))
+    for person in crew:
+        _optional_str(person.get('job'))
     directors = [person for person in crew if person.get('job') == 'Director']
     for order, person in enumerate(directors):
         add(person, 'director', order)
     if kind == 'tv':
-        for order, person in enumerate(map(_dict, _list(data.get('created_by', [])))):
+        for order, person in enumerate(_people(data.get('created_by', []))):
             add(person, 'creator', order)
-    cast = sorted((_dict(person) for person in _list(people.get('cast', []))), key=lambda person: _int(person['order']))
+    cast = sorted(_people(people.get('cast', [])), key=lambda person: _int(person['order']))
     for person in cast[:CAST_LIMIT]:
         add(person, 'cast', person['order'])
     return credits
