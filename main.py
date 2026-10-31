@@ -41,9 +41,10 @@ from telegram.ext import (
 )
 from telegram.ext.filters import Message, MessageFilter
 
-from models import FramedResult, User, init_db
+from models import FramedResult, User
 from models.episode_result import EpisodeResult
 from models.group import Group
+from models.migrate import upgrade_database
 from reaction_delivery import ReactionDelivery, ReactionIntent
 from rich_tables import TopType, enrich_top_profiles, render_stats, render_top, send_rich_message
 from stats import get_user_stats
@@ -335,7 +336,7 @@ async def initialize_database(
         JobQueue[ContextTypes.DEFAULT_TYPE],
     ],
 ) -> None:
-    await init_db()
+    await upgrade_database()
     reaction_delivery_for(_application).start()
 
 

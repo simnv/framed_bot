@@ -7,7 +7,10 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sqlalchemy import event, insert, select, text
+from alembic.autogenerate import compare_metadata
+from alembic.migration import MigrationContext
+from alembic.script import ScriptDirectory
+from sqlalchemy import event, inspect, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from telegram import Chat, Message, Update, User as TelegramUser
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
@@ -15,20 +18,25 @@ from telegram.ext import ContextTypes, ApplicationBuilder, ExtBot
 
 import main
 import stats as stats_module
-from models import init_db
 from models.db import Base, engine
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.group import Group
+from models.migrate import PartialSchemaError, alembic_config, upgrade_database
 from models.user import User
 
 USER_ID = 5_000_000_123
 
 
-async def reset():
+async def drop_schema():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-    await init_db()
+        await conn.execute(text('DROP TABLE IF EXISTS alembic_version'))
+
+
+async def reset():
+    await drop_schema()
+    await upgrade_database()
 
 
 async def seed_history():
@@ -67,10 +75,9 @@ async def profile():
     try:
         user = await User.get(USER_ID)
         assert user is not None
-        assert len(user.framed_results) == len(user.episode_results) == 600
     finally:
         event.remove(engine.sync_engine, 'after_cursor_execute', observe)
-    assert sum(max(0, count) for count in rows) == 1201
+    assert sum(max(0, count) for count in rows) == 1, f'User lookup read game histories: {rows}'
     # Re-registration must be safe even when handlers overlap for a new account/group.
     await asyncio.gather(*(User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Concurrent', False)) for _ in range(12)))
     await asyncio.gather(*(Group.update_from_tg_chat(Chat(-99, 'group', title='Concurrent')) for _ in range(12)))
@@ -203,10 +210,55 @@ async def announce():
     print(json.dumps({'broadcast_attempts': attempts, 'delivered': delivered, 'retry_sleeps': sleeps}))
 
 
+async def schema_state():
+    def read(sync_conn):
+        tables = set(inspect(sync_conn).get_table_names())
+        version = None
+        if 'alembic_version' in tables:
+            version = sync_conn.execute(text('SELECT version_num FROM alembic_version')).scalar_one()
+        return tables, version, compare_metadata(MigrationContext.configure(sync_conn), Base.metadata)
+
+    async with engine.connect() as conn:
+        return await conn.run_sync(read)
+
+
+async def migrations():
+    head = ScriptDirectory.from_config(alembic_config()).get_current_head()
+    tables, version, diff = await schema_state()
+    assert version == head and diff == [], (version, diff)
+    await upgrade_database()
+    assert await schema_state() == (tables, head, [])
+    # A schema that create_all made before Alembic keeps its rows and is adopted at the baseline.
+    await drop_schema()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await User.update_from_tg_user(TelegramUser(USER_ID, 'Legacy', False))
+    assert await FramedResult.save_result(USER_ID, 1, True, 2)
+    await upgrade_database()
+    assert await schema_state() == (tables, head, [])
+    async with engine.connect() as conn:
+        rows = (await conn.execute(select(FramedResult.user_id, FramedResult.won, FramedResult.win_frame))).all()
+    assert rows == [(USER_ID, True, 2)]
+    # A partial pre-Alembic schema stops startup and is left unchanged.
+    await drop_schema()
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.tables['user'].create)
+    try:
+        await upgrade_database()
+    except PartialSchemaError:
+        pass
+    else:
+        raise AssertionError('Partial pre-Alembic schema was migrated')
+    assert (await schema_state())[:2] == ({'user'}, None)
+    print(json.dumps({'head': head, 'tables': sorted(tables)}))
+
+
 async def run():
     try:
         await reset()
-        await {'profile': profile, 'duplicates': duplicates, 'stats': aggregate_stats, 'announce': announce}[sys.argv[1]]()
+        scenarios = {'profile': profile, 'duplicates': duplicates, 'stats': aggregate_stats, 'announce': announce,
+                     'migrations': migrations}
+        await scenarios[sys.argv[1]]()
     finally:
         await engine.dispose()
 

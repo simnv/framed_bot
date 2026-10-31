@@ -40,7 +40,7 @@ def isolated_postgres():
         docker('network', 'rm', network, check=False)
 
 
-@pytest.mark.parametrize('scenario', ['profile', 'duplicates', 'stats', 'announce'])
+@pytest.mark.parametrize('scenario', ['profile', 'duplicates', 'stats', 'announce', 'migrations'])
 def test_application_security(isolated_postgres, scenario):
     network, suffix = isolated_postgres
     image = os.environ.get('FRAMED_TEST_IMAGE', 'framed-bot:local-validation')

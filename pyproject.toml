@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Telegram bot for tracking Framed game results"
 requires-python = ">=3.14"
 dependencies = [
+    "alembic>=1.17",
     "asyncpg>=0.32.0",
     "python-telegram-bot[job-queue,rate-limiter]>=22.8",
     "sqlalchemy[asyncio]>=2.1.6",
@@ -38,3 +39,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S"]
 [tool.ruff.format]
 quote-style = "single"
 indent-style = "space"
+
+[tool.alembic]
+script_location = "%(here)s/models/migrations"
+prepend_sys_path = ["."]

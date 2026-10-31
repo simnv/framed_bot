@@ -1,9 +1,7 @@
 from .db import Base, engine
+from .episode_result import EpisodeResult
 from .framed_result import FramedResult
+from .group import Group
 from .user import User
 
-__all__ = ["FramedResult", "User"]
-
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+__all__ = ['Base', 'EpisodeResult', 'FramedResult', 'Group', 'User', 'engine']

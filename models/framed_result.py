@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import Float, ForeignKey, Integer, Select, UniqueConstraint, case, cast, desc, func, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import AsyncScopedSession, Base
 from .user import User
@@ -10,7 +10,6 @@ from .user import User
 
 class FramedResult(Base):
     __tablename__ = 'framed_result'
-    # Legacy imports need deduplication and a constraint migration; create_all does not migrate tables.
     __table_args__ = (UniqueConstraint('user_id', 'framed_round'),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -18,8 +17,6 @@ class FramedResult(Base):
     framed_round: Mapped[int] = mapped_column(index=True)
     won: Mapped[bool] = mapped_column()
     win_frame: Mapped[int | None] = mapped_column()
-
-    user: Mapped[Base] = relationship('User', back_populates='framed_results')
 
     @staticmethod
     async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool:

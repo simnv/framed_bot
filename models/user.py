@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from sqlalchemy import BigInteger, Select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 from telegram import User as TgUser
 
-from .db import AsyncScopedSession, Base, ResultForStats
+from .db import AsyncScopedSession, Base
 
 
 class User(Base):
@@ -14,9 +14,6 @@ class User(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     full_name: Mapped[str] = mapped_column()
     username: Mapped[str] = mapped_column()
-
-    framed_results: Mapped[list[ResultForStats]] = relationship('FramedResult', back_populates='user', lazy='selectin')
-    episode_results: Mapped[list[ResultForStats]] = relationship('EpisodeResult', back_populates='user', lazy='selectin')
 
     @staticmethod
     async def update_from_tg_user(tg_user: TgUser) -> None:

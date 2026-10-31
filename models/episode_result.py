@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from sqlalchemy import ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import AsyncScopedSession, Base
 
 
 class EpisodeResult(Base):
     __tablename__ = 'episode_result'
-    # Legacy imports need deduplication and a constraint migration; create_all does not migrate tables.
     __table_args__ = (UniqueConstraint('user_id', 'framed_round'),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -17,8 +16,6 @@ class EpisodeResult(Base):
     framed_round: Mapped[int] = mapped_column(index=True)
     won: Mapped[bool] = mapped_column()
     win_frame: Mapped[int | None] = mapped_column()
-
-    user: Mapped[Base] = relationship('User', back_populates='episode_results')
 
     @staticmethod
     async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool:
