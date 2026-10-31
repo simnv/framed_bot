@@ -39,6 +39,7 @@ class FramedResult(Base):
         async with AsyncScopedSession() as session:
             result = await session.execute(
                 Select(
+                    FramedResult.user_id.label('user_id'),
                     User.full_name.label('name'),
                     func.sum(case((FramedResult.won.is_(True), 7 - FramedResult.win_frame), else_=1)).label('score'),
                 )
@@ -55,8 +56,9 @@ class FramedResult(Base):
         async with AsyncScopedSession() as session:
             result = await session.execute(
                 Select(
+                    FramedResult.user_id.label('user_id'),
                     User.full_name.label('name'),
-                    (func.sum(cast(FramedResult.win_frame, Float)) / func.sum(cast(FramedResult.won, Integer))).label(
+                    func.avg(cast(case((FramedResult.won.is_(True), FramedResult.win_frame), else_=7), Float)).label(
                         'score'
                     ),
                 )
@@ -72,7 +74,7 @@ class FramedResult(Base):
     async def top_rounds():
         async with AsyncScopedSession() as session:
             result = await session.execute(
-                Select(User.full_name.label('name'), func.count().label('score'))
+                Select(FramedResult.user_id.label('user_id'), User.full_name.label('name'), func.count().label('score'))
                 .select_from(FramedResult)
                 .join(User, User.id == FramedResult.user_id)
                 .group_by(FramedResult.user_id, User.full_name)
@@ -85,7 +87,11 @@ class FramedResult(Base):
     async def top_won():
         async with AsyncScopedSession() as session:
             result = await session.execute(
-                Select(User.full_name.label('name'), func.sum(cast(FramedResult.won, Integer)).label('score'))
+                Select(
+                    FramedResult.user_id.label('user_id'),
+                    User.full_name.label('name'),
+                    func.sum(cast(FramedResult.won, Integer)).label('score'),
+                )
                 .select_from(FramedResult)
                 .join(User, User.id == FramedResult.user_id)
                 .group_by(FramedResult.user_id, User.full_name)

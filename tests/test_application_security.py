@@ -47,7 +47,7 @@ def test_application_security(isolated_postgres, scenario):
     name = f'framed-fix-{suffix}-{scenario}'
     mounts = []
     # Mount only public application source. Never expose the checkout's environment or secrets.
-    for filename in ('main.py', 'reaction_delivery.py', 'stats.py', 'config.py', 'safe_logging.py', 'models', 'tests/application_security_probe.py'):
+    for filename in ('main.py', 'reaction_delivery.py', 'rich_tables.py', 'stats.py', 'config.py', 'safe_logging.py', 'models', 'tests/application_security_probe.py'):
         mounts.extend(['-v', f'{ROOT / filename}:/app/{filename}:ro'])
     try:
         result = docker('run', '--rm', '--name', name, '--network', network, '--memory', '600m',

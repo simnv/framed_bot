@@ -114,21 +114,23 @@ async def aggregate_stats():
         # Exercise the real /stats handler, not only the aggregate helper.
         sent = []
 
-        async def send_message(_bot, **kwargs):
-            sent.append(kwargs)
+        async def do_api_request(_bot, endpoint, api_kwargs, return_type=None):
+            assert endpoint == 'sendRichMessage'
+            sent.append(api_kwargs)
             return SimpleNamespace(id=19)
 
         message = Message(17, datetime.now(UTC), Chat(123, 'group'), from_user=TelegramUser(USER_ID, 'Synthetic', False), text='/stats')
         application = ApplicationBuilder().token('123:synthetic-only').job_queue(None).build()
         context = ContextTypes.DEFAULT_TYPE(application)
-        with patch.object(ExtBot, 'send_message', send_message):
+        with patch.object(ExtBot, 'do_api_request', do_api_request):
             await main.stats(Update(1, message=message), context)
     finally:
         event.remove(engine.sync_engine, 'after_cursor_execute', observe)
-    assert len(sent) == 1 and sent[0]['text'] == (
-        'Ты участвовал в 600 раундах framed.wtf, отгадал 300 фильмов в среднем с 2.0 кадра.'
-        '\nА ещё в 600 раундах episode.wtf, отгадал 300 сериалов в среднем с 2.0 кадра.'
-    )
+    assert len(sent) == 1
+    rich = sent[0]['rich_message']
+    assert rich['skip_entity_detection'] is True
+    for game in ('framed.wtf', 'episode.wtf'):
+        assert f'<td>{game}</td><td>600</td><td>300</td><td>2.00</td>' in rich['html']
     assert sum(max(0, count) for count in fetched) <= 3, f'/stats materialized history rows: {fetched}'
     assert len(statements) <= 3
     assert await stats_module.get_user_stats(USER_ID + 1) is None

@@ -5,7 +5,6 @@ import json
 import logging
 import re
 from datetime import timedelta
-from enum import IntEnum
 from typing import Protocol
 
 from safe_logging import configure_logging
@@ -16,11 +15,9 @@ from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, DB_CONNECTION_STRING
 
 configure_logging((BOT_TOKEN, DB_CONNECTION_STRING))
 
-from tabulate import tabulate
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    MessageEntity,
     ReactionTypeEmoji,
     Update,
 )
@@ -48,7 +45,8 @@ from models import FramedResult, User, init_db
 from models.episode_result import EpisodeResult
 from models.group import Group
 from reaction_delivery import ReactionDelivery, ReactionIntent
-from stats import Stats, get_user_stats
+from rich_tables import TopType, enrich_top_profiles, render_stats, render_top, send_rich_message
+from stats import get_user_stats
 
 framed_pattern = r'Framed #(?P<round>[\d]+)\n🎥(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){6})\n\nhttps:\/\/framed\.wtf'
 episode_pattern = r'Episode #(?P<round>[\d]+)\n📺(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){10})\n\nhttps:\/\/episode\.wtf'
@@ -97,13 +95,6 @@ def saved_reaction_for(win_frame: int | None) -> ReactionTypeEmoji:
     return first_frame_saved_result_reaction if win_frame == 1 else saved_result_reaction
 
 
-class TopType(IntEnum):
-    TOP_SCORE = 1
-    TOP_FRAME = 2
-    TOP_WIN = 3
-    TOP_ROUNDS = 4
-
-
 class FramedFilter(MessageFilter):
     def filter(self, message: Message):
         return message.text is not None and re.search(framed_pattern, message.text) is not None
@@ -134,14 +125,6 @@ async def delete_message_task(context: ContextTypes.DEFAULT_TYPE):
     if chat_id is None or not isinstance(message_id, int):
         return
     await context.bot.delete_message(chat_id, message_id)
-
-
-def pluralize(count: int, first_form: str, second_form: str, third_form: str):
-    if count % 10 == 1 and count != 11:
-        return first_form
-    if count % 10 in (2, 3, 4) and count not in (12, 13, 14):
-        return second_form
-    return third_form
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,45 +177,6 @@ async def new_episode_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_results(update, context, episode_pattern, EpisodeResult)
 
 
-async def generate_stats_text(framed_stats: Stats, episode_stats: Stats):
-    text = 'Ты участвовал в '
-    if framed_stats.rounds_count:
-        text += (
-            f'{framed_stats.rounds_count} '
-            f'{pluralize(framed_stats.rounds_count, "раунде", "раундах", "раундах")} '
-            f'framed.wtf, '
-        )
-        if framed_stats.rounds_won_count:
-            text += (
-                f'отгадал {framed_stats.rounds_won_count} '
-                f'{pluralize(framed_stats.rounds_won_count, "фильм", "фильма", "фильмов")} '
-                f'в среднем с {framed_stats.average_frame} кадра.'
-            )
-        else:
-            text += 'но ни разу ничего не отгадал.'
-
-    if framed_stats.rounds_count and episode_stats.rounds_count:
-        text += '\nА ещё в '
-
-    if episode_stats.rounds_count:
-        text += (
-            f'{episode_stats.rounds_count} '
-            f'{pluralize(episode_stats.rounds_count, "раунде", "раундах", "раундах")} '
-            f'episode.wtf, '
-        )
-
-        if episode_stats.rounds_won_count:
-            text += (
-                f'отгадал {episode_stats.rounds_won_count} '
-                f'{pluralize(episode_stats.rounds_won_count, "сериал", "сериала", "сериалов")} '
-                f'в среднем с {episode_stats.average_frame} кадра.'
-            )
-        else:
-            text += 'но ни разу ничего не отгадал.'
-
-    return text
-
-
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     effective_user = update.effective_user
     effective_chat = update.effective_chat
@@ -248,9 +192,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     framed_stats, episode_stats = user_stats
 
-    text = await generate_stats_text(framed_stats, episode_stats)
-
-    reply_message = await context.bot.send_message(chat_id=effective_chat.id, text=text, reply_to_message_id=message.id)
+    reply_message = await send_rich_message(
+        context.bot,
+        effective_chat.id,
+        render_stats(framed_stats, episode_stats),
+        reply_to_message_id=message.id,
+    )
 
     job_queue = context.job_queue
     if job_queue is None:
@@ -331,35 +278,14 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if effective_chat is None or message is None:
         return
     results = await FramedResult.top_score()
-    text = await format_top(TopType.TOP_SCORE, results)
-
-    await context.bot.send_message(
-        chat_id=effective_chat.id,
-        text=text,
+    profiles = await enrich_top_profiles(context.bot, results)
+    await send_rich_message(
+        context.bot,
+        effective_chat.id,
+        render_top(TopType.TOP_SCORE, profiles),
         reply_to_message_id=message.id,
-        entities=[MessageEntity(MessageEntity.CODE, 0, len(text))],
         reply_markup=top_reply_markup(TopType.TOP_SCORE),
     )
-
-
-async def format_top(top_type, results) -> str:
-    match top_type:
-        case TopType.TOP_WIN:
-            text = 'Топ по количеству отгаданных фильмов:\n'
-        case TopType.TOP_FRAME:
-            text = 'Топ по среднему отгаданному кадру:\n'
-        case TopType.TOP_SCORE:
-            text = 'Топ по очкам:\n'
-        case TopType.TOP_ROUNDS:
-            text = 'Топ по количеству участий:\n'
-        case _:
-            text = ''
-    text += tabulate(
-        [(i, result.name, result.score) for i, result in enumerate(results, 1)],
-        ('#', 'Имя', 'Очки'),
-        tablefmt='rounded_grid',
-    )
-    return text
 
 
 async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -379,15 +305,21 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         case TopType.TOP_ROUNDS:
             results = await FramedResult.top_rounds()
 
-    text = await format_top(top_type, results)
     query_message = query.message
     if not isinstance(query_message, TelegramMessage):
         await query.answer()
         return
-    await query_message.edit_text(
-        text,
-        entities=[MessageEntity(MessageEntity.CODE, 0, len(text))],
-        reply_markup=top_reply_markup(top_type),
+    profiles = await enrich_top_profiles(context.bot, results)
+    # PTB's typed edit_message_text still requires text; the public API bridge
+    # allows the new rich_message parameter without sending a plain text field.
+    await context.bot.do_api_request(
+        'editMessageText',
+        api_kwargs={
+            'chat_id': query_message.chat_id,
+            'message_id': query_message.message_id,
+            'rich_message': render_top(top_type, profiles),
+            'reply_markup': top_reply_markup(top_type),
+        },
     )
 
     await query.answer()

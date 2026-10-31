@@ -6,7 +6,7 @@ RUN groupadd --gid 10001 bot && useradd --uid 10001 --gid 10001 --no-create-home
 COPY --from=uv /uv /bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
-COPY config.py main.py reaction_delivery.py safe_logging.py stats.py ./
+COPY config.py main.py reaction_delivery.py rich_tables.py safe_logging.py stats.py ./
 COPY models/ ./models/
 COPY deploy/healthcheck.py deploy/start-bot.py deploy/role-policy.sql ./
 USER 10001:10001

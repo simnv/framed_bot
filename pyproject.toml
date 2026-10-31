@@ -7,7 +7,6 @@ dependencies = [
     "asyncpg>=0.32.0",
     "python-telegram-bot[job-queue,rate-limiter]>=22.8",
     "sqlalchemy[asyncio]>=2.1.6",
-    "tabulate>=0.10.0",
 ]
 
 [dependency-groups]
