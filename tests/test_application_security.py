@@ -40,14 +40,14 @@ def isolated_postgres():
         docker('network', 'rm', network, check=False)
 
 
-@pytest.mark.parametrize('scenario', ['profile', 'duplicates', 'stats', 'announce', 'migrations'])
+@pytest.mark.parametrize('scenario', ['profile', 'duplicates', 'stats', 'announce', 'migrations', 'answers'])
 def test_application_security(isolated_postgres, scenario):
     network, suffix = isolated_postgres
     image = os.environ.get('FRAMED_TEST_IMAGE', 'framed-bot:local-validation')
     name = f'framed-fix-{suffix}-{scenario}'
     mounts = []
     # Mount only public application source. Never expose the checkout's environment or secrets.
-    for filename in ('main.py', 'reaction_delivery.py', 'rich_tables.py', 'stats.py', 'config.py', 'safe_logging.py', 'models', 'tests/application_security_probe.py'):
+    for filename in ('main.py', 'reaction_delivery.py', 'rich_tables.py', 'stats.py', 'config.py', 'safe_logging.py', 'models', 'answers', 'tests/application_security_probe.py'):
         mounts.extend(['-v', f'{ROOT / filename}:/app/{filename}:ro'])
     try:
         result = docker('run', '--rm', '--name', name, '--network', network, '--memory', '600m',

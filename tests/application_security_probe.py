@@ -10,7 +10,7 @@ from unittest.mock import patch
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import event, inspect, insert, select, text
+from sqlalchemy import event, func, inspect, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from telegram import Chat, Message, Update, User as TelegramUser
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
@@ -254,11 +254,100 @@ async def migrations():
     print(json.dumps({'head': head, 'tables': sorted(tables)}))
 
 
+async def answers():
+    from answers.store import DbAnswerStore, PendingAnswer
+    from answers.tmdb import Credit, TitleData
+    from models.game_answer import GameAnswer
+    from models.title import Person, Title, TitlePerson
+
+    store = DbAnswerStore()
+
+    def show(tmdb_id, name, credits):
+        raw = {'id': tmdb_id, 'networks': [{'id': 49, 'name': 'HBO'}]}
+        return TitleData(tmdb_id, 'tv', name, name, 2018, None, ['US'], None, [(18, 'Drama')], [(3268, 'HBO')],
+                         credits, raw)
+
+    simon = [Credit(1, 'David Simon', 'creator', 0), Credit(1, 'David Simon', 'cast', 0)]
+    wire = show(1438, 'The Wire', simon)
+    succession = show(76331, 'Succession', [Credit(2, 'Jesse Armstrong', 'creator', 0)])
+    await User.update_from_tg_user(TelegramUser(USER_ID, 'Synthetic', False))
+    assert await store.max_result_round('episode') is None
+    assert await EpisodeResult.save_result(USER_ID, 3, True, 2)
+    assert await store.max_result_round('episode') == 3
+    assert await store.missing_rounds('episode', 3) == [1, 2, 3]
+    await store.insert_answers('episode', {1: 'The Wire', 2: 'Succession', 3: 'The Wire'})
+    # An existing answer row never changes.
+    await store.insert_answers('episode', {1: 'Changed'})
+    assert await store.missing_rounds('episode', 3) == []
+    assert await store.has_answer('episode', 2) and not await store.has_answer('framed', 2)
+    assert await store.pending('episode', 2) == [PendingAnswer(1, 'The Wire'), PendingAnswer(2, 'Succession')]
+    # Two rounds share one title; one person can be creator and cast of a title.
+    await store.save_title('episode', 1, wire, 'auto')
+    await store.save_title('episode', 3, wire, 'low_confidence')
+    await store.mark_unmatched('episode', 2)
+    assert await store.pending('episode', 3) == []
+    assert not await store.set_manual_title('episode', 9, wire)
+    assert await store.set_manual_title('episode', 2, succession)
+    # A sync result never replaces a manual choice.
+    await store.save_title('episode', 2, wire, 'auto')
+    await store.mark_unmatched('episode', 2)
+    async with engine.connect() as conn:
+        rows = (await conn.execute(
+            select(GameAnswer.round, GameAnswer.source_title, Title.name, GameAnswer.match_status)
+            .join(Title, Title.id == GameAnswer.title_id).order_by(GameAnswer.round)
+        )).all()
+        assert rows == [(1, 'The Wire', 'The Wire', 'auto'), (2, 'Succession', 'Succession', 'manual'),
+                        (3, 'The Wire', 'The Wire', 'low_confidence')], rows
+        assert (await conn.execute(select(func.count()).select_from(Title))).scalar_one() == 2
+        roles = (await conn.execute(
+            select(Person.name, TitlePerson.role).join(Person).order_by(TitlePerson.role, Person.name)
+        )).all()
+        assert roles == [('David Simon', 'cast'), ('David Simon', 'creator'), ('Jesse Armstrong', 'creator')], roles
+        network = Title.raw['networks'][0]['name'].astext
+        assert (await conn.execute(select(network).where(Title.tmdb_id == 1438))).scalar_one() == 'HBO'
+    # A new fetch replaces the links of the title.
+    await store.save_title('episode', 1, show(1438, 'The Wire', []), 'auto')
+    async with engine.connect() as conn:
+        assert (await conn.execute(select(func.count()).select_from(TitlePerson))).scalar_one() == 1
+    print(json.dumps({'answers': len(rows)}))
+    await concurrent_answers(store, wire)
+
+
+async def concurrent_answers(store, wire):
+    from answers.tmdb import Credit, TitleData
+    from models.game_answer import GameAnswer
+
+    # A sync and a manual fix of the same answer and title overlap; the answer row lock comes first in both.
+    rounds = range(10, 40)
+    await store.insert_answers('episode', {number: 'The Wire' for number in rounds})
+    for number in rounds:
+        await asyncio.gather(store.save_title('episode', number, wire, 'auto'),
+                             store.set_manual_title('episode', number, wire))
+    # Framed and Episode share person, genre and company rows in reverse order; sorted upserts keep one lock order.
+    people = [Credit(10_000 + number, f'Person {number}', 'cast', number) for number in range(60)]
+    film = TitleData(5000, 'movie', 'Film', 'Film', 2000, 90, ['US'], None, [(18, 'Drama'), (35, 'Comedy')],
+                     [(3268, 'HBO'), (33, 'Universal Pictures')], people, {})
+    show = TitleData(6000, 'tv', 'Show', 'Show', 2001, None, ['US'], None, [(35, 'Comedy'), (18, 'Drama')],
+                     [(33, 'Universal Pictures'), (3268, 'HBO')], people[::-1], {})
+    await store.insert_answers('framed', {number: 'Film' for number in rounds})
+    await store.insert_answers('episode', {number + 100: 'Show' for number in rounds})
+    for number in rounds:
+        await asyncio.gather(store.save_title('framed', number, film, 'auto'),
+                             store.save_title('episode', number + 100, show, 'auto'))
+    async with engine.connect() as conn:
+        statuses = (await conn.execute(
+            select(GameAnswer.match_status, func.count()).where(GameAnswer.title_id.is_not(None))
+            .group_by(GameAnswer.match_status).order_by(GameAnswer.match_status)
+        )).all()
+    # Rounds 1-3 from the scenario above, 30 manual fixes, 60 concurrent title saves.
+    assert statuses == [('auto', 61), ('low_confidence', 1), ('manual', 31)], statuses
+
+
 async def run():
     try:
         await reset()
         scenarios = {'profile': profile, 'duplicates': duplicates, 'stats': aggregate_stats, 'announce': announce,
-                     'migrations': migrations}
+                     'migrations': migrations, 'answers': answers}
         await scenarios[sys.argv[1]]()
     finally:
         await engine.dispose()
