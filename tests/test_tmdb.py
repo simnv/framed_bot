@@ -117,13 +117,77 @@ async def test_find_marks_different_first_result_as_low_confidence() -> None:
         {
             '/3/search/movie': search(
                 {'id': 1, 'title': 'Halloween Kills', 'original_title': 'Halloween Kills'},
-                {'id': 424139, 'title': 'Halloween', 'original_title': 'Halloween'},
+                {'id': 2, 'title': 'Halloween Ends', 'original_title': 'Halloween Ends'},
             )
         },
         [],
     )
 
     assert await tmdb.find('movie', 'Halloween') == Match(1, 'low_confidence')
+
+
+@pytest.mark.asyncio
+async def test_find_prefers_exact_match_further_down_the_results() -> None:
+    tmdb = tmdb_for(
+        {
+            '/3/search/movie': search(
+                {'id': 1, 'title': 'The Batman', 'original_title': 'The Batman'},
+                {'id': 2, 'title': 'Batman Returns', 'original_title': 'Batman Returns'},
+                {'id': 3, 'title': 'Batman', 'original_title': 'Batman'},
+            )
+        },
+        [],
+    )
+
+    assert await tmdb.find('movie', 'Batman') == Match(3, 'auto')
+
+
+@pytest.mark.asyncio
+async def test_find_takes_first_of_two_exact_matches() -> None:
+    tmdb = tmdb_for(
+        {
+            '/3/search/movie': search(
+                {'id': 1, 'title': 'Big Hero 6', 'original_title': 'Big Hero 6'},
+                {'id': 2, 'title': 'Big', 'original_title': 'Big'},
+                {'id': 3, 'title': 'Big', 'original_title': 'Big'},
+            )
+        },
+        [],
+    )
+
+    assert await tmdb.find('movie', 'Big') == Match(2, 'auto')
+
+
+@pytest.mark.asyncio
+async def test_find_accepts_original_name_match_further_down() -> None:
+    tmdb = tmdb_for(
+        {
+            '/3/search/movie': search(
+                {'id': 1, 'title': 'Spirited Away', 'original_title': 'Sen to Chihiro'},
+                {'id': 2, 'title': 'Amelie', 'original_title': 'Le Fabuleux Destin'},
+                {'id': 3, 'title': 'Amelie Poulain', 'original_title': 'Amélie'},
+            )
+        },
+        [],
+    )
+
+    assert await tmdb.find('movie', 'Amélie') == Match(3, 'auto')
+
+
+@pytest.mark.asyncio
+async def test_find_validates_entries_after_an_exact_match() -> None:
+    tmdb = tmdb_for(
+        {
+            '/3/search/movie': search(
+                {'id': 1, 'title': 'Batman', 'original_title': 'Batman'},
+                {'id': True, 'title': 'Batman Returns'},
+            )
+        },
+        [],
+    )
+
+    with pytest.raises(TmdbError, match='TMDB movie search has an unexpected shape'):
+        await tmdb.find('movie', 'Batman')
 
 
 @pytest.mark.asyncio

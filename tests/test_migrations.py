@@ -24,7 +24,7 @@ def offline_sql(*args: str) -> str:
 
 
 def test_revision_0002_adds_new_tables_only() -> None:
-    sql = offline_sql('upgrade', '0001:head')
+    sql = offline_sql('upgrade', '0001:0002')
 
     assert sorted(re.findall(r'^CREATE TABLE (\w+)', sql, re.MULTILINE)) == list(NEW_TABLES)
     assert 'ALTER TABLE' not in sql
@@ -40,6 +40,17 @@ def test_revision_0002_downgrade_drops_only_new_tables() -> None:
     sql = offline_sql('downgrade', '0002:0001')
 
     assert sorted(re.findall(r'^DROP TABLE (\w+)', sql, re.MULTILINE)) == list(NEW_TABLES)
+
+
+def test_revision_0003_clears_low_confidence_matches() -> None:
+    sql = offline_sql('upgrade', '0002:head')
+
+    assert (
+        "UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() "
+        "WHERE match_status = 'low_confidence'"
+    ) in sql
+    assert "UPDATE alembic_version SET version_num='0003' WHERE alembic_version.version_num = '0002'" in sql
+    assert 'DROP' not in sql
 
 
 def test_models_register_new_tables() -> None:

@@ -214,24 +214,32 @@ class TmdbClient:
         return data
 
     async def find(self, kind: Kind, source_title: str) -> Match | None:
-        """Return the first result, or None when the result list is empty (unmatched)."""
+        """Return the first result whose name or original name equals the query ('auto').
+
+        Fall back to the first result ('low_confidence'), or None when the result list is empty (unmatched).
+        Every entry is validated, also after an exact match.
+        """
         query, year = split_year(source_title)
         params: dict[str, str | int] = {'query': query}
         if year is not None:
             params['primary_release_year' if kind == 'movie' else 'first_air_date_year'] = year
         data = await self._get(f'/search/{kind}', params)
+        name_key, original_key = ('title', 'original_title') if kind == 'movie' else ('name', 'original_name')
+        wanted = normalize(query)
         try:
-            results = _list(data['results'])
-            if not results:
-                return None
-            first = _dict(results[0])
-            name_key, original_key = ('title', 'original_title') if kind == 'movie' else ('name', 'original_name')
-            names = {_str(first[name_key]), _optional_str(first.get(original_key))}
-            tmdb_id = _int(first['id'])
+            entries = [_dict(entry) for entry in _list(data['results'])]
+            candidates: list[tuple[int, set[str]]] = []
+            for entry in entries:
+                names = {_str(entry[name_key]), _optional_str(entry.get(original_key))}
+                candidates.append((_int(entry['id']), {normalize(name) for name in names if name}))
         except _Malformed, KeyError:
             raise TmdbError(f'TMDB {kind} search has an unexpected shape') from None
-        exact = normalize(query) in {normalize(name) for name in names if name}
-        return Match(tmdb_id, 'auto' if exact else 'low_confidence')
+        if not candidates:
+            return None
+        for tmdb_id, names in candidates:
+            if wanted in names:
+                return Match(tmdb_id, 'auto')
+        return Match(candidates[0][0], 'low_confidence')
 
     async def details(self, kind: Kind, tmdb_id: int) -> TitleData:
         data = await self._get(f'/{kind}/{tmdb_id}', {'append_to_response': APPEND[kind]})
