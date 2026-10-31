@@ -169,3 +169,19 @@ def test_extract_titles_rejects_malformed_values(script: str) -> None:
 def test_js_unescape_rejects_malformed_escapes(raw: str) -> None:
     with pytest.raises(ScrapeError):
         js_unescape(raw)
+
+
+@pytest.mark.asyncio
+async def test_episode_accepts_identical_answer_arrays_in_two_chunks() -> None:
+    texts = {
+        'https://episode.wtf/': fixture('episode_home.html'),
+        'https://episode.wtf/_next/static/chunks/webpack-fe87f2cbe8ee01db.js': (
+            'n.u=function(e){return"static/chunks/"+e+"."+{87:"0111d1a5ef9290c6",88:"0123456789abcdef"}[e]+".js"}'
+        ),
+        'https://episode.wtf/_next/static/chunks/87.0111d1a5ef9290c6.js': short_array(100),
+        'https://episode.wtf/_next/static/chunks/88.0123456789abcdef.js': short_array(100),
+    }
+    async with text_client(texts) as client:
+        titles = await fetch_titles('episode', client)
+
+    assert titles == [f'Film {number}' for number in range(1, 101)]

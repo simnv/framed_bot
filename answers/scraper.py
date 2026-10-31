@@ -118,6 +118,7 @@ async def fetch_titles(game: Game, client: httpx.AsyncClient) -> list[str]:
         titles = find_titles(await _get(client, url))
         if titles is not None:
             candidates.append(titles)
-    if len(candidates) != 1:
-        raise ScrapeError(f'Found {len(candidates)} answer arrays in lazy chunks')
+    # Several chunks may hold the same array (the site shares it); differing arrays are ambiguous.
+    if not candidates or any(titles != candidates[0] for titles in candidates):
+        raise ScrapeError('Lazy chunks lack one answer array or hold differing ones')
     return checked(candidates[0])
