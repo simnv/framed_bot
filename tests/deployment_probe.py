@@ -1,4 +1,5 @@
 """Container-only integration probe: synthetic credentials, no Telegram API calls."""
+
 import asyncio
 from pathlib import Path
 
@@ -15,8 +16,10 @@ from models.user import User
 
 async def result_counts(user_id):
     async with engine.connect() as conn:
-        return [(await conn.execute(select(func.count()).where(model.user_id == user_id))).scalar_one()
-                for model in (FramedResult, EpisodeResult)]
+        return [
+            (await conn.execute(select(func.count()).where(model.user_id == user_id))).scalar_one()
+            for model in (FramedResult, EpisodeResult)
+        ]
 
 
 async def main():
@@ -31,14 +34,24 @@ async def main():
     assert user is not None and user.id == user_id
     assert await result_counts(user_id) == [1, 1]
     async with engine.connect() as conn:
-        types = (await conn.execute(text("SELECT data_type FROM information_schema.columns WHERE (table_name = 'user' AND column_name = 'id') OR (table_name IN ('framed_result', 'episode_result') AND column_name = 'user_id')"))).scalars().all()
+        types = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns WHERE (table_name = 'user' AND column_name = 'id') OR (table_name IN ('framed_result', 'episode_result') AND column_name = 'user_id')"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         assert types == ['bigint'] * 3
     persistence = PicklePersistence(filepath='/data/bot_data')
     await persistence.update_bot_data({'probe': user_id})
     await persistence.flush()
     Path('/control/ready').touch()
     while not Path('/control/restarted').exists():
-        await asyncio.sleep(.1)
+        await asyncio.sleep(0.1)
     # The same already-used engine/pool must recover on its first query after restart.
     user = await User.get(user_id)
     assert user is not None and await result_counts(user_id) == [1, 1]

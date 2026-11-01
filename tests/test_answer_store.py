@@ -45,18 +45,23 @@ async def test_title_links_deduplicate_ids_and_person_roles() -> None:
     session = AsyncMock(spec=AsyncSession)
     session.execute.return_value = Mock(scalar_one=Mock(return_value=42))
     data = TitleData(
-        1, 'movie', 'Film', 'Film', None, None, [], None,
+        1,
+        'movie',
+        'Film',
+        'Film',
+        None,
+        None,
+        [],
+        None,
         [(35, 'Comedy'), (18, 'Drama'), (35, 'Comedy')],
         [(33, 'Studio'), (2, 'Other studio'), (33, 'Studio')],
-        [Credit(7, 'Actor', 'cast', 0), Credit(7, 'Actor', 'cast', 1), Credit(7, 'Actor', 'director', 0)], {},
+        [Credit(7, 'Actor', 'cast', 0), Credit(7, 'Actor', 'cast', 1), Credit(7, 'Actor', 'director', 0)],
+        {},
     )
 
     assert await _upsert_title(session, data) == 42
 
-    rows = {
-        call.args[0].table.name: call.args[1]
-        for call in session.execute.await_args_list if len(call.args) == 2
-    }
+    rows = {call.args[0].table.name: call.args[1] for call in session.execute.await_args_list if len(call.args) == 2}
     assert rows['title_genre'] == [{'title_id': 42, 'genre_id': 18}, {'title_id': 42, 'genre_id': 35}]
     assert rows['title_company'] == [{'title_id': 42, 'company_id': 2}, {'title_id': 42, 'company_id': 33}]
     assert rows['title_person'] == [

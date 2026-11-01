@@ -99,14 +99,13 @@ async def test_set_title_rejects_bad_arguments(monkeypatch: pytest.MonkeyPatch, 
 
 
 @pytest.mark.parametrize(
-    'value', ['x', '²', '0', '-1', '2147483648', '9' * 5000],
+    'value',
+    ['x', '²', '0', '-1', '2147483648', '9' * 5000],
     ids=['text', 'unicode-digit', 'zero', 'negative', 'overflow', 'huge'],
 )
 @pytest.mark.parametrize('argument', [1, 2], ids=['round', 'tmdb-id'])
 @pytest.mark.asyncio
-async def test_set_title_rejects_invalid_numbers(
-    monkeypatch: pytest.MonkeyPatch, value: str, argument: int
-) -> None:
+async def test_set_title_rejects_invalid_numbers(monkeypatch: pytest.MonkeyPatch, value: str, argument: int) -> None:
     application = build_application()
     details = AsyncMock(return_value=title_data())
     enable_tmdb(monkeypatch, application, details)

@@ -48,7 +48,8 @@ REQUEST_TIMEOUT: Final = 120.0
 EXIT_GRACE: Final = 0.5
 TERMINATE_GRACE: Final = 0.7
 KILL_GRACE: Final = 0.5
-RECEIVER_GRACE: Final = 0.5
+# One budget for stopping the child: graceful exit, terminate, kill and the wait for the receiver thread.
+CHILD_BUDGET: Final = 2.0
 INPUT: Final = 'pixel_values'
 OUTPUT: Final = 'image_embeds'
 
@@ -196,6 +197,7 @@ class ProcessEmbedder:
         self._target = serve
         # The thread that reads the current reply, and the connections whose receiver would not stop (never closed).
         self._receiver: concurrent.futures.Future[object] | None = None
+        self._waiter: asyncio.Future[object] | None = None
         self._leaked: list[tuple[Connection, concurrent.futures.Future[object]]] = []
 
     @property
@@ -267,9 +269,26 @@ class ProcessEmbedder:
             except BaseException as error:  # delivered to the awaiting request
                 receiver.set_exception(error)
 
-        self._receiver = receiver
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[object] = loop.create_future()
+
+        def deliver(done: concurrent.futures.Future[object]) -> None:
+            if waiter.done():
+                return
+            error = done.exception()
+            if error is not None:
+                waiter.set_exception(error)
+            else:
+                waiter.set_result(done.result())
+
+        def notify(done: concurrent.futures.Future[object]) -> None:
+            with contextlib.suppress(RuntimeError):  # the loop may be closed by then
+                loop.call_soon_threadsafe(deliver, done)
+
+        self._receiver, self._waiter = receiver, waiter
+        receiver.add_done_callback(notify)
         threading.Thread(target=receive, daemon=True).start()
-        reply = await asyncio.wrap_future(receiver)
+        reply = await waiter
         if type(reply) is not tuple or len(reply) != 2 or type(reply[0]) is not str:
             raise EOFError
         return cast(tuple[str, object], reply)
@@ -279,22 +298,31 @@ class ProcessEmbedder:
         self._failure = name
         self._stop_now()
 
-    def _stop_now(self) -> None:
-        process, connection, receiver = self._process, self._connection, self._receiver
-        self._process = self._connection = self._receiver = None
+    def _stop_now(self, deadline: float | None = None) -> None:
+        """Stop the child and release its connection within one deadline (default: CHILD_BUDGET from now)."""
+        if deadline is None:
+            deadline = time.monotonic() + CHILD_BUDGET
+
+        def remaining(limit: float) -> float:
+            return max(0.0, min(limit, deadline - time.monotonic()))
+
+        process, connection, receiver, waiter = self._process, self._connection, self._receiver, self._waiter
+        self._process = self._connection = self._receiver = self._waiter = None
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(EOFError())  # wake the request; a stuck receiver must not hold it
         if process is not None and process.is_alive():
             process.terminate()
-            process.join(TERMINATE_GRACE)
+            process.join(remaining(TERMINATE_GRACE))
             if process.is_alive():
                 process.kill()
-                process.join(KILL_GRACE)
+                process.join(remaining(KILL_GRACE))
         if connection is None:
             return
         # With the child gone the receiver reads EOF. Close the descriptor only after the receiver has finished:
         # a receiver paused inside recv still holds the number, and a new pipe could reuse it.
         if receiver is not None:
             self._receiver = receiver
-            concurrent.futures.wait([receiver], timeout=RECEIVER_GRACE)
+            concurrent.futures.wait([receiver], timeout=remaining(CHILD_BUDGET))
             self._receiver = None
             if not receiver.done():
                 logger.warning('CLIP receiver did not stop; its connection stays open: %s', 'ReceiverStuck')
@@ -312,7 +340,8 @@ class ProcessEmbedder:
         if connection is not None and not self._lock.locked():
             with contextlib.suppress(Exception):
                 connection.send(('exit',))
-        deadline = time.monotonic() + EXIT_GRACE
-        while process.is_alive() and time.monotonic() < deadline:
+        started = time.monotonic()
+        exit_by = started + EXIT_GRACE
+        while process.is_alive() and time.monotonic() < exit_by:
             await asyncio.sleep(0.02)
-        self._stop_now()
+        self._stop_now(started + CHILD_BUDGET)

@@ -1,4 +1,5 @@
 """Opt-in application regressions against disposable PostgreSQL; no Telegram API."""
+
 import os
 import subprocess
 import time
@@ -25,15 +26,32 @@ def isolated_postgres():
     network, db = f'framed-fix-{suffix}-net', f'framed-fix-{suffix}-db'
     try:
         docker('network', 'create', '--internal', network)
-        docker('run', '-d', '--name', db, '--network', network, '--network-alias', 'db',
-               '--memory', '256m', '--tmpfs', '/var/lib/postgresql',
-               '-e', 'POSTGRES_USER=synthetic', '-e', 'POSTGRES_DB=synthetic',
-               '-e', 'POSTGRES_PASSWORD=synthetic-only', 'postgres:18.6-trixie')
+        docker(
+            'run',
+            '-d',
+            '--name',
+            db,
+            '--network',
+            network,
+            '--network-alias',
+            'db',
+            '--memory',
+            '256m',
+            '--tmpfs',
+            '/var/lib/postgresql',
+            '-e',
+            'POSTGRES_USER=synthetic',
+            '-e',
+            'POSTGRES_DB=synthetic',
+            '-e',
+            'POSTGRES_PASSWORD=synthetic-only',
+            'postgres:18.6-trixie',
+        )
         deadline = time.monotonic() + 60
         while docker('exec', db, 'pg_isready', '-U', 'synthetic', '-d', 'synthetic', check=False).returncode:
             if time.monotonic() > deadline:
                 pytest.fail('Isolated PostgreSQL did not become ready')
-            time.sleep(.2)
+            time.sleep(0.2)
         yield network, suffix
     finally:
         docker('rm', '-f', db, check=False)
@@ -47,14 +65,43 @@ def test_application_security(isolated_postgres, scenario):
     name = f'framed-fix-{suffix}-{scenario}'
     mounts = []
     # Mount only public application source. Never expose the checkout's environment or secrets.
-    for filename in ('main.py', 'reaction_delivery.py', 'rich_tables.py', 'stats.py', 'config.py', 'safe_logging.py', 'models', 'answers', 'tests/application_security_probe.py'):
+    for filename in (
+        'main.py',
+        'reaction_delivery.py',
+        'rich_tables.py',
+        'stats.py',
+        'config.py',
+        'safe_logging.py',
+        'models',
+        'answers',
+        'tests/application_security_probe.py',
+    ):
         mounts.extend(['-v', f'{ROOT / filename}:/app/{filename}:ro'])
     try:
-        result = docker('run', '--rm', '--name', name, '--network', network, '--memory', '600m',
-                        '-e', 'BOT_TOKEN=123:synthetic-only', '-e', 'ADMIN_USER_ID=1',
-                        '-e', 'DB_CONNECTION_STRING=postgresql+asyncpg://synthetic:synthetic-only@db:5432/synthetic',
-                        '-e', 'PYTHONPATH=/app', *mounts, image,
-                        'python', '/app/tests/application_security_probe.py', scenario, check=False)
+        result = docker(
+            'run',
+            '--rm',
+            '--name',
+            name,
+            '--network',
+            network,
+            '--memory',
+            '600m',
+            '-e',
+            'BOT_TOKEN=123:synthetic-only',
+            '-e',
+            'ADMIN_USER_ID=1',
+            '-e',
+            'DB_CONNECTION_STRING=postgresql+asyncpg://synthetic:synthetic-only@db:5432/synthetic',
+            '-e',
+            'PYTHONPATH=/app',
+            *mounts,
+            image,
+            'python',
+            '/app/tests/application_security_probe.py',
+            scenario,
+            check=False,
+        )
         assert result.returncode == 0, result.stdout + result.stderr
         print(result.stdout.strip())
     finally:

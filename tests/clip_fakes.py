@@ -1,6 +1,7 @@
 """Session factories for the CLIP child process in tests. The spawned child imports this module by name."""
 
 import os
+import signal
 import struct
 import time
 
@@ -60,3 +61,9 @@ def stalling_serve(connection, model_path: str, threads: int, factory) -> None: 
     connection.recv()
     os.write(connection.fileno(), struct.pack('!i', 1000) + b'x')
     time.sleep(600.0)
+
+
+def stubborn_serve(connection, model_path: str, threads: int, factory) -> None:  # noqa: ANN001
+    """Like stalling_serve, but it also ignores SIGTERM, so only SIGKILL stops it."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    stalling_serve(connection, model_path, threads, factory)

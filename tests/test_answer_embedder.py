@@ -253,19 +253,36 @@ def paused_body_read(monkeypatch: pytest.MonkeyPatch, pause: float) -> tuple[thr
     return entered, release
 
 
+def release_when_dead(process: BaseProcess, release: threading.Event) -> None:
+    """Release the paused receiver only after the child is gone and reaped."""
+
+    def watch() -> None:
+        while True:
+            try:
+                os.kill(process.pid, 0)  # ty: ignore[invalid-argument-type]
+            except ProcessLookupError:
+                release.set()
+                return
+            time.sleep(0.005)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 @pytest.mark.asyncio
 async def test_the_receiver_finishes_before_its_connection_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    entered, _ = paused_body_read(monkeypatch, pause=0.3)
-    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=1.0)
+    entered, release = paused_body_read(monkeypatch, pause=30.0)
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=0.5)
     embedder._target = clip_fakes.stalling_serve
-    seen: list[bool] = []
+    closed_with_receiver_done: dict[int, bool] = {}
+    receivers: list[object] = []
     close = Connection.close
 
     def watching_close(self: Connection) -> None:
-        receiver = embedder._receiver
-        seen.append(receiver is None or receiver.done())
+        if receivers and self is embedder_connection[0]:
+            closed_with_receiver_done[id(self)] = receivers[0].done()  # ty: ignore[unresolved-attribute]
         close(self)
 
+    embedder_connection: list[Connection] = []
     monkeypatch.setattr(Connection, 'close', watching_close)
     pipes = 0
     pipe = embedder._context.Pipe
@@ -276,17 +293,52 @@ async def test_the_receiver_finishes_before_its_connection_is_closed(monkeypatch
         return pipe()
 
     monkeypatch.setattr(embedder._context, 'Pipe', counting_pipe)
+    request = asyncio.create_task(embedder.embed([jpeg()]))
+    process = await wait_for_child(embedder)
+    for _ in range(300):
+        if entered.is_set() and embedder._receiver is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert embedder._connection is not None and embedder._receiver is not None
+    embedder_connection.append(embedder._connection)
+    receivers.append(embedder._receiver)
+    release_when_dead(process, release)
 
     with pytest.raises(EmbedderError, match='TimeoutError'):
-        await embedder.embed([jpeg()])
+        await request
 
-    assert entered.is_set()
-    assert seen and all(seen)
-    assert embedder._receiver is None
+    assert closed_with_receiver_done == {id(embedder_connection[0]): True}
     assert pipes == 1
     with pytest.raises(EmbedderError):
         await embedder.embed([jpeg()])
     assert pipes == 1
+
+
+@pytest.mark.asyncio
+async def test_close_with_a_stubborn_child_and_a_stuck_receiver_fits_the_child_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = paused_body_read(monkeypatch, pause=30.0)
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour)
+    embedder._target = clip_fakes.stubborn_serve
+    request = asyncio.create_task(embedder.embed([jpeg()]))
+    process = await wait_for_child(embedder)
+    for _ in range(300):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    try:
+        started = time.monotonic()
+        await embedder.close()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.2
+        assert process.exitcode is not None
+        assert len(embedder._leaked) == 1
+        with pytest.raises(EmbedderError):
+            await request
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio

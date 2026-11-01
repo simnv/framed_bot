@@ -1,4 +1,5 @@
 """Isolated real database probes using synthetic data, without Telegram networking."""
+
 import asyncio
 import json
 import resource
@@ -43,10 +44,13 @@ async def seed_history():
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Synthetic', False))
     async with engine.begin() as conn:
         for model in (FramedResult, EpisodeResult):
-            await conn.execute(insert(model), [
-                dict(user_id=USER_ID, framed_round=i, won=i % 2 == 0, win_frame=2 if i % 2 == 0 else None)
-                for i in range(600)
-            ])
+            await conn.execute(
+                insert(model),
+                [
+                    dict(user_id=USER_ID, framed_round=i, won=i % 2 == 0, win_frame=2 if i % 2 == 0 else None)
+                    for i in range(600)
+                ],
+            )
 
 
 async def profile():
@@ -63,10 +67,14 @@ async def profile():
         await User.update_from_tg_user(TelegramUser(USER_ID, 'Renamed', False, username='new_name'))
     finally:
         event.remove(engine.sync_engine, 'after_cursor_execute', observe)
-    assert not any('framed_result' in sql or 'episode_result' in sql for sql in statements), \
+    assert not any('framed_result' in sql or 'episode_result' in sql for sql in statements), (
         f'Profile update read game histories: returned rows={rows}'
+    )
     async with engine.connect() as conn:
-        assert (await conn.execute(select(User.full_name, User.username).where(User.id == USER_ID))).one() == ('Renamed', 'new_name')
+        assert (await conn.execute(select(User.full_name, User.username).where(User.id == USER_ID))).one() == (
+            'Renamed',
+            'new_name',
+        )
     profile_rows = list(rows)
     profile_statements = len(statements)
     rows.clear()
@@ -81,9 +89,16 @@ async def profile():
     # Re-registration must be safe even when handlers overlap for a new account/group.
     await asyncio.gather(*(User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Concurrent', False)) for _ in range(12)))
     await asyncio.gather(*(Group.update_from_tg_chat(Chat(-99, 'group', title='Concurrent')) for _ in range(12)))
-    print(json.dumps({'profile_statements': profile_statements, 'profile_rows': profile_rows,
-                      'history_read_rows': rows,
-                      'rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+    print(
+        json.dumps(
+            {
+                'profile_statements': profile_statements,
+                'profile_rows': profile_rows,
+                'history_read_rows': rows,
+                'rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            }
+        )
+    )
 
 
 async def duplicates():
@@ -92,7 +107,12 @@ async def duplicates():
     for model in (FramedResult, EpisodeResult):
         results = await asyncio.gather(*(model.save_result(USER_ID, 77, True, 2) for _ in range(12)))
         async with engine.connect() as conn:
-            count = (await conn.execute(text(f'SELECT count(*) FROM {model.__tablename__} WHERE user_id=:id AND framed_round=77'), {'id': USER_ID})).scalar_one()
+            count = (
+                await conn.execute(
+                    text(f'SELECT count(*) FROM {model.__tablename__} WHERE user_id=:id AND framed_round=77'),
+                    {'id': USER_ID},
+                )
+            ).scalar_one()
         assert sum(results) == count == 1, (model.__tablename__, sum(results), count)
         # Enforce the invariant even for future callers that bypass save_result.
         try:
@@ -126,7 +146,13 @@ async def aggregate_stats():
             sent.append(api_kwargs)
             return SimpleNamespace(id=19)
 
-        message = Message(17, datetime.now(UTC), Chat(123, 'group'), from_user=TelegramUser(USER_ID, 'Synthetic', False), text='/stats')
+        message = Message(
+            17,
+            datetime.now(UTC),
+            Chat(123, 'group'),
+            from_user=TelegramUser(USER_ID, 'Synthetic', False),
+            text='/stats',
+        )
         application = ApplicationBuilder().token('123:synthetic-only').job_queue(None).build()
         context = ContextTypes.DEFAULT_TYPE(application)
         with patch.object(ExtBot, 'do_api_request', do_api_request):
@@ -142,11 +168,17 @@ async def aggregate_stats():
     assert len(statements) <= 3
     assert await stats_module.get_user_stats(USER_ID + 1) is None
     await User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Empty', False))
-    assert await stats_module.get_user_stats(USER_ID + 1) == (stats_module.Stats(0, 0, None), stats_module.Stats(0, 0, None))
+    assert await stats_module.get_user_stats(USER_ID + 1) == (
+        stats_module.Stats(0, 0, None),
+        stats_module.Stats(0, 0, None),
+    )
     async with engine.begin() as conn:
         await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=1, won=False, win_frame=None))
         await conn.execute(insert(EpisodeResult).values(user_id=USER_ID + 1, framed_round=1, won=True, win_frame=3))
-    assert await stats_module.get_user_stats(USER_ID + 1) == (stats_module.Stats(1, 0, None), stats_module.Stats(1, 1, 3.0))
+    assert await stats_module.get_user_stats(USER_ID + 1) == (
+        stats_module.Stats(1, 0, None),
+        stats_module.Stats(1, 1, 3.0),
+    )
     async with engine.begin() as conn:
         await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=2, won=True, win_frame=None))
     try:
@@ -155,8 +187,15 @@ async def aggregate_stats():
         pass
     else:
         raise AssertionError('Invalid winning row silently changed the average')
-    print(json.dumps({'stats_statements': len(statements), 'stats_rows': fetched,
-                      'rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))
+    print(
+        json.dumps(
+            {
+                'stats_statements': len(statements),
+                'stats_rows': fetched,
+                'rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            }
+        )
+    )
 
 
 async def announce():
@@ -188,7 +227,13 @@ async def announce():
     async def sleep(delay):
         sleeps.append(delay)
 
-    message = Message(17, datetime.now(UTC), Chat(1, 'private'), from_user=TelegramUser(1, 'Admin', False), text='/announce Synthetic notice')
+    message = Message(
+        17,
+        datetime.now(UTC),
+        Chat(1, 'private'),
+        from_user=TelegramUser(1, 'Admin', False),
+        text='/announce Synthetic notice',
+    )
     application = ApplicationBuilder().token('123:synthetic-only').build()
     context = ContextTypes.DEFAULT_TYPE(application)
     with patch('asyncio.sleep', sleep), patch.object(ExtBot, 'send_message', send_message):
@@ -199,9 +244,11 @@ async def announce():
     assert attempts.count(-9) == 1
     assert max(sleeps) <= 5 and sum(sleeps) <= 8
     assert {group.id for group in await Group.get_all()} == {-9, -8, -5, -4, -3, -2, -1}
+
     # A later announcement excludes permanently unavailable recipients.
     async def later_send(_bot, *, chat_id, text):
         assert chat_id not in (-7, -6)
+
     with patch.object(ExtBot, 'send_message', later_send):
         await main.announce(Update(2, message=message), context)
     # Fresh activity can register a previously unavailable recipient again.
@@ -264,8 +311,9 @@ async def answers():
 
     def show(tmdb_id, name, credits):
         raw = {'id': tmdb_id, 'networks': [{'id': 49, 'name': 'HBO'}]}
-        return TitleData(tmdb_id, 'tv', name, name, 2018, None, ['US'], None, [(18, 'Drama')], [(3268, 'HBO')],
-                         credits, raw)
+        return TitleData(
+            tmdb_id, 'tv', name, name, 2018, None, ['US'], None, [(18, 'Drama')], [(3268, 'HBO')], credits, raw
+        )
 
     simon = [Credit(1, 'David Simon', 'creator', 0), Credit(1, 'David Simon', 'cast', 0)]
     wire = show(1438, 'The Wire', simon)
@@ -295,16 +343,24 @@ async def answers():
     await store.save_title('episode', 2, wire, 'auto')
     await store.mark_unmatched('episode', 2)
     async with engine.connect() as conn:
-        rows = (await conn.execute(
-            select(GameAnswer.round, GameAnswer.source_title, Title.name, GameAnswer.match_status)
-            .join(Title, Title.id == GameAnswer.title_id).order_by(GameAnswer.round)
-        )).all()
-        assert rows == [(1, 'The Wire', 'The Wire', 'auto'), (2, 'Succession', 'Succession', 'manual'),
-                        (3, 'The Wire', 'The Wire', 'low_confidence')], rows
+        rows = (
+            await conn.execute(
+                select(GameAnswer.round, GameAnswer.source_title, Title.name, GameAnswer.match_status)
+                .join(Title, Title.id == GameAnswer.title_id)
+                .order_by(GameAnswer.round)
+            )
+        ).all()
+        assert rows == [
+            (1, 'The Wire', 'The Wire', 'auto'),
+            (2, 'Succession', 'Succession', 'manual'),
+            (3, 'The Wire', 'The Wire', 'low_confidence'),
+        ], rows
         assert (await conn.execute(select(func.count()).select_from(Title))).scalar_one() == 2
-        roles = (await conn.execute(
-            select(Person.name, TitlePerson.role).join(Person).order_by(TitlePerson.role, Person.name)
-        )).all()
+        roles = (
+            await conn.execute(
+                select(Person.name, TitlePerson.role).join(Person).order_by(TitlePerson.role, Person.name)
+            )
+        ).all()
         assert roles == [('David Simon', 'cast'), ('David Simon', 'creator'), ('Jesse Armstrong', 'creator')], roles
         network = Title.raw['networks'][0]['name'].astext
         assert (await conn.execute(select(network).where(Title.tmdb_id == 1438))).scalar_one() == 'HBO'
@@ -324,24 +380,54 @@ async def concurrent_answers(store, wire):
     rounds = range(10, 40)
     await store.insert_answers('episode', {number: 'The Wire' for number in rounds})
     for number in rounds:
-        await asyncio.gather(store.save_title('episode', number, wire, 'auto'),
-                             store.set_manual_title('episode', number, wire))
+        await asyncio.gather(
+            store.save_title('episode', number, wire, 'auto'), store.set_manual_title('episode', number, wire)
+        )
     # Framed and Episode share person, genre and company rows in reverse order; sorted upserts keep one lock order.
     people = [Credit(10_000 + number, f'Person {number}', 'cast', number) for number in range(60)]
-    film = TitleData(5000, 'movie', 'Film', 'Film', 2000, 90, ['US'], None, [(18, 'Drama'), (35, 'Comedy')],
-                     [(3268, 'HBO'), (33, 'Universal Pictures')], people, {})
-    show = TitleData(6000, 'tv', 'Show', 'Show', 2001, None, ['US'], None, [(35, 'Comedy'), (18, 'Drama')],
-                     [(33, 'Universal Pictures'), (3268, 'HBO')], people[::-1], {})
+    film = TitleData(
+        5000,
+        'movie',
+        'Film',
+        'Film',
+        2000,
+        90,
+        ['US'],
+        None,
+        [(18, 'Drama'), (35, 'Comedy')],
+        [(3268, 'HBO'), (33, 'Universal Pictures')],
+        people,
+        {},
+    )
+    show = TitleData(
+        6000,
+        'tv',
+        'Show',
+        'Show',
+        2001,
+        None,
+        ['US'],
+        None,
+        [(35, 'Comedy'), (18, 'Drama')],
+        [(33, 'Universal Pictures'), (3268, 'HBO')],
+        people[::-1],
+        {},
+    )
     await store.insert_answers('framed', {number: 'Film' for number in rounds})
     await store.insert_answers('episode', {number + 100: 'Show' for number in rounds})
     for number in rounds:
-        await asyncio.gather(store.save_title('framed', number, film, 'auto'),
-                             store.save_title('episode', number + 100, show, 'auto'))
+        await asyncio.gather(
+            store.save_title('framed', number, film, 'auto'), store.save_title('episode', number + 100, show, 'auto')
+        )
     async with engine.connect() as conn:
-        statuses = (await conn.execute(
-            select(GameAnswer.match_status, func.count()).where(GameAnswer.title_id.is_not(None))
-            .group_by(GameAnswer.match_status).order_by(GameAnswer.match_status)
-        )).all()
+        statuses = (
+            await conn.execute(
+                select(GameAnswer.match_status, func.count())
+                .where(GameAnswer.title_id.is_not(None))
+                .group_by(GameAnswer.match_status)
+                .order_by(GameAnswer.match_status)
+            )
+        ).all()
     # Rounds 1-3 from the scenario above, 30 manual fixes, 60 concurrent title saves.
     assert statuses == [('auto', 61), ('low_confidence', 1), ('manual', 31)], statuses
 
@@ -349,8 +435,14 @@ async def concurrent_answers(store, wire):
 async def run():
     try:
         await reset()
-        scenarios = {'profile': profile, 'duplicates': duplicates, 'stats': aggregate_stats, 'announce': announce,
-                     'migrations': migrations, 'answers': answers}
+        scenarios = {
+            'profile': profile,
+            'duplicates': duplicates,
+            'stats': aggregate_stats,
+            'announce': announce,
+            'migrations': migrations,
+            'answers': answers,
+        }
         await scenarios[sys.argv[1]]()
     finally:
         await engine.dispose()

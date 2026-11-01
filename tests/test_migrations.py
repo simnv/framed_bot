@@ -46,7 +46,7 @@ def test_revision_0003_clears_low_confidence_matches() -> None:
     sql = offline_sql('upgrade', '0002:0003')
 
     assert (
-        "UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() "
+        'UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() '
         "WHERE match_status = 'low_confidence'"
     ) in sql
     assert "UPDATE alembic_version SET version_num='0003' WHERE alembic_version.version_num = '0002'" in sql

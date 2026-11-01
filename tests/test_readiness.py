@@ -21,8 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_config(monkeypatch: pytest.MonkeyPatch):
     for name in (
-        'BOT_TOKEN', 'BOT_TOKEN_FILE', 'DB_CONNECTION_STRING', 'DB_CONNECTION_STRING_FILE', 'BOT_DATA_PATH',
-        'TMDB_API_KEY', 'TMDB_API_KEY_FILE',
+        'BOT_TOKEN',
+        'BOT_TOKEN_FILE',
+        'DB_CONNECTION_STRING',
+        'DB_CONNECTION_STRING_FILE',
+        'BOT_DATA_PATH',
+        'TMDB_API_KEY',
+        'TMDB_API_KEY_FILE',
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('ADMIN_USER_ID', '1')
@@ -114,6 +119,7 @@ def test_invalid_admin_id_does_not_reveal_value_in_traceback(monkeypatch):
     marker = 'placeholder-private-admin-value'
     monkeypatch.setenv('ADMIN_USER_ID', marker)
     import traceback
+
     try:
         load()
     except RuntimeError as error:
@@ -141,25 +147,44 @@ def test_configured_logging_redacts_http_urls_and_tracebacks():
     except RuntimeError:
         record = logging.LogRecord('httpx', logging.ERROR, __file__, 1, 'request %s', (marker,), sys.exc_info())
     output = formatter.format(record)
-    leaked = any(part in output for part in (
-        marker, db_url, 'placeholder-db-password', 'TelegramCredential_0123456789',
-    ))
+    leaked = any(
+        part in output
+        for part in (
+            marker,
+            db_url,
+            'placeholder-db-password',
+            'TelegramCredential_0123456789',
+        )
+    )
     assert not leaked
     assert 'RuntimeError' in output
 
 
 def test_uncaught_exception_is_redacted():
     marker = 'placeholder-uncaught-credential'
-    env = {key: value for key, value in os.environ.items() if key not in (
-        'BOT_TOKEN', 'BOT_TOKEN_FILE', 'DB_CONNECTION_STRING', 'DB_CONNECTION_STRING_FILE', 'ADMIN_USER_ID',
-    )}
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in (
+            'BOT_TOKEN',
+            'BOT_TOKEN_FILE',
+            'DB_CONNECTION_STRING',
+            'DB_CONNECTION_STRING_FILE',
+            'ADMIN_USER_ID',
+        )
+    }
     env.update(
-        BOT_TOKEN=marker, ADMIN_USER_ID='1',
+        BOT_TOKEN=marker,
+        ADMIN_USER_ID='1',
         DB_CONNECTION_STRING='postgresql+asyncpg://placeholder@localhost/test',
     )
     result = subprocess.run(
         [sys.executable, '-c', 'import main; raise RuntimeError(main.BOT_TOKEN)'],
-        cwd=ROOT, env=env, capture_output=True, text=True,
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode != 0
     leaked = marker in result.stderr
@@ -171,12 +196,17 @@ def test_tmdb_key_is_redacted_in_logs():
     marker = 'placeholder-tmdb-credential'
     env = {key: value for key, value in os.environ.items() if key not in ('TMDB_API_KEY', 'TMDB_API_KEY_FILE')}
     env.update(
-        TMDB_API_KEY=marker, BOT_TOKEN=os.environ['BOT_TOKEN'], ADMIN_USER_ID='1',
+        TMDB_API_KEY=marker,
+        BOT_TOKEN=os.environ['BOT_TOKEN'],
+        ADMIN_USER_ID='1',
         DB_CONNECTION_STRING='postgresql+asyncpg://placeholder@localhost/test',
     )
     result = subprocess.run(
         [sys.executable, '-c', 'import logging, main; logging.warning("key %s", main.TMDB_API_KEY)'],
-        cwd=ROOT, env=env, capture_output=True, text=True,
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0
     leaked = marker in result.stderr
@@ -202,18 +232,25 @@ async def test_application_persists_data_at_configured_path(monkeypatch, tmp_pat
 def test_logging_redacts_decoded_password_and_traceback_filename():
     from safe_logging import RedactingFormatter
 
-    formatter = RedactingFormatter((
-        'postgresql+asyncpg://synthetic_user:private%2Fpassword@localhost/test',
-        'filename-private-marker',
-    ))
+    formatter = RedactingFormatter(
+        (
+            'postgresql+asyncpg://synthetic_user:private%2Fpassword@localhost/test',
+            'filename-private-marker',
+        )
+    )
     try:
         exec(compile("raise RuntimeError('private/password')", '/tmp/filename-private-marker.py', 'exec'))
     except RuntimeError:
         record = logging.LogRecord('database', logging.ERROR, __file__, 1, 'database failed', (), sys.exc_info())
     output = formatter.format(record)
-    leaked = any(part in output for part in (
-        'private/password', 'private%2Fpassword', 'filename-private-marker',
-    ))
+    leaked = any(
+        part in output
+        for part in (
+            'private/password',
+            'private%2Fpassword',
+            'filename-private-marker',
+        )
+    )
     assert not leaked
     assert 'RuntimeError' in output
     assert 'database failed' in output
