@@ -103,3 +103,73 @@ def test_report_gate_needs_99_percent_and_no_regression(capsys: pytest.CaptureFi
     out = capsys.readouterr().out
     assert 'regressions 1' in out
     assert json.dumps('wrong: round 1 status auto got 999 want 1')[1:-1] in out
+
+
+class CountingStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.read = 0
+
+    async def __aiter__(self) -> Any:
+        for chunk in self.chunks:
+            self.read += len(chunk)
+            yield chunk
+
+
+async def fetch_image(transport: httpx.AsyncBaseTransport) -> list[bytes]:
+    limiter = eval_matching.RateLimiter(eval_matching.FAST)
+    async with httpx.AsyncClient(transport=transport) as client:
+        return await eval_matching.ImageFetcher(client, limiter, limiter).tmdb_images(['/a.jpg'])
+
+
+async def direct_and_recorded(
+    tmp_path: Path, headers: dict[str, str], chunks: list[bytes]
+) -> tuple[list[bytes], list[bytes], CountingStream, eval_matching.ReplayCache]:
+    direct_stream = CountingStream(chunks)
+    recorded_stream = CountingStream(chunks)
+
+    def handler(stream: CountingStream) -> httpx.MockTransport:
+        return httpx.MockTransport(lambda _: httpx.Response(200, headers=headers, stream=stream))
+
+    direct = await fetch_image(handler(direct_stream))
+    cache = eval_matching.ReplayCache.load(tmp_path)
+    recorded = await fetch_image(eval_matching.ReplayTransport(cache, handler(recorded_stream)))
+    assert recorded_stream.read <= max(direct_stream.read, eval_matching.MAX_IMAGE_BYTES + max(map(len, chunks)))
+    return direct, recorded, recorded_stream, cache
+
+
+@pytest.mark.asyncio
+async def test_recording_rejects_an_oversized_declared_length_before_reading(tmp_path: Path) -> None:
+    headers = {'Content-Type': 'image/jpeg', 'Content-Length': '1000001'}
+    direct, recorded, stream, cache = await direct_and_recorded(tmp_path, headers, [b'short'])
+    assert direct == recorded == []
+    assert stream.read == 0
+    (entry,) = cache.index.values()
+    assert entry['rejected'] is True
+    assert (tmp_path / 'bodies' / entry['body']).read_bytes() == b''
+    # The replay of the recording reaches the same outcome.
+    assert await fetch_image(eval_matching.ReplayTransport(cache, None)) == []
+
+
+@pytest.mark.asyncio
+async def test_recording_stops_a_streamed_body_at_the_bound(tmp_path: Path) -> None:
+    chunks = [b'x' * 600_000] * 5
+    direct, recorded, stream, cache = await direct_and_recorded(tmp_path, {'Content-Type': 'image/jpeg'}, chunks)
+    assert direct == recorded == []
+    assert stream.read == 1_200_000
+    (entry,) = cache.index.values()
+    assert entry['rejected'] is True
+    assert await fetch_image(eval_matching.ReplayTransport(cache, None)) == []
+
+
+@pytest.mark.asyncio
+async def test_recording_keeps_a_good_image_and_its_length(tmp_path: Path) -> None:
+    headers = {'Content-Type': 'image/jpeg', 'Content-Length': '3'}
+    direct, recorded, _, cache = await direct_and_recorded(tmp_path, headers, [b'abc'])
+    assert direct == recorded == [b'abc']
+    assert fetch_headers(cache) == '3'
+    assert await fetch_image(eval_matching.ReplayTransport(cache, None)) == [b'abc']
+
+
+def fetch_headers(cache: Any) -> str | None:
+    return next(iter(cache.index.values())).get('length')

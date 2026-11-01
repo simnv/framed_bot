@@ -37,14 +37,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from answers.assets import MODES, current_mode_day, parse_asset  # noqa: E402
 from answers.embedder import DIMENSIONS, ProcessEmbedder  # noqa: E402
-from answers.images import ImageFetcher  # noqa: E402
+from answers.images import MAX_IMAGE_BYTES, ImageFetcher  # noqa: E402
 from answers.pipeline import Resolution, Resolver, TmdbVisualSource, sibling_years  # noqa: E402
 from answers.ratelimit import API_RATE, CDN_RATE, SITE_RATE, RateLimiter  # noqa: E402
 from answers.tmdb import TmdbClient  # noqa: E402
 
 MODE_DIRS = {'titleshot': 'ts', 'poster': 'po'}
 RECORDED = (200, 404)
-KEPT_HEADERS = ('content-type', 'retry-after')
+KEPT_HEADERS = ('content-type', 'content-length', 'retry-after')
 FAST = 1_000_000.0
 
 
@@ -73,13 +73,32 @@ class ReplayCache:
         if entry is None:
             return None
         headers = {'Content-Type': entry['type']} if entry['type'] else {}
+        if entry.get('rejected'):
+            # A response that production rejects (declared or streamed length over the bound) keeps no body; the
+            # declared length makes ImageFetcher reject it the same way.
+            headers['Content-Length'] = str(MAX_IMAGE_BYTES + 1)
+        elif entry.get('length') is not None:
+            headers['Content-Length'] = entry['length']
         return entry['status'], headers, (self.root / 'bodies' / entry['body']).read_bytes()
 
-    def put(self, key: str, status: int, content_type: str | None, body: bytes) -> None:
+    def put(
+        self,
+        key: str,
+        status: int,
+        content_type: str | None,
+        body: bytes,
+        length: str | None = None,
+        rejected: bool = False,
+    ) -> None:
         digest = hashlib.sha256(body).hexdigest()
         (self.root / 'bodies').mkdir(parents=True, exist_ok=True)
         (self.root / 'bodies' / digest).write_bytes(body)
-        self.index[key] = {'status': status, 'type': content_type, 'body': digest}
+        entry: dict[str, Any] = {'status': status, 'type': content_type, 'body': digest}
+        if length is not None:
+            entry['length'] = length
+        if rejected:
+            entry['rejected'] = True
+        self.index[key] = entry
         self.added += 1
         if self.added % 200 == 0:
             self.save()
@@ -97,20 +116,51 @@ class ReplayTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         key = request_key(request)
-        found = self._cache.get(key)
-        if found is not None:
-            status, headers, body = found
-            return httpx.Response(status, headers=headers, content=body, request=request)
+        if self._cache.get(key) is not None:
+            return self._replay(key, request)
         if self._live is None:
             self.misses.append(key)
             raise ReplayMiss(key)
         response = await self._live.handle_async_request(request)
-        body = await response.aread()
-        content_type = response.headers.get('Content-Type')
-        if response.status_code in RECORDED:
-            self._cache.put(key, response.status_code, content_type, body)
+        try:
+            body, rejected = await self._read(response)
+        finally:
+            await response.aclose()
+        status = response.status_code
+        if status in RECORDED:
+            self._cache.put(
+                key,
+                status,
+                response.headers.get('Content-Type'),
+                body,
+                response.headers.get('Content-Length'),
+                rejected,
+            )
+            return self._replay(key, request)
         kept = {name: value for name, value in response.headers.items() if name.lower() in KEPT_HEADERS}
-        return httpx.Response(response.status_code, headers=kept, content=body, request=request)
+        return httpx.Response(status, headers=kept, content=body, request=request)
+
+    def _replay(self, key: str, request: httpx.Request) -> httpx.Response:
+        found = self._cache.get(key)
+        if found is None:
+            raise ReplayMiss(key)
+        status, headers, body = found
+        return httpx.Response(status, headers=headers, content=body, request=request)
+
+    @staticmethod
+    async def _read(response: httpx.Response) -> tuple[bytes, bool]:
+        """Read the body as ImageFetcher does: an image over the bound is rejected before or while it is read."""
+        if not response.headers.get('Content-Type', '').startswith('image/'):
+            return await response.aread(), False
+        declared = response.headers.get('Content-Length', '')
+        if declared.isascii() and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+            return b'', True
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body += chunk
+            if len(body) > MAX_IMAGE_BYTES:
+                return b'', True
+        return bytes(body), False
 
 
 class CachingEmbedder:
