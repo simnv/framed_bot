@@ -710,7 +710,7 @@ def test_migration_0004_and_answer_locks_on_a_seeded_database():
         assert summary == {
             'reset': 1917, 'manual_kept': 3, 'titles_kept': True, 'dangling': 0, 'site_kept': 'site',
             'bogus_status_rejected': True, 'bogus_mode_rejected': True, 'parallel_upserts': 'ok',
-            'after_downgrade_site_visual': 2, 'after_downgrade_manual': 4, 'asset_table_dropped': True, 'head': '0004',
+            'after_downgrade_site_visual': 2, 'after_downgrade_manual': 4, 'asset_table_dropped': True, 'head': '0006',
         }
     finally:
         docker('rm', '-f', db, check=False)

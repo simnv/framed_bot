@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Mapped, mapped_column
+
+from answers import FRAMES
 
 from .db import AsyncScopedSession, Base
 
 
 class EpisodeResult(Base):
     __tablename__ = 'episode_result'
-    __table_args__ = (UniqueConstraint('user_id', 'framed_round'),)
+    __table_args__ = (
+        UniqueConstraint('user_id', 'framed_round'),
+        CheckConstraint(
+            f'(won AND win_frame IS NOT NULL AND win_frame BETWEEN 1 AND {FRAMES["episode"]}) '
+            'OR (NOT won AND win_frame IS NULL)',
+            name='ck_episode_result_win_frame',
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey('user.id'), index=True)

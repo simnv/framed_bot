@@ -11,7 +11,7 @@ from unittest.mock import patch
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import event, func, inspect, insert, select, text
+from sqlalchemy import CheckConstraint, MetaData, event, func, inspect, insert, select, text
 from sqlalchemy.exc import IntegrityError
 from telegram import Chat, Message, Update, User as TelegramUser
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
@@ -188,14 +188,26 @@ async def aggregate_stats():
         stats_module.Stats(1, 0, None, 1, 7.0),
         stats_module.Stats(1, 1, 3.0, 8, 3.0),
     )
-    async with engine.begin() as conn:
-        await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=2, won=True, win_frame=None))
+    # Revision 0006 makes PostgreSQL reject a winning row without a frame and a frame outside the game range.
+    for model, frame in ((FramedResult, None), (FramedResult, 7), (EpisodeResult, 11), (EpisodeResult, 0)):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(insert(model).values(user_id=USER_ID + 1, framed_round=2, won=True, win_frame=frame))
+        except IntegrityError:
+            pass
+        else:
+            raise AssertionError(f'{model.__tablename__} accepted a winning row with win_frame={frame}')
     try:
-        await stats_module.get_user_stats(USER_ID + 1)
-    except stats_module.MissingWinFrameError:
+        async with engine.begin() as conn:
+            await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=2, won=False, win_frame=2))
+    except IntegrityError:
         pass
     else:
-        raise AssertionError('Invalid winning row silently changed the average')
+        raise AssertionError('framed_result accepted a lost row with a frame')
+    assert await stats_module.get_user_stats(USER_ID + 1) == (
+        stats_module.Stats(1, 0, None, 1, 7.0),
+        stats_module.Stats(1, 1, 3.0, 8, 3.0),
+    )
     print(
         json.dumps(
             {
@@ -287,8 +299,13 @@ async def migrations():
     # A schema that create_all made before Alembic keeps its rows and is adopted at the baseline.
     await drop_schema()
     async with engine.begin() as conn:
-        # create_all before Alembic made only the baseline tables.
-        await conn.run_sync(Base.metadata.create_all, tables=[Base.metadata.tables[name] for name in BASELINE_TABLES])
+        # create_all before Alembic made only the baseline tables, without the checks that later revisions add.
+        legacy = MetaData()
+        for name in BASELINE_TABLES:
+            table = Base.metadata.tables[name].to_metadata(legacy)
+            for constraint in [c for c in table.constraints if isinstance(c, CheckConstraint)]:
+                table.constraints.discard(constraint)
+        await conn.run_sync(legacy.create_all)
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Legacy', False))
     assert await FramedResult.save_result(USER_ID, 1, True, 2)
     await upgrade_database()

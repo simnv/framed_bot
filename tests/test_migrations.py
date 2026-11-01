@@ -109,3 +109,41 @@ def test_revision_0005_clears_low_confidence_matches_again() -> None:
     ) in sql
     assert "UPDATE alembic_version SET version_num='0005' WHERE alembic_version.version_num = '0004'" in sql
     assert 'DROP' not in sql
+
+
+RESULT_CHECKS = {
+    'framed_result': 'ck_framed_result_win_frame',
+    'episode_result': 'ck_episode_result_win_frame',
+}
+RESULT_RULES = {
+    'framed_result': '(won AND win_frame IS NOT NULL AND win_frame BETWEEN 1 AND 6) OR (NOT won AND win_frame IS NULL)',
+    'episode_result': (
+        '(won AND win_frame IS NOT NULL AND win_frame BETWEEN 1 AND 10) OR (NOT won AND win_frame IS NULL)'
+    ),
+}
+
+
+def test_revision_0006_adds_result_win_frame_checks_only() -> None:
+    sql = offline_sql('upgrade', '0005:0006')
+
+    for table, name in RESULT_CHECKS.items():
+        assert f'ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({RESULT_RULES[table]})' in sql
+    assert 'UPDATE framed_result' not in sql and 'UPDATE episode_result' not in sql
+    assert 'DELETE' not in sql and 'DROP' not in sql
+    assert "UPDATE alembic_version SET version_num='0006' WHERE alembic_version.version_num = '0005'" in sql
+
+
+def test_revision_0006_downgrade_drops_only_the_result_checks() -> None:
+    sql = offline_sql('downgrade', '0006:0005')
+
+    for table, name in RESULT_CHECKS.items():
+        assert f'ALTER TABLE {table} DROP CONSTRAINT {name}' in sql
+    assert sql.count('DROP CONSTRAINT') == 2
+
+
+def test_result_models_declare_the_win_frame_checks() -> None:
+    from models import Base
+
+    for table, name in RESULT_CHECKS.items():
+        check = next(c for c in Base.metadata.tables[table].constraints if c.name == name)
+        assert str(check.sqltext) == RESULT_RULES[table]
