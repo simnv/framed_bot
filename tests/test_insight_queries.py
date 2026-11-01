@@ -330,6 +330,18 @@ async def test_league_rows_rank_by_strength_against_all_players_and_carry_the_pe
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(('game', 'kind', 'exists'), [('episode', 'tv', True), ('framed', 'movie', False)])
+async def test_weekly_episode_leagues_need_five_rounds_and_framed_leagues_fifteen(database, game, kind, exists):
+    add_title(database, genres=(1,), kind=kind)
+    for user in (1, 2, 3):
+        add_rounds(database, user=user, count=5, frame=2, game=game)
+    board = await insight.league(game, 'genre', 1, TODAY)
+    choices = await insight.league_choices(game, 'genre', TODAY)
+    assert (board is not None) is exists
+    assert [choice.key for choice in choices] == ([1] if exists else [])
+
+
+@pytest.mark.asyncio
 async def test_league_needs_three_players_with_fifteen_weighted_rounds(database):
     add_title(database, genres=(1, 2))
     add_rounds(database, user=1, count=30)

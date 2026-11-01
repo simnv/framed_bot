@@ -304,7 +304,9 @@ def test_league_picker_names_the_game_and_the_dimension(game, dimension, title, 
     parsed = RichParser(rich['html'])
     assert parsed.paragraphs[0] == title
     assert hint in parsed.paragraphs[1]
-    assert 'не меньше 15 раундов' in rich['html'] and 'не меньше 3' in rich['html']
+    # Episode has one round a week, so its leagues need fewer rounds.
+    rounds = {'framed': 15, 'episode': 5}[game]
+    assert f'не меньше {rounds} раундов' in rich['html'] and 'не меньше 3' in rich['html']
     assert rich['skip_entity_detection'] is True
 
 

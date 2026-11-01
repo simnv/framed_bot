@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from answers.ratelimit import RateLimiter, Throttled
-from answers.tmdb import Credit, TitleData, TmdbClient, TmdbError, TmdbRateLimited, normalize, split_year
+from answers.tmdb import Credit, TitleData, TmdbClient, TmdbError, TmdbRateLimited, normalize, split_year, title_data
 
 TOKEN = 'synthetic-tmdb-token'  # noqa: S105 - synthetic test value
 MOVIE_DETAILS: dict[str, Any] = {
@@ -424,3 +424,21 @@ async def test_requests_do_not_follow_redirects() -> None:
         await tmdb.search('movie', 'Dune', None)
 
     assert len(requests) == 1
+
+
+def test_html_entities_in_names_become_plain_text() -> None:
+    # TMDB returns some TV genre names with HTML entities, for example 'Sci-Fi &amp; Fantasy'.
+    details = {
+        **TV_DETAILS,
+        'name': 'Tom &amp; Jerry',
+        'original_name': 'Tom &amp; Jerry',
+        'genres': [{'id': 10765, 'name': 'Sci-Fi &amp; Fantasy'}, {'id': 10768, 'name': 'War &amp; Politics'}],
+        'production_companies': [{'id': 1, 'name': 'Hanna &amp; Barbera'}],
+        'created_by': [{'id': 2, 'name': 'Joseph &quot;Joe&quot; Barbera'}],
+        'credits': {'cast': [{'id': 3, 'name': 'O&#39;Neil', 'order': 0}], 'crew': []},
+    }
+    data = title_data('tv', details)
+    assert (data.name, data.original_name) == ('Tom & Jerry', 'Tom & Jerry')
+    assert data.genres == [(10765, 'Sci-Fi & Fantasy'), (10768, 'War & Politics')]
+    assert data.companies == [(1, 'Hanna & Barbera')]
+    assert [credit.name for credit in data.credits] == ['Joseph "Joe" Barbera', "O'Neil"]

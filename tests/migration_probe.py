@@ -159,8 +159,22 @@ async def main() -> None:
     )
     summary['after_downgrade_manual'] = await value("SELECT count(*) FROM game_answer WHERE match_status = 'manual'")
     summary['asset_table_dropped'] = await value("SELECT to_regclass('framed_asset') IS NULL")
+    await migrate('0006')
+    # 0007 replaces HTML entities in stored names. '&amp;lt;' must become '&lt;', not '<'.
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO genre (id, name) VALUES (99001, 'Sci-Fi &amp; Fantasy'), (99002, 'A &amp;lt; B'), "
+                "(99003, 'Drama')"
+            )
+        )
+        await connection.execute(text("INSERT INTO person (id, name) VALUES (99001, 'O&#39;Neil')"))
     await migrate('head')
     summary['head'] = await value('SELECT version_num FROM alembic_version')
+    summary['unescaped_names'] = await value(
+        "SELECT string_agg(name, '|' ORDER BY id) FROM (SELECT id, name FROM genre WHERE id > 99000 "
+        'UNION ALL SELECT id + 10, name FROM person WHERE id = 99001) names'
+    )
     await engine.dispose()
     print(json.dumps(summary, sort_keys=True))
 

@@ -1,5 +1,6 @@
 """Find a game answer on TMDB and read the title data that the bot stores."""
 
+import html
 import math
 import re
 from dataclasses import dataclass
@@ -97,6 +98,11 @@ def _optional_int(value: object) -> int | None:
     return None if value is None else _int(value)
 
 
+def _name(value: object) -> str:
+    """A display name. TMDB returns some names with HTML entities, for example 'Sci-Fi &amp; Fantasy'."""
+    return html.unescape(_str(value))
+
+
 def _optional_str(value: object) -> str | None:
     if value is None or value == '':
         return None
@@ -142,7 +148,7 @@ def _vote_average(value: object) -> float:
 
 
 def _pairs(value: object, key: str) -> list[tuple[int, str]]:
-    return [(_int(item['id']), _str(item[key])) for item in map(_dict, _list(value))]
+    return [(_int(item['id']), _name(item[key])) for item in map(_dict, _list(value))]
 
 
 def _people(value: object) -> list[dict[str, Any]]:
@@ -163,7 +169,7 @@ def _credits(data: dict[str, Any], kind: Kind) -> list[Credit]:
         person_id = _int(person['id'])
         if (person_id, role) not in seen:
             seen.add((person_id, role))
-            credits.append(Credit(person_id, _str(person['name']), role, order))
+            credits.append(Credit(person_id, _name(person['name']), role, order))
 
     people = _dict(data.get('credits', {}))
     crew = _people(people.get('crew', []))
@@ -185,13 +191,13 @@ def title_data(kind: Kind, data: dict[str, Any]) -> TitleData:
     """Map a TMDB details response. Raise TmdbError when a field has an unexpected type."""
     try:
         if kind == 'movie':
-            name = _str(data['title'])
-            original_name = _optional_str(data.get('original_title')) or name
+            name = _name(data['title'])
+            original_name = html.unescape(_optional_str(data.get('original_title')) or name)
             year, runtime = _year(data.get('release_date')), _optional_int(data.get('runtime')) or None
             imdb_id = _optional_str(data.get('imdb_id'))
         else:
-            name = _str(data['name'])
-            original_name = _optional_str(data.get('original_name')) or name
+            name = _name(data['name'])
+            original_name = html.unescape(_optional_str(data.get('original_name')) or name)
             run_times = [_int(minutes) for minutes in _list(data.get('episode_run_time', []))]
             last_episode = data.get('last_episode_to_air')
             last_runtime = None if last_episode is None else _optional_int(_dict(last_episode).get('runtime'))

@@ -440,9 +440,9 @@ _DIMENSION_WORDS: dict[Dimension, tuple[str, str, str, str]] = {
 }
 
 
-def _league_rule(dimension: Dimension) -> str:
+def _league_rule(game: Game, dimension: Dimension) -> str:
     where = _DIMENSION_WORDS[dimension][2]
-    return f'В лигу попадают игроки, у которых не меньше {MIN_LEAGUE_ROUNDS} раундов в этом {where}.'
+    return f'В лигу попадают игроки, у которых не меньше {MIN_LEAGUE_ROUNDS[game]} раундов в этом {where}.'
 
 
 def render_league_picker(game: Game, dimension: Dimension, choices: Sequence[Choice]) -> RichMessage:
@@ -453,7 +453,7 @@ def render_league_picker(game: Game, dimension: Dimension, choices: Sequence[Cho
         html += f'<p>Выбери {single} кнопкой ниже.</p>'
     else:
         html += '<p>Пока нет ни одной лиги.</p>'
-    html += f'<p>{_league_rule(dimension)} Лига есть, если таких игроков не меньше {MIN_LEAGUE_PLAYERS}.</p>'
+    html += f'<p>{_league_rule(game, dimension)} Лига есть, если таких игроков не меньше {MIN_LEAGUE_PLAYERS}.</p>'
     return {'html': html, 'skip_entity_detection': True}
 
 
@@ -472,7 +472,7 @@ def render_league(game: Game, league: League, profiles: Sequence[TopResult]) -> 
     ]
     html = f'<p>{_GAME_TITLES[game]}: лига {_DIMENSION_WORDS[league.dimension][3]} {escape(league.label)}</p>'
     html += _table(('#', 'Имя', 'Раунды', 'Победы', 'Общая', 'Личная'), rows, alignments=_LEAGUE_COLUMNS)
-    html += f'<p>{_league_rule(league.dimension)}</p>'
+    html += f'<p>{_league_rule(game, league.dimension)}</p>'
     note = (
         '<p>Общая сила — насколько игрок играет лучше (+) или хуже (\u2212) среднего уровня всех игроков, '
         f'в очках за раунд. К раундам игрока в лиге бот добавляет {SMOOTHING} раундов со средними очками '

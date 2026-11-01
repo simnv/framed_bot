@@ -147,3 +147,27 @@ def test_result_models_declare_the_win_frame_checks() -> None:
     for table, name in RESULT_CHECKS.items():
         check = next(c for c in Base.metadata.tables[table].constraints if c.name == name)
         assert str(check.sqltext) == RESULT_RULES[table]
+
+
+ENTITY_TABLES = {'genre': ('name',), 'person': ('name',), 'company': ('name',), 'title': ('name', 'original_name')}
+
+
+def test_revision_0007_unescapes_html_entities_in_stored_names_only() -> None:
+    sql = offline_sql('upgrade', '0006:0007')
+
+    for table, columns in ENTITY_TABLES.items():
+        for column in columns:
+            assert f'UPDATE {table} SET {column} = ' in sql  # noqa: S608 - fixed test names
+            assert f"WHERE {column} LIKE '%&%;%'" in sql
+    # &amp; is the outermost replace, so it runs last and '&amp;lt;' becomes '&lt;' and not '<'.
+    update = next(line for line in sql.splitlines() if line.startswith('UPDATE genre SET name = '))
+    assert update.index("'&lt;'") < update.index("'&amp;'")
+    assert 'DELETE' not in sql and 'DROP' not in sql and 'ALTER' not in sql
+    assert "UPDATE alembic_version SET version_num='0007' WHERE alembic_version.version_num = '0006'" in sql
+
+
+def test_revision_0007_downgrade_changes_only_the_version() -> None:
+    sql = offline_sql('downgrade', '0007:0006')
+
+    assert 'UPDATE genre' not in sql and 'UPDATE title' not in sql
+    assert "UPDATE alembic_version SET version_num='0006' WHERE alembic_version.version_num = '0007'" in sql

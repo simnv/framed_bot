@@ -8,6 +8,8 @@ from __future__ import annotations
 import dataclasses
 from typing import Final, Literal
 
+from answers import Game
+
 type Dimension = Literal['genre', 'decade']
 type Role = Literal['director', 'creator', 'cast']
 type RankBoard = Literal['score', 'frame', 'win', 'rounds', 'genre', 'decade']
@@ -15,7 +17,8 @@ type RankBoard = Literal['score', 'frame', 'win', 'rounds', 'genre', 'decade']
 SMOOTHING: Final = 10
 MIN_STATS_BUCKET: Final = 5
 MIN_STATS_PERSON: Final = 3
-MIN_LEAGUE_ROUNDS: Final = 15
+# Framed has a round each day and Episode a round each week, so an Episode league needs fewer rounds.
+MIN_LEAGUE_ROUNDS: Final[dict[Game, int]] = {'framed': 15, 'episode': 5}
 MIN_LEAGUE_PLAYERS: Final = 3
 MIN_TITLE_PLAYERS: Final = 5
 LEAGUE_LIMIT: Final = 10

@@ -304,7 +304,7 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
     dimensions: tuple[Dimension, ...] = ('genre', 'decade')
     for dimension in dimensions:
         candidates = []
-        for board in await _league_boards(eligible, dimension):
+        for board in await _league_boards(eligible, game, dimension):
             for place, row in enumerate(board.rows, 1):
                 if row.user_id == user_id:
                     candidates.append(Rank(dimension, place, len(board.rows), board.label))
@@ -316,7 +316,7 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
     )
 
 
-async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
+async def _league_boards(eligible: CTE, game: Game, dimension: Dimension) -> list[League]:
     mean = await _mean(_mean_statement(eligible))
     # The own mean of each player gives the personal strength, the same number as in /stats.
     own = {
@@ -327,7 +327,7 @@ async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
     grouped: dict[int, list[LeagueRow]] = {}
     labels: dict[int, str] = {}
     for row in rows:
-        if _exact(row.rounds) < MIN_LEAGUE_ROUNDS:
+        if _exact(row.rounds) < MIN_LEAGUE_ROUNDS[game]:
             continue
         bucket = _bucket(row, mean, dimension)
         labels[row.key] = bucket.label
@@ -352,14 +352,14 @@ async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
 
 
 async def league_choices(game: Game, dimension: Dimension, today: date) -> tuple[Choice, ...]:
-    boards = await _league_boards(_eligible(game, today), dimension)
+    boards = await _league_boards(_eligible(game, today), game, dimension)
     boards.sort(key=lambda board: board.key if dimension == 'decade' else board.label)
     return tuple(Choice(board.key, board.label) for board in boards)
 
 
 async def league(game: Game, dimension: Dimension, key: int, today: date) -> League | None:
     """None when the board does not exist (unknown key or fewer than MIN_LEAGUE_PLAYERS players)."""
-    boards = await _league_boards(_eligible(game, today), dimension)
+    boards = await _league_boards(_eligible(game, today), game, dimension)
     for board in boards:
         if board.key == key:
             return dataclasses.replace(board, rows=board.rows[:LEAGUE_LIMIT])
