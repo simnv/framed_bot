@@ -1,13 +1,14 @@
 """Resolve one round to a TMDB title: text candidates first, then a visual tie-break when the text is not sure."""
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Final, Literal, Protocol
 
 import numpy as np
 
-from . import KIND_BY_GAME, Game, Kind, round_date
+from . import KIND_BY_GAME, Game, Kind, round_date, utc_today
 from .embedder import Embedder, EmbedderError
 from .images import ImageError, ImageFetcher, has_frames
 from .matching import Candidate, Search, TextChoice, text_match
@@ -18,6 +19,7 @@ from .visual import pick
 logger = logging.getLogger(__name__)
 
 LOW_CONFIDENCE_POOL: Final = 8
+VOTES_TIEBREAK_MIN_AGE: Final = timedelta(days=30)  # older rounds: the vote count settles a tie
 MAX_ROUND: Final = 1_000_000
 MAX_IMAGE_ID: Final = 10_000_000  # as the scraper bound
 
@@ -72,8 +74,16 @@ def visual_group(text: TextChoice) -> list[Candidate]:
 
 
 class Resolver:
-    def __init__(self, search: Search, visual: VisualSource | None = None, embedder: Embedder | None = None) -> None:
+    def __init__(
+        self,
+        search: Search,
+        visual: VisualSource | None = None,
+        embedder: Embedder | None = None,
+        *,
+        today: Callable[[], date] = utc_today,
+    ) -> None:
         self._search = search
+        self._today = today
         self._visual = visual
         self._embedder = embedder
         self._visual_disabled = False  # set after an EmbedderError; the backend stays off until restart
@@ -96,9 +106,8 @@ class Resolver:
             raise ValueError('Invalid round number')
         kind = KIND_BY_GAME[game]
         query, year = split_year(source_title)
-        text = await text_match(
-            self._search, kind, query, year, round_date(game, round_number), siblings.get(query, frozenset())
-        )
+        played = round_date(game, round_number)
+        text = await text_match(self._search, kind, query, year, played, siblings.get(query, frozenset()))
         if text is None:
             return None
         chosen = text.choice.candidate.tmdb_id
@@ -109,6 +118,8 @@ class Resolver:
             winner = await self._tie_break(game, kind, image_id, group)
             if winner is not None:
                 return Resolution(winner, 'visual')
+        if text.ties and played < self._today() - VOTES_TIEBREAK_MIN_AGE:
+            return Resolution(chosen, 'auto')  # the most-voted tie; a new release can still be the answer
         return Resolution(chosen, 'low_confidence')
 
     async def _tie_break(self, game: Game, kind: Kind, image_id: int, group: list[Candidate]) -> int | None:

@@ -1,9 +1,11 @@
+from collections.abc import Callable
+from datetime import date, timedelta
 from typing import Any, cast
 
 import numpy as np
 import pytest
 
-from answers import Game, Kind
+from answers import Game, Kind, round_date
 from answers.embedder import EmbedderError
 from answers.images import ImageError
 from answers.matching import Candidate
@@ -60,6 +62,16 @@ def searching(*candidates: Candidate):
     return search
 
 
+def on(day: date) -> Callable[[], date]:
+    return lambda: day
+
+
+# Framed round 1000 is dated 2024-12-06: the day after is "recent", and the clock of most tests stands there.
+ROUND_DAY = round_date('framed', 1000)
+NEAR = on(ROUND_DAY + timedelta(days=1))
+OLD = on(ROUND_DAY + timedelta(days=31))
+EDGE = on(ROUND_DAY + timedelta(days=30))
+
 REMAKES = (film(1, 'Dune', '1984-12-14', 3000), film(2, 'Dune', '2021-09-15', 9000))
 
 
@@ -86,7 +98,7 @@ async def test_a_tie_is_broken_by_the_frames() -> None:
 @pytest.mark.asyncio
 async def test_a_small_gap_keeps_the_text_choice_with_low_confidence() -> None:
     visual = FakeVisual([b'ab'], {1: [b'a'], 2: [b'b']})
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder())
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=NEAR)
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'low_confidence')
 
@@ -95,7 +107,7 @@ async def test_a_small_gap_keeps_the_text_choice_with_low_confidence() -> None:
 @pytest.mark.asyncio
 async def test_a_tie_without_frames_is_low_confidence(image_id: int | None) -> None:
     visual = FakeVisual([b'a'], {1: [b'a'], 2: [b'b']})
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder())
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=NEAR)
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, image_id) == Resolution(2, 'low_confidence')
     assert visual.frame_requests == []
@@ -104,7 +116,7 @@ async def test_a_tie_without_frames_is_low_confidence(image_id: int | None) -> N
 @pytest.mark.asyncio
 async def test_no_frames_means_no_candidate_downloads() -> None:
     visual = FakeVisual([], {1: [b'a'], 2: [b'b']})
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder())
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=on(round_date('episode', 10)))
 
     assert await resolver.resolve('episode', 10, 'Dune', {}, 10) == Resolution(2, 'low_confidence')
     assert visual.image_requests == []
@@ -128,7 +140,7 @@ async def test_no_candidate_is_unmatched() -> None:
 
 @pytest.mark.asyncio
 async def test_without_an_embedder_ties_are_low_confidence() -> None:
-    assert await Resolver(searching(*REMAKES)).resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(
+    assert await Resolver(searching(*REMAKES), today=NEAR).resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(
         2, 'low_confidence'
     )
 
@@ -136,7 +148,7 @@ async def test_without_an_embedder_ties_are_low_confidence() -> None:
 @pytest.mark.asyncio
 async def test_image_errors_keep_the_text_choice(caplog: pytest.LogCaptureFixture) -> None:
     visual = FakeVisual([b'a'], {}, error=ImageError('secret detail'))
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder())
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=NEAR)
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'low_confidence')
     assert 'ImageError' in caplog.text
@@ -165,7 +177,7 @@ async def test_sibling_years_reach_the_filter() -> None:
 @pytest.mark.asyncio
 async def test_embedder_errors_keep_the_text_choice_and_later_rounds_still_resolve() -> None:
     visual = FakeVisual([b'a'], {1: [b'a'], 2: [b'b']})
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(EmbedderError('Fail')))
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(EmbedderError('Fail')), today=NEAR)
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'low_confidence')
     assert visual.frame_requests == [('framed', 1000)]
@@ -196,7 +208,7 @@ async def test_close_closes_the_embedder() -> None:
 @pytest.mark.asyncio
 async def test_an_invalid_image_id_means_no_frames(image_id: object) -> None:
     visual = FakeVisual([b'a'], {1: [b'a'], 2: [b'b']})
-    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder())
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=NEAR)
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, cast(Any, image_id)) == Resolution(2, 'low_confidence')
     assert visual.frame_requests == []
@@ -233,3 +245,53 @@ async def test_a_fuzzy_choice_after_the_eighth_entry_keeps_the_group_at_eight() 
     await resolver.resolve('framed', 1000, 'Moonlightt', {}, 1000)
 
     assert visual.image_requests == [10, 20, 21, 22, 23, 24, 25, 26]
+
+
+@pytest.mark.asyncio
+async def test_an_old_tie_with_an_undecided_visual_step_goes_to_the_most_voted() -> None:
+    visual = FakeVisual([b'ab'], {1: [b'a'], 2: [b'b']})
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=OLD)
+
+    assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'auto')
+
+
+@pytest.mark.parametrize('clock', [EDGE, NEAR], ids=['exactly 30 days', 'recent'])
+@pytest.mark.asyncio
+async def test_a_tie_not_older_than_30_days_stays_low_confidence(clock: Callable[[], date]) -> None:
+    visual = FakeVisual([b'ab'], {1: [b'a'], 2: [b'b']})
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=clock)
+
+    assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'low_confidence')
+
+
+@pytest.mark.asyncio
+async def test_an_old_fuzzy_choice_stays_low_confidence() -> None:
+    candidates = [film(10, 'Moonlight', votes=50)] + [film(20 + n, f'Other {n}') for n in range(3)]
+    visual = FakeVisual([b'ab'], {})
+    resolver = Resolver(searching(*candidates), visual, FakeEmbedder(), today=OLD)
+
+    assert await resolver.resolve('framed', 1000, 'Moonlightt', {}, 1000) == Resolution(10, 'low_confidence')
+
+
+@pytest.mark.asyncio
+async def test_a_decisive_visual_result_wins_for_an_old_tie() -> None:
+    visual = FakeVisual([b'a', b'a'], {1: [b'a'], 2: [b'b']})
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=OLD)
+
+    assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(1, 'visual')
+
+
+@pytest.mark.asyncio
+async def test_an_old_tie_without_the_visual_step_is_auto() -> None:
+    resolver = Resolver(searching(*REMAKES), today=OLD)
+
+    assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'auto')
+
+
+@pytest.mark.asyncio
+async def test_throttling_still_propagates_for_an_old_tie() -> None:
+    visual = FakeVisual([b'a'], {}, error=TmdbRateLimited('429'))
+    resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(), today=OLD)
+
+    with pytest.raises(TmdbRateLimited):
+        await resolver.resolve('framed', 1000, 'Dune', {}, 1000)

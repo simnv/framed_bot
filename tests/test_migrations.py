@@ -98,3 +98,14 @@ def test_models_register_new_tables() -> None:
         if constraint.name == 'ck_game_answer_match_status'
     )
     assert "'site'" in str(check.sqltext) and "'visual'" in str(check.sqltext)
+
+
+def test_revision_0005_clears_low_confidence_matches_again() -> None:
+    sql = offline_sql('upgrade', '0004:0005')
+
+    assert (
+        'UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() '
+        "WHERE match_status = 'low_confidence'"
+    ) in sql
+    assert "UPDATE alembic_version SET version_num='0005' WHERE alembic_version.version_num = '0004'" in sql
+    assert 'DROP' not in sql
