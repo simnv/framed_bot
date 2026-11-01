@@ -381,3 +381,63 @@ async def test_a_stuck_receiver_keeps_its_descriptor_open_and_latches_the_failur
         assert pipes == 1
     finally:
         release.set()
+
+
+async def paused_stubborn_request(
+    monkeypatch: pytest.MonkeyPatch, request_timeout: float = 120.0
+) -> tuple[ProcessEmbedder, asyncio.Task[np.ndarray], BaseProcess, threading.Event, float]:
+    """A request to a child that ignores SIGTERM, with the receiver paused in the body read."""
+    entered, release = paused_body_read(monkeypatch, pause=30.0)
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=request_timeout)
+    embedder._target = clip_fakes.stubborn_serve
+    request = asyncio.create_task(embedder.embed([jpeg()]))
+    process = await wait_for_child(embedder)
+    timeout_started = time.monotonic()  # the request timeout starts right after the child starts
+    await asyncio.to_thread(entered.wait, 10.0)
+    assert entered.is_set()
+    return embedder, request, process, release, timeout_started
+
+
+@pytest.mark.asyncio
+async def test_a_request_timeout_during_the_graceful_exit_wait_shares_the_close_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder, request, process, release, timeout_started = await paused_stubborn_request(monkeypatch, 1.5)
+    try:
+        # Start close() 1.25 s into the request, so the 1.5 s timeout fires inside the 0.5 s graceful-exit wait.
+        await asyncio.sleep(max(0.0, timeout_started + 1.25 - time.monotonic()))
+        started = time.monotonic()
+        await embedder.close()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0 + 0.15
+        assert process.exitcode is not None
+        assert len(embedder._leaked) == 1
+        # The timeout path did the stop, so the two paths really overlapped.
+        with pytest.raises(EmbedderError, match='^TimeoutError$'):
+            await request
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_during_the_graceful_exit_wait_shares_the_close_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    embedder, request, process, release, _ = await paused_stubborn_request(monkeypatch)
+    try:
+        started = time.monotonic()
+        closing = asyncio.create_task(embedder.close())
+        await asyncio.sleep(0.3)  # inside the 0.5 s graceful-exit wait
+        assert not closing.done()
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await closing
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0 + 0.15
+        assert process.exitcode is not None
+        assert len(embedder._leaked) == 1
+    finally:
+        release.set()

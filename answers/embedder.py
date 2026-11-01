@@ -199,6 +199,8 @@ class ProcessEmbedder:
         self._receiver: concurrent.futures.Future[object] | None = None
         self._waiter: asyncio.Future[object] | None = None
         self._leaked: list[tuple[Connection, concurrent.futures.Future[object]]] = []
+        # The end of the active stop budget. close() sets it once and every later stop path reuses it.
+        self._stop_by: float | None = None
 
     @property
     def child(self) -> BaseProcess | None:
@@ -298,10 +300,13 @@ class ProcessEmbedder:
         self._failure = name
         self._stop_now()
 
-    def _stop_now(self, deadline: float | None = None) -> None:
-        """Stop the child and release its connection within one deadline (default: CHILD_BUDGET from now)."""
-        if deadline is None:
-            deadline = time.monotonic() + CHILD_BUDGET
+    def _stop_now(self) -> None:
+        """Stop the child and release its connection by the active stop deadline.
+
+        After close() has started, every path (request timeout, cancellation, close itself) uses the deadline that
+        close() set, so overlapping stops never get a fresh budget. Before close(), each stop gets CHILD_BUDGET.
+        """
+        deadline = self._stop_by if self._stop_by is not None else time.monotonic() + CHILD_BUDGET
 
         def remaining(limit: float) -> float:
             return max(0.0, min(limit, deadline - time.monotonic()))
@@ -334,14 +339,15 @@ class ProcessEmbedder:
     async def close(self) -> None:
         """Stop admissions, ask an idle child to exit, then terminate and kill it. Ends within about 2 seconds."""
         self._closed = True
+        if self._stop_by is None:
+            self._stop_by = time.monotonic() + CHILD_BUDGET
         process, connection = self._process, self._connection
         if process is None:
             return
         if connection is not None and not self._lock.locked():
             with contextlib.suppress(Exception):
                 connection.send(('exit',))
-        started = time.monotonic()
-        exit_by = started + EXIT_GRACE
+        exit_by = min(time.monotonic() + EXIT_GRACE, self._stop_by)
         while process.is_alive() and time.monotonic() < exit_by:
             await asyncio.sleep(0.02)
-        self._stop_now(started + CHILD_BUDGET)
+        self._stop_now()
