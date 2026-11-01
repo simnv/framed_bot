@@ -6,12 +6,15 @@ exit, then terminates and kills it within a fixed deadline. Preprocessing uses P
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import io
+import logging
 import multiprocessing
 import signal
 import struct
 import sys
+import threading
 import time
 import types
 from collections.abc import Callable, Generator
@@ -22,6 +25,8 @@ from typing import Any, Final, Protocol, cast
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 SIZE: Final = 224
 MEAN: Final = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
@@ -43,6 +48,7 @@ REQUEST_TIMEOUT: Final = 120.0
 EXIT_GRACE: Final = 0.5
 TERMINATE_GRACE: Final = 0.7
 KILL_GRACE: Final = 0.5
+RECEIVER_GRACE: Final = 0.5
 INPUT: Final = 'pixel_values'
 OUTPUT: Final = 'image_embeds'
 
@@ -188,6 +194,9 @@ class ProcessEmbedder:
         self._closed = False
         self._failure: str | None = None
         self._target = serve
+        # The thread that reads the current reply, and the connections whose receiver would not stop (never closed).
+        self._receiver: concurrent.futures.Future[object] | None = None
+        self._leaked: list[tuple[Connection, concurrent.futures.Future[object]]] = []
 
     @property
     def child(self) -> BaseProcess | None:
@@ -247,12 +256,23 @@ class ProcessEmbedder:
         return self._connection
 
     async def _reply(self, connection: Connection) -> tuple[str, object]:
-        # recv blocks until the whole framed reply arrives, so it runs in a thread; stopping the child (kill, then
-        # close) ends the read with EOFError or OSError, so a stalled partial reply cannot outlive the deadline.
-        reply = await asyncio.to_thread(connection.recv)
+        # recv blocks until the whole framed reply arrives, so it runs in its own thread. Teardown kills the child,
+        # waits for this thread, and only then closes the connection (see _stop_now).
+        receiver: concurrent.futures.Future[object] = concurrent.futures.Future()
+        receiver.set_running_or_notify_cancel()
+
+        def receive() -> None:
+            try:
+                receiver.set_result(connection.recv())
+            except BaseException as error:  # delivered to the awaiting request
+                receiver.set_exception(error)
+
+        self._receiver = receiver
+        threading.Thread(target=receive, daemon=True).start()
+        reply = await asyncio.wrap_future(receiver)
         if type(reply) is not tuple or len(reply) != 2 or type(reply[0]) is not str:
             raise EOFError
-        return reply
+        return cast(tuple[str, object], reply)
 
     def _fail(self, name: str) -> None:
         """Disable the backend until the bot restarts; tied rounds then keep the text choice."""
@@ -260,17 +280,28 @@ class ProcessEmbedder:
         self._stop_now()
 
     def _stop_now(self) -> None:
-        process, connection = self._process, self._connection
-        self._process = self._connection = None
+        process, connection, receiver = self._process, self._connection, self._receiver
+        self._process = self._connection = self._receiver = None
         if process is not None and process.is_alive():
             process.terminate()
             process.join(TERMINATE_GRACE)
             if process.is_alive():
                 process.kill()
                 process.join(KILL_GRACE)
-        # Close after the child is gone, so a thread blocked in recv sees EOF and no descriptor is reused under it.
-        if connection is not None:
-            connection.close()
+        if connection is None:
+            return
+        # With the child gone the receiver reads EOF. Close the descriptor only after the receiver has finished:
+        # a receiver paused inside recv still holds the number, and a new pipe could reuse it.
+        if receiver is not None:
+            self._receiver = receiver
+            concurrent.futures.wait([receiver], timeout=RECEIVER_GRACE)
+            self._receiver = None
+            if not receiver.done():
+                logger.warning('CLIP receiver did not stop; its connection stays open: %s', 'ReceiverStuck')
+                self._leaked.append((connection, receiver))
+                self._failure = self._failure or 'ReceiverStuck'
+                return
+        connection.close()
 
     async def close(self) -> None:
         """Stop admissions, ask an idle child to exit, then terminate and kill it. Ends within about 2 seconds."""

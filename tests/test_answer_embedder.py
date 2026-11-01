@@ -2,8 +2,11 @@
 
 import asyncio
 import io
+import logging
 import os
+import threading
 import time
+from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from pathlib import Path
 
@@ -233,3 +236,96 @@ async def test_a_memory_error_in_the_child_is_a_persistent_application_error() -
         with pytest.raises(EmbedderError, match='^MemoryError$'):
             await embedder.embed([jpeg()])
         assert embedder.child is None
+
+
+def paused_body_read(monkeypatch: pytest.MonkeyPatch, pause: float) -> tuple[threading.Event, threading.Event]:
+    """Pause the receiver in the body read of a framed reply (the header read, size 4, runs at once)."""
+    entered, release = threading.Event(), threading.Event()
+    original = Connection._recv  # ty: ignore[unresolved-attribute]
+
+    def recv(self: Connection, size: int, *args: object) -> object:
+        if size > 4:
+            entered.set()
+            release.wait(pause)
+        return original(self, size, *args)
+
+    monkeypatch.setattr(Connection, '_recv', recv)
+    return entered, release
+
+
+@pytest.mark.asyncio
+async def test_the_receiver_finishes_before_its_connection_is_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    entered, _ = paused_body_read(monkeypatch, pause=0.3)
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=1.0)
+    embedder._target = clip_fakes.stalling_serve
+    seen: list[bool] = []
+    close = Connection.close
+
+    def watching_close(self: Connection) -> None:
+        receiver = embedder._receiver
+        seen.append(receiver is None or receiver.done())
+        close(self)
+
+    monkeypatch.setattr(Connection, 'close', watching_close)
+    pipes = 0
+    pipe = embedder._context.Pipe
+
+    def counting_pipe() -> object:
+        nonlocal pipes
+        pipes += 1
+        return pipe()
+
+    monkeypatch.setattr(embedder._context, 'Pipe', counting_pipe)
+
+    with pytest.raises(EmbedderError, match='TimeoutError'):
+        await embedder.embed([jpeg()])
+
+    assert entered.is_set()
+    assert seen and all(seen)
+    assert embedder._receiver is None
+    assert pipes == 1
+    with pytest.raises(EmbedderError):
+        await embedder.embed([jpeg()])
+    assert pipes == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_receiver_keeps_its_descriptor_open_and_latches_the_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    entered, release = paused_body_read(monkeypatch, pause=30.0)
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=0.5)
+    embedder._target = clip_fakes.stalling_serve
+    pipes = 0
+    pipe = embedder._context.Pipe
+
+    def counting_pipe() -> object:
+        nonlocal pipes
+        pipes += 1
+        return pipe()
+
+    monkeypatch.setattr(embedder._context, 'Pipe', counting_pipe)
+    request = asyncio.create_task(embedder.embed([jpeg()]))
+    process = await wait_for_child(embedder)
+    for _ in range(300):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    connection = embedder._connection
+    assert connection is not None
+    descriptor = connection.fileno()
+
+    started = time.monotonic()
+    try:
+        with caplog.at_level(logging.WARNING, logger='answers.embedder'), pytest.raises(EmbedderError, match='Timeout'):
+            await request
+        assert time.monotonic() - started < 3.0
+        assert process.exitcode is not None
+        assert not connection.closed
+        os.fstat(descriptor)  # still open
+        assert 'ReceiverStuck' in caplog.text
+        with pytest.raises(EmbedderError):
+            await embedder.embed([jpeg()])
+        assert pipes == 1
+    finally:
+        release.set()
