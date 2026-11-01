@@ -1,5 +1,6 @@
 """Find a game answer on TMDB and read the title data that the bot stores."""
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Final, Literal
@@ -16,6 +17,11 @@ CAST_LIMIT: Final = 10
 YEAR_SUFFIX = re.compile(r'^(?P<name>.+?) \((?P<year>\d{4})\)$')
 NOT_WORD = re.compile(r'[\W_]+')
 ISO_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
+# TMDB image paths look like /abc123.jpg; anything else never reaches a URL.
+IMAGE_PATH = re.compile(r'/[A-Za-z0-9_-]{1,64}\.(?:jpg|png)')
+BACKDROP_LIMIT: Final = 12
+STILL_SEASONS: Final = (1, 2)
+STILL_LIMIT: Final = 10
 # TV details have no imdb_id without external_ids.
 APPEND: Final[dict[Kind, str]] = {'movie': 'credits', 'tv': 'credits,external_ids'}
 
@@ -28,6 +34,10 @@ class TmdbError(RuntimeError):
 
 class TmdbRateLimited(TmdbError, Throttled):
     """HTTP 429. The client pauses its limiter; the sync run stops."""
+
+
+class TmdbNotFound(TmdbError):
+    pass
 
 
 class _Malformed(Exception):
@@ -114,6 +124,21 @@ def normalize(name: str) -> str:
 def _year(value: object) -> int | None:
     date = _optional_str(value)
     return int(date[:4]) if date and date[:4].isdigit() else None
+
+
+def _image_path(value: object) -> str:
+    path = _str(value)
+    if not IMAGE_PATH.fullmatch(path):
+        raise _Malformed
+    return path
+
+
+def _vote_average(value: object) -> float:
+    if value is None:
+        return 0.0
+    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
+        raise _Malformed
+    return float(value)
 
 
 def _pairs(value: object, key: str) -> list[tuple[int, str]]:
@@ -209,6 +234,8 @@ class TmdbClient:
         if response.status_code == 429:
             self._limiter.throttled(retry_after(response.headers.get('Retry-After')))
             raise TmdbRateLimited('TMDB rate limit reached')
+        if response.status_code == 404:
+            raise TmdbNotFound(f'TMDB request {path} returned HTTP 404')
         if response.status_code != 200:
             raise TmdbError(f'TMDB request {path} returned HTTP {response.status_code}')
         try:
@@ -272,6 +299,29 @@ class TmdbClient:
             return candidates
         except _Malformed, KeyError:
             raise TmdbError(f'TMDB {kind} search has an unexpected shape') from None
+
+    async def image_paths(self, kind: Kind, tmdb_id: int) -> list[str]:
+        """Up to BACKDROP_LIMIT backdrops (any language and none), best voted first; for TV also episode stills."""
+        data = await self._get(f'/{kind}/{tmdb_id}/images', {})
+        try:
+            backdrops = [_dict(entry) for entry in _list(data.get('backdrops', []))]
+            ranked = sorted(backdrops, key=lambda entry: -_vote_average(entry.get('vote_average')))
+            paths = [_image_path(entry['file_path']) for entry in ranked[:BACKDROP_LIMIT]]
+        except _Malformed, KeyError:
+            raise TmdbError(f'TMDB {kind} images have an unexpected shape') from None
+        if kind == 'tv':
+            for season in STILL_SEASONS:
+                try:
+                    season_data = await self._get(f'/tv/{tmdb_id}/season/{season}', {})
+                except TmdbNotFound:
+                    continue
+                try:
+                    episodes = [_dict(entry) for entry in _list(season_data.get('episodes', []))]
+                    stills = [entry.get('still_path') for entry in episodes]
+                    paths += [_image_path(still) for still in stills if still is not None][:STILL_LIMIT]
+                except _Malformed:
+                    raise TmdbError('TMDB season has an unexpected shape') from None
+        return list(dict.fromkeys(paths))
 
     async def details(self, kind: Kind, tmdb_id: int) -> TitleData:
         data = await self._get(f'/{kind}/{tmdb_id}', {'append_to_response': APPEND[kind]})

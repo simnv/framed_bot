@@ -4,11 +4,13 @@ The bundle format is not a contract: every unexpected shape raises ScrapeError.
 """
 
 import re
+from dataclasses import dataclass
 from typing import Final
 
 import httpx
 
 from . import Game
+from .ratelimit import SITE_RATE, RateLimiter, Throttled, retry_after
 
 SITES: Final[dict[Game, str]] = {'framed': 'https://framed.wtf', 'episode': 'https://episode.wtf'}
 HEADERS: Final = {'User-Agent': 'framed-bot/1.0'}
@@ -19,16 +21,27 @@ APP_SCRIPT = re.compile(r'src="(/_next/static/chunks/pages/_app-[0-9a-f]+\.js)"'
 WEBPACK_SCRIPT = re.compile(r'src="(/_next/static/chunks/webpack-[0-9a-f]+\.js)"')
 # The webpack runtime maps lazy chunk ids to hashes: "static/chunks/"+e+"."+{87:"0111d1a5ef9290c6"}[e]+".js"
 CHUNK_MAP = re.compile(r'"static/chunks/"\+\w+\+"\."\+\{([^{}]+)\}\[\w+\]\+"\.js"')
-CHUNK_ENTRY = re.compile(r'(\d+):"([0-9a-f]+)"')
-_ENTRY = r'\{title:"(?:[^"\\]|\\.)*",id:[\d.e]+(?:,occurrences?:\d+)?\}'
+CHUNK_ENTRY = re.compile(r'([0-9]+):"([0-9a-f]+)"')
+_ENTRY = r'\{title:"(?:[^"\\]|\\.)*",id:[0-9.e]+(?:,occurrences?:[0-9]+)?\}'
 TITLE_ARRAY = re.compile(r'=\[(' + _ENTRY + r'(?:,' + _ENTRY + r')*)\]')
-TITLE_ENTRY = re.compile(r'\{title:"((?:[^"\\]|\\.)*)",id:([\d.e]+)')
+TITLE_ENTRY = re.compile(r'\{title:"((?:[^"\\]|\\.)*)",id:([0-9.e]+)')
 JS_ESCAPE = re.compile(r'\\(x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|.)', re.DOTALL)
 SIMPLE_ESCAPES: Final = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f', 'v': '\v', '0': '\0'}
 
 
+MAX_IMAGE_ID: Final = 10_000_000
+
+
 class ScrapeError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class BundleEntry:
+    """One round of the answer array: the title and the id of its frame images (round N is element N-1)."""
+
+    title: str
+    image_id: int
 
 
 def _unescape_char(match: re.Match[str]) -> str:
@@ -56,14 +69,22 @@ def _round_id(raw: str) -> float:
         raise ScrapeError('Malformed id in answer array') from None
 
 
-def find_titles(script: str) -> list[str] | None:
+def _image_id(raw: str) -> int:
+    """The bundle writes ids as JS numbers, for example 1e3 for 1000."""
+    value = _round_id(raw)
+    if not value.is_integer() or not 1 <= value < MAX_IMAGE_ID:
+        raise ScrapeError('Malformed id in answer array')
+    return int(value)
+
+
+def find_entries(script: str) -> list[BundleEntry] | None:
     """Return the answer array of a script, or None when the script has no answer array."""
     candidates = []
     for array in TITLE_ARRAY.finditer(script):
         entries = TITLE_ENTRY.findall(array.group(1))
         # Answer arrays start at round 1; mode arrays (titleshot, one-frame) start elsewhere.
         if _round_id(entries[0][1]) == 1:
-            candidates.append([js_unescape(title) for title, _ in entries])
+            candidates.append([BundleEntry(js_unescape(title), _image_id(raw_id)) for title, raw_id in entries])
     if not candidates:
         return None
     if len(candidates) > 1:
@@ -71,17 +92,26 @@ def find_titles(script: str) -> list[str] | None:
     return candidates[0]
 
 
-def extract_titles(script: str) -> list[str]:
-    titles = find_titles(script)
-    if titles is None:
+def find_titles(script: str) -> list[str] | None:
+    entries = find_entries(script)
+    return None if entries is None else [entry.title for entry in entries]
+
+
+def extract_entries(script: str) -> list[BundleEntry]:
+    entries = find_entries(script)
+    if entries is None:
         raise ScrapeError('Answer array not found')
-    return checked(titles)
+    return checked(entries)
 
 
-def checked(titles: list[str]) -> list[str]:
-    if len(titles) < MIN_TITLES:
-        raise ScrapeError(f'Answer array has only {len(titles)} entries')
-    return titles
+def extract_titles(script: str) -> list[str]:
+    return [entry.title for entry in extract_entries(script)]
+
+
+def checked[T](entries: list[T]) -> list[T]:
+    if len(entries) < MIN_TITLES:
+        raise ScrapeError(f'Answer array has only {len(entries)} entries')
+    return entries
 
 
 def chunk_urls(base: str, runtime: str) -> list[str]:
@@ -100,25 +130,37 @@ def script_path(page: str, pattern: re.Pattern[str], name: str) -> str:
     return found.group(1)
 
 
-async def _get(client: httpx.AsyncClient, url: str) -> str:
-    response = await client.get(url, headers=HEADERS, timeout=TIMEOUT)
+async def _get(client: httpx.AsyncClient, url: str, limiter: RateLimiter) -> str:
+    await limiter.wait()
+    response = await client.get(url, headers=HEADERS, timeout=TIMEOUT, follow_redirects=False)
+    if response.status_code == 429:
+        limiter.throttled(retry_after(response.headers.get('Retry-After')))
+        raise Throttled('Game site returned HTTP 429')
     response.raise_for_status()
     return response.text
 
 
-async def fetch_titles(game: Game, client: httpx.AsyncClient) -> list[str]:
-    """Return the answers of all rounds in the bundle: round N is element N-1. Some rounds are in the future."""
+async def fetch_entries(game: Game, client: httpx.AsyncClient, limiter: RateLimiter) -> list[BundleEntry]:
+    """Return the answers of all rounds in the bundle: round N is element N-1. Some rounds are in the future.
+
+    Every request (home page, scripts, chunks) waits for `limiter`, the limit that all game-site requests share.
+    """
     base = SITES[game]
-    page = await _get(client, f'{base}/')
+    page = await _get(client, f'{base}/', limiter)
     if game == 'framed':
-        return extract_titles(await _get(client, base + script_path(page, APP_SCRIPT, 'App bundle')))
-    runtime = await _get(client, base + script_path(page, WEBPACK_SCRIPT, 'Webpack runtime'))
+        return extract_entries(await _get(client, base + script_path(page, APP_SCRIPT, 'App bundle'), limiter))
+    runtime = await _get(client, base + script_path(page, WEBPACK_SCRIPT, 'Webpack runtime'), limiter)
     candidates = []
     for url in chunk_urls(base, runtime):
-        titles = find_titles(await _get(client, url))
-        if titles is not None:
-            candidates.append(titles)
+        entries = find_entries(await _get(client, url, limiter))
+        if entries is not None:
+            candidates.append(entries)
     # Several chunks may hold the same array (the site shares it); differing arrays are ambiguous.
-    if not candidates or any(titles != candidates[0] for titles in candidates):
+    if not candidates or any(entries != candidates[0] for entries in candidates):
         raise ScrapeError('Lazy chunks lack one answer array or hold differing ones')
     return checked(candidates[0])
+
+
+async def fetch_titles(game: Game, client: httpx.AsyncClient, limiter: RateLimiter | None = None) -> list[str]:
+    entries = await fetch_entries(game, client, limiter or RateLimiter(SITE_RATE))
+    return [entry.title for entry in entries]

@@ -3,9 +3,19 @@ from pathlib import Path
 import httpx
 import pytest
 
-from answers.scraper import ScrapeError, extract_titles, fetch_titles, js_unescape
+from answers.ratelimit import RateLimiter, Throttled
+from answers.scraper import (
+    BundleEntry,
+    ScrapeError,
+    extract_entries,
+    extract_titles,
+    fetch_entries,
+    fetch_titles,
+    js_unescape,
+)
 
 FIXTURES = Path(__file__).with_name('fixtures')
+FAST = RateLimiter(1000)
 FRAMED_ROUTES = {
     'https://framed.wtf/': 'framed_home.html',
     'https://framed.wtf/_next/static/chunks/pages/_app-073c1f0998963a1e.js': 'framed_app.js',
@@ -42,7 +52,7 @@ def short_array(count: int, first_id: int = 1) -> str:
 async def test_framed_round_n_is_entry_n_minus_one() -> None:
     requests: list[httpx.Request] = []
     async with client_for(FRAMED_ROUTES, requests) as client:
-        titles = await fetch_titles('framed', client)
+        titles = await fetch_titles('framed', client, FAST)
 
     assert len(titles) == 114
     assert titles[0] == 'The Shawshank Redemption'
@@ -53,7 +63,7 @@ async def test_framed_round_n_is_entry_n_minus_one() -> None:
 @pytest.mark.asyncio
 async def test_framed_keeps_year_suffix_and_decodes_escapes() -> None:
     async with client_for(FRAMED_ROUTES, []) as client:
-        titles = await fetch_titles('framed', client)
+        titles = await fetch_titles('framed', client, FAST)
 
     # The trimmed fixture appends real later entries after the first 110 rounds.
     assert titles[110:] == ['A Star Is Born (2018)', "You've Got Mail", 'Toy Story 3', 'Halloween (2018)']
@@ -71,7 +81,7 @@ def test_framed_skips_mode_arrays_that_do_not_start_at_round_one() -> None:
 async def test_episode_finds_answers_chunk_through_webpack_runtime() -> None:
     requests: list[httpx.Request] = []
     async with client_for(EPISODE_ROUTES, requests) as client:
-        titles = await fetch_titles('episode', client)
+        titles = await fetch_titles('episode', client, FAST)
 
     assert len(titles) == 112
     assert titles[0] == 'Game of Thrones'
@@ -101,7 +111,7 @@ async def test_episode_fails_when_no_chunk_has_answers() -> None:
     routes['https://episode.wtf/_next/static/chunks/87.0111d1a5ef9290c6.js'] = 'episode_380.js'
     async with client_for(routes, []) as client:
         with pytest.raises(ScrapeError):
-            await fetch_titles('episode', client)
+            await fetch_titles('episode', client, FAST)
 
 
 @pytest.mark.asyncio
@@ -110,14 +120,14 @@ async def test_framed_fails_when_home_page_has_no_app_bundle() -> None:
     routes['https://framed.wtf/'] = 'episode_380.js'
     async with client_for(routes, []) as client:
         with pytest.raises(ScrapeError):
-            await fetch_titles('framed', client)
+            await fetch_titles('framed', client, FAST)
 
 
 @pytest.mark.asyncio
 async def test_http_error_propagates() -> None:
     async with client_for({}, []) as client:
         with pytest.raises(httpx.HTTPStatusError):
-            await fetch_titles('framed', client)
+            await fetch_titles('framed', client, FAST)
 
 
 def test_js_unescape() -> None:
@@ -152,7 +162,7 @@ async def test_episode_rejects_answer_arrays_in_two_chunks() -> None:
     }
     async with text_client(texts) as client:
         with pytest.raises(ScrapeError):
-            await fetch_titles('episode', client)
+            await fetch_titles('episode', client, FAST)
 
 
 @pytest.mark.parametrize(
@@ -182,6 +192,86 @@ async def test_episode_accepts_identical_answer_arrays_in_two_chunks() -> None:
         'https://episode.wtf/_next/static/chunks/88.0123456789abcdef.js': short_array(100),
     }
     async with text_client(texts) as client:
-        titles = await fetch_titles('episode', client)
+        titles = await fetch_titles('episode', client, FAST)
 
     assert titles == [f'Film {number}' for number in range(1, 101)]
+
+
+@pytest.mark.asyncio
+async def test_framed_entries_carry_image_ids_written_as_js_numbers() -> None:
+    async with client_for(FRAMED_ROUTES, []) as client:
+        entries = await fetch_entries('framed', client, RateLimiter(1000))
+
+    assert entries[0] == BundleEntry('The Shawshank Redemption', 1)
+    assert BundleEntry('Toy Story 3', 1000) in entries
+
+
+def test_extract_entries_reads_exponent_ids() -> None:
+    script = short_array(100).replace('id:100}', 'id:1e3}')
+
+    assert extract_entries(script)[-1] == BundleEntry('Film 100', 1000)
+
+
+@pytest.mark.parametrize('raw_id', ['1.5', '0', '1e9'])
+def test_extract_entries_rejects_ids_that_are_not_image_ids(raw_id: str) -> None:
+    script = short_array(100).replace('id:100}', f'id:{raw_id}}}')
+
+    with pytest.raises(ScrapeError, match='Malformed id'):
+        extract_entries(script)
+
+
+@pytest.mark.asyncio
+async def test_every_bundle_request_waits_for_the_shared_limiter() -> None:
+    waits: list[str] = []
+
+    class Recording(RateLimiter):
+        async def wait(self) -> None:
+            waits.append('wait')
+
+    requests: list[httpx.Request] = []
+    async with client_for(EPISODE_ROUTES, requests) as client:
+        await fetch_entries('episode', client, Recording(1))
+
+    assert len(waits) == len(requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_bundle_request_pauses_the_site_group() -> None:
+    clock = [0.0]
+
+    async def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    limiter = RateLimiter(1000, clock=lambda: clock[0], sleep=sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={'Retry-After': '42'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(Throttled):
+            await fetch_entries('framed', client, limiter)
+
+    await limiter.wait()
+    assert clock[0] == pytest.approx(42.0)
+
+
+@pytest.mark.asyncio
+async def test_bundle_requests_do_not_follow_redirects() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={'Location': 'https://evil.test/'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_entries('framed', client, RateLimiter(1000))
+
+    assert [request.url.host for request in requests] == ['framed.wtf']
+
+
+def test_extract_entries_rejects_non_ascii_digit_ids() -> None:
+    script = short_array(100).replace('id:100}', 'id:١٠٠}')
+
+    with pytest.raises(ScrapeError):
+        extract_entries(script)
