@@ -182,3 +182,54 @@ async def test_non_bytes_images_are_rejected_before_a_child_starts() -> None:
     with pytest.raises(EmbedderError, match='^TypeError$'):
         await embedder.embed([bytearray(b'x')])  # ty: ignore[invalid-argument-type]
     assert embedder.child is None
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_partial_reply_times_out_without_blocking_the_loop() -> None:
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour, request_timeout=1.0)
+    embedder._target = clip_fakes.stalling_serve
+    beats = 0
+
+    async def heartbeat() -> None:
+        nonlocal beats
+        while True:
+            beats += 1
+            await asyncio.sleep(0.01)
+
+    ticker = asyncio.create_task(heartbeat())
+    request = asyncio.create_task(embedder.embed([jpeg()]))
+    process = await wait_for_child(embedder)
+    try:
+        with pytest.raises(EmbedderError, match='TimeoutError'):
+            await request
+    finally:
+        ticker.cancel()
+
+    assert beats >= 50
+    assert exited(embedder, process)
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_dies_unexpectedly_disables_the_backend() -> None:
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.colour)
+    await embedder.embed([jpeg()])
+    process = embedder.child
+    assert process is not None
+    process.kill()
+    process.join(2.0)
+
+    for _ in range(3):
+        with pytest.raises(EmbedderError, match='^ChildDied$'):
+            await embedder.embed([jpeg()])
+        assert embedder.child is None
+    await embedder.close()
+
+
+@pytest.mark.asyncio
+async def test_a_memory_error_in_the_child_is_a_persistent_application_error() -> None:
+    embedder = ProcessEmbedder(MODEL, factory=clip_fakes.memory_failure)
+
+    for _ in range(2):
+        with pytest.raises(EmbedderError, match='^MemoryError$'):
+            await embedder.embed([jpeg()])
+        assert embedder.child is None

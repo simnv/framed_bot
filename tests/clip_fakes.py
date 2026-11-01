@@ -1,5 +1,7 @@
 """Session factories for the CLIP child process in tests. The spawned child imports this module by name."""
 
+import os
+import struct
 import time
 
 import numpy as np
@@ -47,3 +49,14 @@ def ort_failure(model_path: str, threads: int) -> ColourSession:
     from onnxruntime.capi.onnxruntime_pybind11_state import Fail  # ty: ignore[unresolved-import]
 
     raise Fail('synthetic backend failure')
+
+
+def memory_failure(model_path: str, threads: int) -> ColourSession:
+    raise MemoryError
+
+
+def stalling_serve(connection, model_path: str, threads: int, factory) -> None:  # noqa: ANN001
+    """A child that reads one request, sends a reply header for 1000 bytes plus 1 byte, then stalls."""
+    connection.recv()
+    os.write(connection.fileno(), struct.pack('!i', 1000) + b'x')
+    time.sleep(600.0)

@@ -10,6 +10,7 @@ import contextlib
 import io
 import multiprocessing
 import signal
+import struct
 import sys
 import time
 import types
@@ -90,7 +91,8 @@ def preprocess(data: bytes) -> np.ndarray | None:
         resized = rgb.resize(size, Image.Resampling.BICUBIC)
         left, top = (size[0] - SIZE) // 2, (size[1] - SIZE) // 2
         pixels = np.asarray(resized.crop((left, top, left + SIZE, top + SIZE)), dtype=np.float32) / 255.0
-    except Exception:  # Pillow raises OSError, SyntaxError, ValueError, struct.error, EOFError and bomb errors
+    except OSError, ValueError, SyntaxError, EOFError, struct.error, Image.DecompressionBombError:
+        # Known malformed-image errors only; MemoryError and the like reach the backend error boundary.
         return None
     return ((pixels - MEAN) / STD).transpose(2, 0, 1)
 
@@ -185,7 +187,7 @@ class ProcessEmbedder:
         self._lock = asyncio.Lock()
         self._closed = False
         self._failure: str | None = None
-        self._waiting: tuple[asyncio.AbstractEventLoop, int, asyncio.Future[None]] | None = None
+        self._target = serve
 
     @property
     def child(self) -> BaseProcess | None:
@@ -203,6 +205,10 @@ class ProcessEmbedder:
                 raise EmbedderError('Closed')
             if self._failure is not None:
                 raise EmbedderError(self._failure)
+            if self._process is not None and not self._process.is_alive():
+                # Not a first start and not our own stop: the child died. Never load the model again.
+                self._fail('ChildDied')
+                raise EmbedderError('ChildDied')
             try:
                 connection = self._started()
                 kind, value = await asyncio.wait_for(self._exchange(connection, images), self._timeout)
@@ -228,11 +234,11 @@ class ProcessEmbedder:
         return await self._reply(connection)
 
     def _started(self) -> Connection:
-        if self._process is None or self._connection is None or not self._process.is_alive():
+        if self._process is None or self._connection is None:
             self._stop_now()
             parent, child = self._context.Pipe()
             process = self._context.Process(
-                target=serve, args=(child, self._model_path, self._threads, self._factory), daemon=True
+                target=self._target, args=(child, self._model_path, self._threads, self._factory), daemon=True
             )
             with _without_main_module():
                 process.start()
@@ -241,29 +247,12 @@ class ProcessEmbedder:
         return self._connection
 
     async def _reply(self, connection: Connection) -> tuple[str, object]:
-        loop = asyncio.get_running_loop()
-        readable: asyncio.Future[None] = loop.create_future()
-        descriptor = connection.fileno()
-        loop.add_reader(descriptor, lambda: readable.done() or readable.set_result(None))
-        self._waiting = (loop, descriptor, readable)
-        try:
-            await readable
-        finally:
-            self._stop_waiting()
-        reply = connection.recv()
+        # recv blocks until the whole framed reply arrives, so it runs in a thread; stopping the child (kill, then
+        # close) ends the read with EOFError or OSError, so a stalled partial reply cannot outlive the deadline.
+        reply = await asyncio.to_thread(connection.recv)
         if type(reply) is not tuple or len(reply) != 2 or type(reply[0]) is not str:
             raise EOFError
         return reply
-
-    def _stop_waiting(self, error: BaseException | None = None) -> None:
-        """Remove the reader before the connection closes; wake the waiter with `error` when one is given."""
-        if self._waiting is None:
-            return
-        loop, descriptor, readable = self._waiting
-        self._waiting = None
-        loop.remove_reader(descriptor)
-        if error is not None and not readable.done():
-            readable.set_exception(error)
 
     def _fail(self, name: str) -> None:
         """Disable the backend until the bot restarts; tied rounds then keep the text choice."""
@@ -273,15 +262,15 @@ class ProcessEmbedder:
     def _stop_now(self) -> None:
         process, connection = self._process, self._connection
         self._process = self._connection = None
-        self._stop_waiting(EOFError())
-        if connection is not None:
-            connection.close()
         if process is not None and process.is_alive():
             process.terminate()
             process.join(TERMINATE_GRACE)
             if process.is_alive():
                 process.kill()
                 process.join(KILL_GRACE)
+        # Close after the child is gone, so a thread blocked in recv sees EOF and no descriptor is reused under it.
+        if connection is not None:
+            connection.close()
 
     async def close(self) -> None:
         """Stop admissions, ask an idle child to exit, then terminate and kill it. Ends within about 2 seconds."""

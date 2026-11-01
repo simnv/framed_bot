@@ -73,12 +73,21 @@ def png(width: int, height: int) -> bytes:
 @pytest.mark.parametrize('size', [(10_000, 1), (1, 10_000), (2049, 1000), (900, 200), (10, 10)])
 def test_preprocess_rejects_sizes_before_any_resize(monkeypatch: pytest.MonkeyPatch, size: tuple[int, int]) -> None:
     # A 10000 x 1 PNG is about 100 bytes; resizing its short side to 224 would ask for 2,240,000 x 224 pixels.
-    def no_resize(*args: object, **kwargs: object) -> None:
-        raise AssertionError('resize must not run')
-
-    monkeypatch.setattr(Image.Image, 'resize', no_resize)
+    resizes: list[object] = []
+    monkeypatch.setattr(Image.Image, 'resize', lambda *args, **kwargs: resizes.append(args))
 
     assert preprocess(png(*size)) is None
+    assert resizes == []
+
+
+def test_preprocess_lets_unexpected_failures_reach_the_backend_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_memory(*args: object, **kwargs: object) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(Image.Image, 'resize', no_memory)
+
+    with pytest.raises(MemoryError):
+        preprocess(png(64, 64))
 
 
 def test_preprocess_accepts_the_largest_bounded_sizes() -> None:
