@@ -9,11 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.db import AsyncScopedSession
 from models.episode_result import EpisodeResult
+from models.framed_asset import FramedAsset
 from models.framed_result import FramedResult
 from models.game_answer import GameAnswer
 from models.title import Company, Genre, Person, Title, TitleCompany, TitleGenre, TitlePerson
 
 from . import Game, MatchStatus
+from .assets import Asset, Mode
 from .tmdb import TitleData
 
 
@@ -126,11 +128,11 @@ class DbAnswerStore:
             return [PendingAnswer(number, title) for number, title in result.all()]
 
     async def save_title(self, game: Game, round_number: int, data: TitleData, status: MatchStatus) -> None:
-        """Link a round to a title found by the sync. A manual row stays unchanged."""
+        """Link a round to a title found by the sync. Never change manual rows; change site rows only by a site id."""
         async with AsyncScopedSession() as session, session.begin():
             # Lock the answer row before the title, in the same order as set_manual_title.
             current = await _lock_answer(session, game, round_number)
-            if current is None or current == 'manual':
+            if current is None or current == 'manual' or (current == 'site' and status != 'site'):
                 return
             title_id = await _upsert_title(session, data)
             await session.execute(
@@ -147,6 +149,7 @@ class DbAnswerStore:
                     GameAnswer.game == game,
                     GameAnswer.round == round_number,
                     GameAnswer.match_status.is_distinct_from('manual'),
+                    GameAnswer.match_status.is_distinct_from('site'),
                 )
                 .values(match_status='unmatched', updated_at=func.now())
             )
@@ -164,6 +167,29 @@ class DbAnswerStore:
             )
             return True
 
+    async def source_titles(self, game: Game) -> list[str]:
+        async with AsyncScopedSession() as session:
+            result = await session.execute(select(GameAnswer.source_title).where(GameAnswer.game == game))
+            return list(result.scalars())
+
+    async def missing_asset_days(self, mode: Mode, up_to_day: int) -> list[int]:
+        async with AsyncScopedSession() as session:
+            result = await session.execute(
+                select(FramedAsset.day).where(FramedAsset.mode == mode, FramedAsset.day <= up_to_day)
+            )
+            stored = set(result.scalars())
+        return [day for day in range(1, up_to_day + 1) if day not in stored]
+
+    async def save_asset(self, asset: Asset) -> None:
+        async with AsyncScopedSession() as session, session.begin():
+            await session.execute(asset_insert(asset))
+
+    async def site_updates(self, up_to_round: int) -> list[tuple[int, int]]:
+        """Framed (round, tmdb_id) pairs whose site id differs from the stored match. Manual rows are left out."""
+        async with AsyncScopedSession() as session:
+            result = await session.execute(site_updates_query(up_to_round))
+            return [(number, tmdb_id) for number, tmdb_id in result.all()]
+
     async def has_answer(self, game: Game, round_number: int) -> bool:
         async with AsyncScopedSession() as session:
             found = await session.scalar(
@@ -175,3 +201,39 @@ class DbAnswerStore:
         model = FramedResult if game == 'framed' else EpisodeResult
         async with AsyncScopedSession() as session:
             return await session.scalar(select(func.max(model.framed_round)))
+
+
+def asset_insert(asset: Asset) -> Any:
+    values = {
+        'mode': asset.mode,
+        'day': asset.day,
+        'classic_day': asset.classic_day,
+        'tmdb_id': asset.tmdb_id,
+        'imdb_id': asset.imdb_id,
+    }
+    return (
+        insert(FramedAsset).values(**values).on_conflict_do_nothing(index_elements=[FramedAsset.mode, FramedAsset.day])
+    )
+
+
+def site_updates_query(up_to_round: int) -> Any:
+    # A classic day with two different ids in the asset table is ambiguous and gives no site id.
+    site = (
+        select(FramedAsset.classic_day, func.min(FramedAsset.tmdb_id).label('tmdb_id'))
+        .where(FramedAsset.classic_day.is_not(None), FramedAsset.tmdb_id.is_not(None))
+        .group_by(FramedAsset.classic_day)
+        .having(func.count(FramedAsset.tmdb_id.distinct()) == 1)
+        .subquery()
+    )
+    return (
+        select(GameAnswer.round, site.c.tmdb_id)
+        .join(site, site.c.classic_day == GameAnswer.round)
+        .outerjoin(Title, Title.id == GameAnswer.title_id)
+        .where(
+            GameAnswer.game == 'framed',
+            GameAnswer.round <= up_to_round,
+            GameAnswer.match_status.is_distinct_from('manual'),
+            or_(GameAnswer.match_status.is_distinct_from('site'), Title.tmdb_id.is_distinct_from(site.c.tmdb_id)),
+        )
+        .order_by(GameAnswer.round)
+    )

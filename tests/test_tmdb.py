@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from answers.ratelimit import RateLimiter, Throttled
-from answers.tmdb import Credit, Match, TitleData, TmdbClient, TmdbError, TmdbRateLimited, normalize, split_year
+from answers.tmdb import Credit, TitleData, TmdbClient, TmdbError, TmdbRateLimited, normalize, split_year
 
 TOKEN = 'synthetic-tmdb-token'  # noqa: S105 - synthetic test value
 MOVIE_DETAILS: dict[str, Any] = {
@@ -70,132 +70,17 @@ def test_normalize_folds_case_and_strips_punctuation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_find_movie_uses_bearer_token_and_primary_release_year() -> None:
-    requests: list[httpx.Request] = []
-    tmdb = tmdb_for(
-        {'/3/search/movie': search({'id': 424139, 'title': 'Halloween', 'original_title': 'Halloween'})}, requests
-    )
-
-    match = await tmdb.find('movie', 'Halloween (2018)')
-
-    assert match == Match(424139, 'auto')
-    [request] = requests
-    assert request.url.host == 'api.themoviedb.org'
-    assert request.headers['Authorization'] == f'Bearer {TOKEN}'
-    assert dict(request.url.params) == {'query': 'Halloween', 'primary_release_year': '2018'}
-
-
-@pytest.mark.asyncio
-async def test_find_movie_without_year_sends_query_only() -> None:
+async def test_search_uses_bearer_token_and_sends_query_only_without_year() -> None:
     requests: list[httpx.Request] = []
     tmdb = tmdb_for({'/3/search/movie': search({'id': 278, 'title': 'The Shawshank Redemption'})}, requests)
 
-    assert await tmdb.find('movie', 'The Shawshank Redemption') == Match(278, 'auto')
-    assert dict(requests[0].url.params) == {'query': 'The Shawshank Redemption'}
+    [found] = await tmdb.search('movie', 'The Shawshank Redemption', None)
 
-
-@pytest.mark.asyncio
-async def test_find_tv_uses_tv_search() -> None:
-    requests: list[httpx.Request] = []
-    tmdb = tmdb_for(
-        {'/3/search/tv': search({'id': 76331, 'name': 'Succession', 'original_name': 'Succession'})}, requests
-    )
-
-    assert await tmdb.find('tv', 'Succession') == Match(76331, 'auto')
-    assert dict(requests[0].url.params) == {'query': 'Succession'}
-
-
-@pytest.mark.asyncio
-async def test_find_accepts_original_name_match() -> None:
-    tmdb = tmdb_for({'/3/search/movie': search({'id': 129, 'title': 'Spirited Away', 'original_title': 'Amélie'})}, [])
-
-    assert await tmdb.find('movie', 'Amélie') == Match(129, 'auto')
-
-
-@pytest.mark.asyncio
-async def test_find_marks_different_first_result_as_low_confidence() -> None:
-    tmdb = tmdb_for(
-        {
-            '/3/search/movie': search(
-                {'id': 1, 'title': 'Halloween Kills', 'original_title': 'Halloween Kills'},
-                {'id': 2, 'title': 'Halloween Ends', 'original_title': 'Halloween Ends'},
-            )
-        },
-        [],
-    )
-
-    assert await tmdb.find('movie', 'Halloween') == Match(1, 'low_confidence')
-
-
-@pytest.mark.asyncio
-async def test_find_prefers_exact_match_further_down_the_results() -> None:
-    tmdb = tmdb_for(
-        {
-            '/3/search/movie': search(
-                {'id': 1, 'title': 'The Batman', 'original_title': 'The Batman'},
-                {'id': 2, 'title': 'Batman Returns', 'original_title': 'Batman Returns'},
-                {'id': 3, 'title': 'Batman', 'original_title': 'Batman'},
-            )
-        },
-        [],
-    )
-
-    assert await tmdb.find('movie', 'Batman') == Match(3, 'auto')
-
-
-@pytest.mark.asyncio
-async def test_find_takes_first_of_two_exact_matches() -> None:
-    tmdb = tmdb_for(
-        {
-            '/3/search/movie': search(
-                {'id': 1, 'title': 'Big Hero 6', 'original_title': 'Big Hero 6'},
-                {'id': 2, 'title': 'Big', 'original_title': 'Big'},
-                {'id': 3, 'title': 'Big', 'original_title': 'Big'},
-            )
-        },
-        [],
-    )
-
-    assert await tmdb.find('movie', 'Big') == Match(2, 'auto')
-
-
-@pytest.mark.asyncio
-async def test_find_accepts_original_name_match_further_down() -> None:
-    tmdb = tmdb_for(
-        {
-            '/3/search/movie': search(
-                {'id': 1, 'title': 'Spirited Away', 'original_title': 'Sen to Chihiro'},
-                {'id': 2, 'title': 'Amelie', 'original_title': 'Le Fabuleux Destin'},
-                {'id': 3, 'title': 'Amelie Poulain', 'original_title': 'Amélie'},
-            )
-        },
-        [],
-    )
-
-    assert await tmdb.find('movie', 'Amélie') == Match(3, 'auto')
-
-
-@pytest.mark.asyncio
-async def test_find_validates_entries_after_an_exact_match() -> None:
-    tmdb = tmdb_for(
-        {
-            '/3/search/movie': search(
-                {'id': 1, 'title': 'Batman', 'original_title': 'Batman'},
-                {'id': True, 'title': 'Batman Returns'},
-            )
-        },
-        [],
-    )
-
-    with pytest.raises(TmdbError, match='TMDB movie search has an unexpected shape'):
-        await tmdb.find('movie', 'Batman')
-
-
-@pytest.mark.asyncio
-async def test_find_returns_none_without_results() -> None:
-    tmdb = tmdb_for({'/3/search/movie': search()}, [])
-
-    assert await tmdb.find('movie', 'Not A Film') is None
+    assert found.tmdb_id == 278
+    [request] = requests
+    assert request.url.host == 'api.themoviedb.org'
+    assert request.headers['Authorization'] == f'Bearer {TOKEN}'
+    assert dict(request.url.params) == {'query': 'The Shawshank Redemption'}
 
 
 @pytest.mark.asyncio
@@ -311,7 +196,7 @@ async def test_bad_responses_raise_tmdb_error(response: httpx.Response) -> None:
     tmdb = tmdb_for({'/3/search/movie': response}, [])
 
     with pytest.raises(TmdbError):
-        await tmdb.find('movie', 'Halloween')
+        await tmdb.search('movie', 'Halloween', None)
 
 
 @pytest.mark.asyncio
@@ -322,7 +207,7 @@ async def test_timeout_raises_tmdb_error_without_token() -> None:
     tmdb = TmdbClient(TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
 
     with pytest.raises(TmdbError) as error:
-        await tmdb.find('movie', 'Halloween')
+        await tmdb.search('movie', 'Halloween', None)
     assert TOKEN not in str(error.value)
 
 
@@ -362,7 +247,7 @@ async def test_malformed_search_raises_fixed_tmdb_error(body: dict[str, Any]) ->
     tmdb = tmdb_for({'/3/search/movie': httpx.Response(200, json=body)}, [])
 
     with pytest.raises(TmdbError) as error:
-        await tmdb.find('movie', 'Halloween')
+        await tmdb.search('movie', 'Halloween', None)
     assert str(error.value) == 'TMDB movie search has an unexpected shape'
 
 

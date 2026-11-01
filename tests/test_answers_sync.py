@@ -7,11 +7,14 @@ import httpx
 import pytest
 from sqlalchemy.exc import SQLAlchemyError
 
-from answers import Game, Kind, MatchStatus
-from answers.scraper import ScrapeError
+from answers import KIND_BY_GAME, Game, Kind, MatchStatus
+from answers.assets import Asset, AssetError, Mode
+from answers.pipeline import Resolution, Resolver
+from answers.ratelimit import Throttled
+from answers.scraper import BundleEntry, ScrapeError
 from answers.store import PendingAnswer
 from answers.sync import AnswerSync
-from answers.tmdb import Match, TitleData, TmdbClient, TmdbError, TmdbRateLimited
+from answers.tmdb import TitleData, TmdbClient, TmdbError, TmdbRateLimited
 
 TITLES = [f'Film {number}' for number in range(1, 201)]
 # Framed round 1695 and Episode round 217; both limits are far above the small rounds in these tests.
@@ -29,6 +32,7 @@ class Row:
 class FakeStore:
     rows: dict[tuple[Game, int], Row] = field(default_factory=dict)
     limits: list[int] = field(default_factory=list)
+    assets: dict[tuple[Mode, int], Asset] = field(default_factory=dict)
 
     async def missing_rounds(self, game: Game, up_to_round: int) -> list[int]:
         self.limits.append(up_to_round)
@@ -52,13 +56,34 @@ class FakeStore:
 
     async def save_title(self, game: Game, round_number: int, data: TitleData, status: MatchStatus) -> None:
         row = self.rows[(game, round_number)]
-        if row.match_status != 'manual':
+        if row.match_status != 'manual' and (row.match_status != 'site' or status == 'site'):
             row.title_id, row.match_status = data.tmdb_id, status
 
     async def mark_unmatched(self, game: Game, round_number: int) -> None:
         row = self.rows[(game, round_number)]
-        if row.match_status != 'manual':
+        if row.match_status not in ('manual', 'site'):
             row.match_status = 'unmatched'
+
+    async def source_titles(self, game: Game) -> list[str]:
+        return [row.source_title for (row_game, _), row in sorted(self.rows.items()) if row_game == game]
+
+    async def missing_asset_days(self, mode: Mode, up_to_day: int) -> list[int]:
+        return [day for day in range(1, up_to_day + 1) if (mode, day) not in self.assets]
+
+    async def save_asset(self, asset: Asset) -> None:
+        self.assets.setdefault((asset.mode, asset.day), asset)
+
+    async def site_updates(self, up_to_round: int) -> list[tuple[int, int]]:
+        site = {a.classic_day: a.tmdb_id for a in self.assets.values() if a.classic_day and a.tmdb_id}
+        return [
+            (number, site[number])
+            for (game, number), row in sorted(self.rows.items())
+            if game == 'framed'
+            and number <= up_to_round
+            and number in site
+            and row.match_status != 'manual'
+            and (row.match_status != 'site' or row.title_id != site[number])
+        ]
 
 
 @dataclass
@@ -68,13 +93,13 @@ class FakeScraper:
     calls: list[Game] = field(default_factory=list)
     gate: asyncio.Event | None = None
 
-    async def __call__(self, game: Game) -> list[str]:
+    async def __call__(self, game: Game) -> list[BundleEntry]:
         self.calls.append(game)
         if self.gate is not None:
             await self.gate.wait()
         if self.error is not None:
             raise self.error
-        return self.titles
+        return [BundleEntry(title, 100 + number) for number, title in enumerate(self.titles, start=1)]
 
 
 def title_data(tmdb_id: int, kind: Kind = 'movie') -> TitleData:
@@ -83,19 +108,55 @@ def title_data(tmdb_id: int, kind: Kind = 'movie') -> TitleData:
 
 @dataclass
 class FakeTmdb:
-    # source_title -> outcome of find: a Match, None, or an exception.
-    outcomes: dict[str, Match | None | Exception] = field(default_factory=dict)
-    finds: list[tuple[Kind, str]] = field(default_factory=list)
+    """Both the resolver and the title source of the sync."""
 
-    async def find(self, kind: Kind, source_title: str) -> Match | None:
-        self.finds.append((kind, source_title))
-        outcome = self.outcomes.get(source_title, Match(int(source_title.split()[-1]), 'auto'))
+    # source_title -> outcome of resolve: a Resolution, None, or an exception.
+    outcomes: dict[str, Resolution | None | Exception] = field(default_factory=dict)
+    finds: list[tuple[Kind, str]] = field(default_factory=list)
+    image_ids: list[int | None] = field(default_factory=list)
+    siblings: list[dict[str, frozenset[int]]] = field(default_factory=list)
+    detail_errors: dict[int, Exception] = field(default_factory=dict)
+    closed: bool = False
+
+    async def resolve(
+        self,
+        game: Game,
+        round_number: int,
+        source_title: str,
+        siblings: dict[str, frozenset[int]],
+        image_id: int | None,
+    ) -> Resolution | None:
+        self.finds.append((KIND_BY_GAME[game], source_title))
+        self.image_ids.append(image_id)
+        self.siblings.append(siblings)
+        if source_title not in self.outcomes:
+            return Resolution(int(source_title.split()[-1]), 'auto')
+        outcome = self.outcomes[source_title]
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
+    async def close(self) -> None:
+        self.closed = True
+
     async def details(self, kind: Kind, tmdb_id: int) -> TitleData:
+        if tmdb_id in self.detail_errors:
+            raise self.detail_errors[tmdb_id]
         return title_data(tmdb_id, kind)
+
+
+@dataclass
+class FakeAssets:
+    # (mode, day) -> asset; other days return 404 rows. An exception stops the mode.
+    found: dict[tuple[Mode, int], Asset | Exception] = field(default_factory=dict)
+    requests: list[tuple[Mode, int]] = field(default_factory=list)
+
+    async def fetch(self, mode: Mode, day: int) -> Asset:
+        self.requests.append((mode, day))
+        outcome = self.found.get((mode, day), Asset(mode, day, None, None, None))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 @dataclass
@@ -111,9 +172,11 @@ def make_sync(
     scraper: FakeScraper | None = None,
     tmdb: FakeTmdb | None = None,
     today: date = TODAY,
+    assets: FakeAssets | None = None,
 ) -> tuple[AnswerSync, FakeStore, FakeScraper, FakeTmdb, Alerts]:
     store, scraper, tmdb, alerts = store or FakeStore(), scraper or FakeScraper(), tmdb or FakeTmdb(), Alerts()
-    return AnswerSync(store, scraper, tmdb, alerts, today=lambda: today), store, scraper, tmdb, alerts
+    sync = AnswerSync(store, scraper, tmdb, alerts, today=lambda: today, resolver=tmdb, assets=assets)
+    return sync, store, scraper, tmdb, alerts
 
 
 async def wait_until(condition: Any) -> None:
@@ -192,7 +255,7 @@ async def test_sync_marks_unmatched_and_does_not_retry_them() -> None:
 
 @pytest.mark.asyncio
 async def test_sync_keeps_low_confidence_status() -> None:
-    sync, store, _, _, _ = make_sync(tmdb=FakeTmdb({'Film 1': Match(77, 'low_confidence')}))
+    sync, store, _, _, _ = make_sync(tmdb=FakeTmdb({'Film 1': Resolution(77, 'low_confidence')}))
 
     await sync.sync('framed', 1)
 
@@ -332,7 +395,8 @@ async def test_sync_before_round_one_does_nothing() -> None:
 def tmdb_with_bodies(searches: dict[str, Any], details: dict[int, Any]) -> TmdbClient:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == '/3/search/movie':
-            return httpx.Response(200, json=searches[request.url.params['query']])
+            # Variants such as 'Film III' find nothing.
+            return httpx.Response(200, json=searches.get(request.url.params['query'], {'results': []}))
         return httpx.Response(200, json=details[int(request.url.path.rsplit('/', 1)[1])])
 
     return TmdbClient('synthetic-tmdb-key', httpx.AsyncClient(transport=httpx.MockTransport(handler)))
@@ -351,7 +415,7 @@ async def test_malformed_tmdb_responses_keep_rows_pending_and_later_rows_continu
         {3: {'id': 3, 'title': None}, 4: valid},
     )
     store = FakeStore()
-    sync = AnswerSync(store, FakeScraper(), tmdb, Alerts(), today=lambda: TODAY)
+    sync = AnswerSync(store, FakeScraper(), tmdb, Alerts(), today=lambda: TODAY, resolver=Resolver(tmdb.search))
 
     await sync.sync('framed', 4)
 
@@ -420,3 +484,265 @@ async def test_shutdown_cancels_a_stalled_newest_round_lookup() -> None:
     assert await caller is None
     assert store.limits == []
     await sync.sync_newest('framed', stalled)
+
+
+def site_asset(mode: Mode, day: int, classic_day: int, tmdb_id: int) -> Asset:
+    return Asset(mode, day, classic_day, tmdb_id, None)
+
+
+@pytest.mark.asyncio
+async def test_framed_sync_fetches_mode_days_up_to_today_only() -> None:
+    # 2025-06-07 is titleshot day 3; poster day 1 is 2025-07-25.
+    assets = FakeAssets()
+    sync, store, _, _, _ = make_sync(today=date(2025, 6, 7), assets=assets)
+
+    await sync.sync('framed', 2)
+    await sync.sync('framed', 2)
+
+    assert assets.requests == [('titleshot', 1), ('titleshot', 2), ('titleshot', 3)]
+    assert store.assets[('titleshot', 2)] == Asset('titleshot', 2, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_episode_sync_fetches_no_assets() -> None:
+    assets = FakeAssets()
+    sync, _, _, _, _ = make_sync(today=date(2025, 6, 7), assets=assets)
+
+    await sync.sync('episode', 2)
+
+    assert assets.requests == []
+
+
+@pytest.mark.asyncio
+async def test_site_ids_win_over_text_and_skip_the_resolver() -> None:
+    assets = FakeAssets({('titleshot', 1): site_asset('titleshot', 1, 2, 900)})
+    sync, store, _, tmdb, _ = make_sync(today=date(2025, 6, 5), assets=assets)
+
+    await sync.sync('framed', 3)
+
+    assert store.rows[('framed', 2)] == Row('Film 2', 900, 'site')
+    assert tmdb.finds == [('movie', 'Film 1'), ('movie', 'Film 3')]
+
+
+@pytest.mark.asyncio
+async def test_a_new_site_id_replaces_a_text_match_but_text_never_replaces_site() -> None:
+    store = FakeStore(
+        {
+            ('framed', 1): Row('Film 1', 1, 'auto'),
+            ('framed', 2): Row('Film 2', 800, 'site'),
+            ('framed', 3): Row('Film 3', 3, 'manual'),
+        }
+    )
+    assets = FakeAssets(
+        {
+            ('titleshot', 1): site_asset('titleshot', 1, 1, 700),
+            ('titleshot', 2): site_asset('titleshot', 2, 3, 600),
+        }
+    )
+    sync, _, _, _, _ = make_sync(store, today=date(2025, 6, 6), assets=assets)
+
+    await sync.sync('framed', 3)
+    await store.save_title('framed', 2, title_data(5), 'auto')
+
+    assert store.rows[('framed', 1)] == Row('Film 1', 700, 'site')
+    assert store.rows[('framed', 2)] == Row('Film 2', 800, 'site')
+    assert store.rows[('framed', 3)] == Row('Film 3', 3, 'manual')
+
+
+@pytest.mark.asyncio
+async def test_an_asset_error_stops_that_mode_and_matching_continues(caplog: pytest.LogCaptureFixture) -> None:
+    assets = FakeAssets({('titleshot', 2): AssetError('titleshot day 2 returned HTTP 500')})
+    sync, store, _, _, _ = make_sync(today=date(2025, 7, 25), assets=assets)
+
+    await sync.sync('framed', 1)
+
+    assert ('titleshot', 3) not in assets.requests
+    assert ('poster', 1) in assets.requests
+    assert store.rows[('framed', 1)] == Row('Film 1', 1, 'auto')
+    assert 'HTTP 500' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_in_the_site_step_stops_the_run() -> None:
+    assets = FakeAssets({('titleshot', 1): site_asset('titleshot', 1, 1, 900)})
+    tmdb = FakeTmdb(detail_errors={900: TmdbRateLimited('429')})
+    sync, store, _, _, _ = make_sync(tmdb=tmdb, today=date(2025, 6, 5), assets=assets)
+
+    await sync.sync('framed', 2)
+
+    assert store.rows[('framed', 1)] == Row('Film 1')
+    assert tmdb.finds == []
+
+
+@pytest.mark.asyncio
+async def test_the_resolver_gets_bundle_image_ids_and_sibling_years() -> None:
+    titles = ['Halloween (2018)', 'Halloween'] + TITLES[2:]
+    sync, store, _, tmdb, _ = make_sync(
+        scraper=FakeScraper(titles=titles),
+        tmdb=FakeTmdb({'Halloween (2018)': Resolution(5, 'auto'), 'Halloween': Resolution(6, 'visual')}),
+    )
+
+    await sync.sync('framed', 2)
+
+    assert tmdb.image_ids == [101, 102]
+    assert tmdb.siblings[1] == {'Halloween': frozenset({2018})}
+    assert store.rows[('framed', 2)] == Row('Halloween', 6, 'visual')
+
+
+@pytest.mark.asyncio
+async def test_pending_rows_scrape_the_bundle_once_for_image_ids() -> None:
+    store = FakeStore({('framed', 1): Row('Film 1'), ('framed', 2): Row('Film 2')})
+    sync, _, scraper, tmdb, _ = make_sync(store)
+
+    await sync.sync('framed', 2)
+    store.rows[('framed', 1)] = Row('Film 1')
+    await sync.sync('framed', 2)
+
+    assert scraper.calls == ['framed']
+    assert tmdb.image_ids == [101, 102, 101]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_bundle_scrape_still_matches_without_image_ids() -> None:
+    store = FakeStore({('framed', 1): Row('Film 1')})
+    sync, _, _, tmdb, alerts = make_sync(store, scraper=FakeScraper(error=ScrapeError('no array')))
+
+    await sync.sync('framed', 1)
+
+    assert tmdb.image_ids == [None]
+    assert store.rows[('framed', 1)] == Row('Film 1', 1, 'auto')
+    assert len(alerts.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_asset_request_stops_both_modes() -> None:
+    assets = FakeAssets({('titleshot', 2): Throttled('titleshot day 2 returned HTTP 429')})
+    sync, store, _, tmdb, _ = make_sync(today=date(2025, 7, 26), assets=assets)
+
+    await sync.sync('framed', 1)
+
+    assert assets.requests == [('titleshot', 1), ('titleshot', 2)]
+    # The run ends: no site ids, no matching; the round stays pending.
+    assert store.rows[('framed', 1)] == Row('Film 1')
+    assert tmdb.finds == []
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_tie_break_stops_the_run_and_keeps_the_round_pending() -> None:
+    tmdb = FakeTmdb({'Film 2': Throttled('Image host returned HTTP 429')})
+    sync, store, _, _, _ = make_sync(tmdb=tmdb)
+
+    await sync.sync('framed', 3)
+
+    assert store.rows[('framed', 2)] == Row('Film 2')
+    assert store.rows[('framed', 3)] == Row('Film 3')
+    assert tmdb.finds == [('movie', 'Film 1'), ('movie', 'Film 2')]
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_scrape_does_not_alert_the_admin() -> None:
+    sync, store, _, _, alerts = make_sync(scraper=FakeScraper(error=Throttled('429')))
+
+    await sync.sync('framed', 1)
+
+    assert store.rows == {}
+    assert alerts.messages == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_resolver() -> None:
+    sync, _, _, tmdb, _ = make_sync()
+
+    await sync.shutdown()
+
+    assert tmdb.closed
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stays_bounded_when_the_resolver_does_not_close(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import answers.sync
+
+    monkeypatch.setattr(answers.sync, 'ACTIVE_TIMEOUT', 0.1)
+    monkeypatch.setattr(answers.sync, 'SHUTDOWN_TIMEOUT', 0.3)
+    sync, _, _, tmdb, _ = make_sync()
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(tmdb, 'close', hang)
+
+    await asyncio.wait_for(sync.shutdown(), 1)
+
+    assert 'did not stop in time' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_scrape_ends_the_run_before_assets_and_matching() -> None:
+    store = FakeStore({('framed', 1): Row('Film 1')})
+    assets = FakeAssets()
+    sync, _, _, tmdb, alerts = make_sync(
+        store, FakeScraper(error=Throttled('429')), today=date(2025, 6, 7), assets=assets
+    )
+
+    await sync.sync('framed', 2)
+
+    assert assets.requests == []
+    assert tmdb.finds == []
+    assert alerts.messages == []
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_bundle_scrape_for_image_ids_ends_the_run() -> None:
+    store = FakeStore({('framed', 1): Row('Film 1')})
+    sync, _, _, tmdb, alerts = make_sync(store, FakeScraper(error=Throttled('429')))
+
+    await sync.sync('framed', 1)
+
+    assert tmdb.finds == []
+    assert store.rows[('framed', 1)] == Row('Film 1')
+    assert alerts.messages == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stays_bounded_when_the_resolver_ignores_cancellation(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import answers.sync
+
+    monkeypatch.setattr(answers.sync, 'ACTIVE_TIMEOUT', 0.1)
+    monkeypatch.setattr(answers.sync, 'SHUTDOWN_TIMEOUT', 0.3)
+    sync, _, _, tmdb, _ = make_sync()
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    monkeypatch.setattr(tmdb, 'close', stubborn)
+
+    await asyncio.wait_for(sync.shutdown(), 1)
+
+    release.set()
+    assert 'did not stop in time' in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_logs_a_failing_resolver_close_by_type(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    sync, _, _, tmdb, _ = make_sync()
+
+    async def broken() -> None:
+        raise OSError('sensitive path')
+
+    monkeypatch.setattr(tmdb, 'close', broken)
+
+    await sync.shutdown()
+
+    assert 'OSError' in caplog.text
+    assert 'sensitive path' not in caplog.text

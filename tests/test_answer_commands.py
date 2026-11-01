@@ -9,6 +9,7 @@ from telegram import Chat, Message, Update, User
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ExtBot, Job, JobQueue
 
 import main
+from answers.scraper import BundleEntry
 from answers.store import DbAnswerStore
 from answers.sync import AnswerSync
 from answers.tmdb import TitleData, TmdbClient, TmdbError
@@ -310,7 +311,7 @@ async def test_stop_cancels_answer_jobs_and_still_drains_reactions(monkeypatch: 
     monkeypatch.setattr(ExtBot, 'set_message_reaction', set_message_reaction)
     scraping = asyncio.Event()
 
-    async def scrape_forever(_game: str) -> list[str]:
+    async def scrape_forever(_game: str) -> list[BundleEntry]:
         scraping.set()
         await asyncio.Event().wait()
         return []

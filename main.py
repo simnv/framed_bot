@@ -45,7 +45,9 @@ from telegram.ext import (
 from telegram.ext.filters import Message, MessageFilter
 
 from answers import GAMES, KIND_BY_GAME, Game, parse_game, round_limit, utc_today
-from answers.scraper import fetch_titles
+from answers.pipeline import Resolver
+from answers.ratelimit import SITE_RATE, RateLimiter
+from answers.scraper import BundleEntry, fetch_entries
 from answers.store import DbAnswerStore
 from answers.sync import AnswerSync
 from answers.tmdb import TmdbClient, TmdbError
@@ -180,18 +182,21 @@ def start_answers(application: ReactionApplication) -> None:
     """Create the answer services and schedule the startup backfill. Startup does not wait for it."""
     client = httpx.AsyncClient()
     application.http_client = client
+    site_limiter = RateLimiter(SITE_RATE)
+    resolver = None
     if TMDB_API_KEY:
         application.tmdb = TmdbClient(TMDB_API_KEY, client)
+        resolver = Resolver(application.tmdb.search)
     else:
         logging.warning('TMDB_API_KEY is not set; the bot stores game answers without title data')
 
-    async def scrape(game: Game) -> list[str]:
-        return await fetch_titles(game, client)
+    async def scrape(game: Game) -> list[BundleEntry]:
+        return await fetch_entries(game, client, site_limiter)
 
     async def alert(text: str) -> None:
         await alert_admin(application.bot, text)
 
-    application.answer_sync = AnswerSync(application.answer_store, scrape, application.tmdb, alert)
+    application.answer_sync = AnswerSync(application.answer_store, scrape, application.tmdb, alert, resolver=resolver)
     job_queue = application.job_queue
     if job_queue is None:
         return
