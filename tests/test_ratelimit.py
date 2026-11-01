@@ -112,6 +112,16 @@ def test_backoff_doubles_without_retry_after_and_stays_bounded() -> None:
     assert limiter.throttled(0.0) == 1.0
 
 
+def test_backoff_stays_at_the_cap_after_many_strikes_without_a_quiet_period() -> None:
+    clock = FakeClock()
+    limiter = RateLimiter(8.0, clock=clock, sleep=clock.sleep)
+
+    delays = [limiter.throttled(None) for _ in range(2000)]
+
+    assert delays[-1] == MAX_COOLDOWN
+    assert limiter.throttled(None) == MAX_COOLDOWN
+
+
 def test_backoff_starts_again_after_a_quiet_period() -> None:
     clock = FakeClock()
     limiter = RateLimiter(8.0, clock=clock, sleep=clock.sleep)
@@ -124,7 +134,15 @@ def test_backoff_starts_again_after_a_quiet_period() -> None:
 
 @pytest.mark.parametrize(
     ('value', 'seconds'),
-    [('120', 120.0), (' 7 ', 7.0), ('Sun, 01 Nov 2026 12:01:00 GMT', 60.0), ('soon', None), ('-5', None), (None, None)],
+    [
+        ('120', 120.0),
+        (' 7 ', 7.0),
+        ('Sun, 01 Nov 2026 12:01:00 GMT', 60.0),
+        ('soon', None),
+        ('-5', None),
+        ('²', None),
+        (None, None),
+    ],
 )
 def test_retry_after_reads_seconds_and_http_dates(value: str | None, seconds: float | None) -> None:
     assert retry_after(value, datetime(2026, 11, 1, 12, 0, tzinfo=UTC)) == seconds

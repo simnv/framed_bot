@@ -305,7 +305,7 @@ def test_dockerfile_downloads_the_pinned_clip_model():
     assert f"or '{DEFAULT_MODEL_PATH}'" in (ROOT / 'config.py').read_text()
 
 
-def test_stack_gives_the_bot_one_cpu_and_one_gigabyte():
+def test_stack_sets_the_bot_cpu_and_memory_limits():
     stack = (ROOT / 'deploy/stack.yml').read_text()
     bot = stack.split('  bot:\n', 1)[1].split('\n  db:\n', 1)[0]
     assert "limits: {cpus: '1.0', memory: 1536M}" in bot

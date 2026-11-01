@@ -15,6 +15,8 @@ CDN_RATE: Final = 8.0  # image.tmdb.org
 MIN_COOLDOWN: Final = 1.0
 FIRST_BACKOFF: Final = 30.0
 MAX_COOLDOWN: Final = 300.0
+# 30 * 2**STRIKE_LIMIT is already above MAX_COOLDOWN; a higher count changes nothing.
+STRIKE_LIMIT: Final = 8
 
 
 class Throttled(RuntimeError):
@@ -26,7 +28,7 @@ def retry_after(value: str | None, now: datetime | None = None) -> float | None:
     if value is None:
         return None
     value = value.strip()
-    if value.isdigit():
+    if value.isascii() and value.isdigit():
         return float(value)
     try:
         moment = parsedate_to_datetime(value)
@@ -73,8 +75,9 @@ class RateLimiter:
         if self._paused_until is not None and now - self._paused_until > MAX_COOLDOWN:
             self._strikes = 0
         if retry_after_seconds is None:
-            delay = FIRST_BACKOFF * 2**self._strikes
-            self._strikes += 1
+            # Stop counting once the cap is certain, so the exponent stays small.
+            delay = min(FIRST_BACKOFF * 2**self._strikes, MAX_COOLDOWN)
+            self._strikes = min(self._strikes + 1, STRIKE_LIMIT)
         else:
             delay = retry_after_seconds
         delay = min(max(delay, MIN_COOLDOWN), MAX_COOLDOWN)
