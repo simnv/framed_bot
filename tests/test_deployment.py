@@ -655,3 +655,61 @@ def test_image_contains_the_pinned_clip_model():
     )
     result = docker('run', '--rm', '--network', 'none', image, 'python', '-c', script, DEFAULT_MODEL_PATH)
     assert result.stdout.split() == [MODEL_SHA256, 'False']
+
+
+def start_disposable_postgres(network, name):
+    docker('network', 'create', network)
+    docker('run', '-d', '--memory', '512m', '--name', name, '--network', network, '--network-alias', 'db',
+           '-e', 'POSTGRES_PASSWORD=synthetic-only', '-e', 'POSTGRES_DB=framed', PG)
+    # The init server listens only on the socket; TCP readiness means the final server runs.
+    until(lambda: docker('exec', name, 'pg_isready', '-h', '127.0.0.1', '-U', 'postgres', '-d', 'framed',
+                         check=False).returncode == 0)
+
+
+@pytest.mark.skipif(os.environ.get('FRAMED_DEPLOY_TEST') != '1', reason='Opt-in disposable Docker integration')
+def test_migration_0004_and_answer_locks_on_a_seeded_database():
+    import json
+    suffix = uuid.uuid4().hex[:10]
+    network, db = f'framed-check-{suffix}-net', f'framed-check-{suffix}-db'
+    image = os.environ.get('FRAMED_TEST_IMAGE', 'framed-bot:local-validation')
+    try:
+        start_disposable_postgres(network, db)
+        result = docker('run', '--rm', '--network', network,
+                        '-e', 'DB_CONNECTION_STRING=postgresql+asyncpg://postgres:synthetic-only@db:5432/framed',
+                        '-e', 'BOT_TOKEN=123:synthetic-test-only', '-e', 'ADMIN_USER_ID=0', '-e', 'PYTHONPATH=/app',
+                        '-v', f'{ROOT / "tests"}:/checks:ro', image,
+                        'python', '/checks/migration_probe.py', check=False)
+        assert result.returncode == 0, result.stderr[-3000:]
+        summary = json.loads(result.stdout.strip().splitlines()[-1])
+        manual_title = summary.pop('manual_race').split('/')
+        assert manual_title[0] == 'manual'
+        assert summary == {
+            'reset': 1917, 'manual_kept': 3, 'titles_kept': True, 'dangling': 0, 'site_kept': 'site',
+            'bogus_status_rejected': True, 'bogus_mode_rejected': True, 'parallel_upserts': 'ok',
+            'after_downgrade_site_visual': 2, 'after_downgrade_manual': 4, 'asset_table_dropped': True, 'head': '0004',
+        }
+    finally:
+        docker('rm', '-f', db, check=False)
+        docker('network', 'rm', network, check=False)
+
+
+@pytest.mark.skipif(os.environ.get('FRAMED_DEPLOY_TEST') != '1', reason='Opt-in disposable Docker integration')
+def test_clip_worst_case_fits_the_one_gigabyte_limit():
+    import json
+    name = f'framed-check-{uuid.uuid4().hex[:10]}-clip'
+    image = os.environ.get('FRAMED_TEST_IMAGE', 'framed-bot:local-validation')
+    try:
+        result = docker('run', '--name', name, '--memory', '1g', '--memory-swap', '1g', '--cpus', '1',
+                        '-e', 'BOT_TOKEN=123:synthetic-test-only', '-e', 'ADMIN_USER_ID=0',
+                        '-e', 'DB_CONNECTION_STRING=postgresql+asyncpg://synthetic:synthetic-only@localhost:5432/framed',
+                        '-e', 'PYTHONPATH=/app', '-v', f'{ROOT / "tests"}:/checks:ro', image,
+                        'python', '/checks/clip_memory_probe.py', check=False)
+        state = json.loads(docker('inspect', '--format', '{{json .State}}', name).stdout)
+        assert not state['OOMKilled'] and result.returncode == 0, result.stderr[-3000:]
+        summary = json.loads(result.stdout.strip().splitlines()[-1])
+        # 6 Framed or 10 Episode frames (the 10000 x 1 PNG is rejected), then 8 candidates x 32 images.
+        assert summary['vectors'] == [262, 266]
+        assert summary['container_anon_peak_mb'] < 900
+        print(summary)
+    finally:
+        docker('rm', '-f', name, check=False)
