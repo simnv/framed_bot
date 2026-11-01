@@ -1,6 +1,7 @@
 import asyncio
 import time
 from datetime import UTC, date, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import httpx
@@ -9,6 +10,8 @@ from telegram import Chat, Message, Update, User
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, ExtBot, Job, JobQueue
 
 import main
+from answers.pipeline import Resolver
+from answers.ratelimit import RateLimiter
 from answers.scraper import BundleEntry
 from answers.store import DbAnswerStore
 from answers.sync import AnswerSync
@@ -402,3 +405,85 @@ async def test_stop_cancels_a_stalled_newest_round_lookup_and_still_drains_react
     assert time.monotonic() - started < 2
     assert reactions == [77]
     assert application.reaction_delivery.counts['succeeded'] == 1
+
+
+@pytest.mark.parametrize('model_exists', [False, True])
+def test_build_resolver_adds_the_visual_step_only_with_the_model_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, model_exists: bool
+) -> None:
+    model = tmp_path / 'vision_model.onnx'
+    if model_exists:
+        model.write_bytes(b'not loaded by the constructor')
+    monkeypatch.setattr(main, 'CLIP_MODEL_PATH', str(model))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(500)))
+    tmdb = TmdbClient('synthetic-tmdb-key', client)
+
+    resolver = main.build_resolver(client, tmdb, main.default_limiters())
+
+    assert isinstance(resolver, Resolver)
+    assert (resolver._embedder is not None) is model_exists
+    assert ('CLIP model file is missing' in caplog.text) is not model_exists
+    assert 'synthetic-tmdb-key' not in caplog.text
+
+
+class Grants(RateLimiter):
+    """Counts waits; the transport checks that each request consumed one."""
+
+    def __init__(self) -> None:
+        super().__init__(1000)
+        self.granted = 0
+        self.used = 0
+
+    async def wait(self) -> None:
+        self.granted += 1
+
+
+@pytest.mark.asyncio
+async def test_every_answer_request_waits_for_its_host_group_limiter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixtures = Path(__file__).with_name('fixtures')
+    model = tmp_path / 'vision_model.onnx'
+    model.write_bytes(b'never loaded')
+    monkeypatch.setattr(main, 'TMDB_API_KEY', 'synthetic-tmdb-key')
+    monkeypatch.setattr(main, 'CLIP_MODEL_PATH', str(model))
+    site, api, cdn = Grants(), Grants(), Grants()
+    limiters = main.Limiters(site, api, cdn)
+    groups = dict.fromkeys(('framed.wtf', 'episode.wtf', 'core.framed.wtf'), site)
+    groups |= {'api.themoviedb.org': api, 'image.tmdb.org': cdn}
+    routes = {
+        'https://framed.wtf/': httpx.Response(200, text=(fixtures / 'framed_home.html').read_text()),
+        'https://framed.wtf/_next/static/chunks/pages/_app-073c1f0998963a1e.js': httpx.Response(
+            200, text=(fixtures / 'framed_app.js').read_text()
+        ),
+        'https://api.themoviedb.org/3/movie/7/images': httpx.Response(
+            200, json={'backdrops': [{'file_path': '/a.jpg'}, {'file_path': '/b.jpg'}]}
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limiter = groups[request.url.host]
+        limiter.used += 1
+        assert limiter.used <= limiter.granted, f'{request.url} did not wait for its limiter'
+        return routes.get(str(request.url).split('?')[0], httpx.Response(404))
+
+    application = build_application()
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    main.start_answers(application, client, limiters)
+    sync = application.answer_sync
+    assert sync is not None
+    resolver = sync._resolver
+    assert isinstance(resolver, Resolver) and resolver._visual is not None
+
+    await sync._scrape('framed')
+    assert sync._assets is not None
+    await sync._assets.fetch('titleshot', 1)
+    await resolver._visual.frames('framed', 40)
+    await resolver._visual.candidate_images('movie', 7)
+    await main.stop_answers(application)
+
+    assert [(limiter.used, limiter.granted) for limiter in (site, api, cdn)] == [
+        (9, 9),
+        (1, 1),
+        (2, 2),
+    ]

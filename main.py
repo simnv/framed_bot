@@ -6,6 +6,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Protocol
 
 import httpx
@@ -14,7 +15,7 @@ from safe_logging import configure_logging
 
 configure_logging()
 
-from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, DB_CONNECTION_STRING, TMDB_API_KEY
+from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, CLIP_MODEL_PATH, DB_CONNECTION_STRING, TMDB_API_KEY
 
 configure_logging((BOT_TOKEN, DB_CONNECTION_STRING, TMDB_API_KEY or ''))
 
@@ -45,8 +46,11 @@ from telegram.ext import (
 from telegram.ext.filters import Message, MessageFilter
 
 from answers import GAMES, KIND_BY_GAME, Game, parse_game, round_limit, utc_today
-from answers.pipeline import Resolver
-from answers.ratelimit import SITE_RATE, RateLimiter
+from answers.assets import AssetFetcher
+from answers.embedder import ProcessEmbedder
+from answers.images import ImageFetcher
+from answers.pipeline import Resolver, TmdbVisualSource
+from answers.ratelimit import API_RATE, CDN_RATE, SITE_RATE, RateLimiter
 from answers.scraper import BundleEntry, fetch_entries
 from answers.store import DbAnswerStore
 from answers.sync import AnswerSync
@@ -72,6 +76,8 @@ help_text = (
     '/top — рейтинг игроков\n\n'
     f'{tmdb_notice}'
 )
+# CPU limit of the bot service is 1.0, so inference uses one thread.
+CLIP_THREADS = 1
 set_title_usage = 'Использование: /set_title <framed|episode> <раунд> <tmdb_id>'
 
 
@@ -178,25 +184,57 @@ async def alert_admin(bot: ExtBot[None], text: str) -> None:
         logging.warning('Cannot send the game answer alert to the admin')
 
 
-def start_answers(application: ReactionApplication) -> None:
+@dataclass(frozen=True, slots=True)
+class Limiters:
+    """One limiter for each host group; every request of the answer services waits for one of them."""
+
+    site: RateLimiter  # framed.wtf, episode.wtf and core.framed.wtf
+    api: RateLimiter  # api.themoviedb.org
+    cdn: RateLimiter  # image.tmdb.org
+
+
+def default_limiters() -> Limiters:
+    return Limiters(RateLimiter(SITE_RATE), RateLimiter(API_RATE), RateLimiter(CDN_RATE))
+
+
+def build_resolver(client: httpx.AsyncClient, tmdb: TmdbClient, limiters: Limiters) -> Resolver:
+    """Text matching always; the visual tie-break only when the CLIP model file exists. The child starts lazily."""
+    model = Path(CLIP_MODEL_PATH)
+    if not model.is_file():
+        logging.warning('The CLIP model file is missing; tied matches keep the text choice')
+        return Resolver(tmdb.search)
+    fetcher = ImageFetcher(client, limiters.site, limiters.cdn)
+    return Resolver(tmdb.search, TmdbVisualSource(fetcher, tmdb), ProcessEmbedder(model, threads=CLIP_THREADS))
+
+
+def start_answers(
+    application: ReactionApplication, client: httpx.AsyncClient | None = None, limiters: Limiters | None = None
+) -> None:
     """Create the answer services and schedule the startup backfill. Startup does not wait for it."""
-    client = httpx.AsyncClient()
+    client = client or httpx.AsyncClient()
+    limiters = limiters or default_limiters()
     application.http_client = client
-    site_limiter = RateLimiter(SITE_RATE)
     resolver = None
     if TMDB_API_KEY:
-        application.tmdb = TmdbClient(TMDB_API_KEY, client)
-        resolver = Resolver(application.tmdb.search)
+        application.tmdb = TmdbClient(TMDB_API_KEY, client, limiters.api)
+        resolver = build_resolver(client, application.tmdb, limiters)
     else:
         logging.warning('TMDB_API_KEY is not set; the bot stores game answers without title data')
 
     async def scrape(game: Game) -> list[BundleEntry]:
-        return await fetch_entries(game, client, site_limiter)
+        return await fetch_entries(game, client, limiters.site)
 
     async def alert(text: str) -> None:
         await alert_admin(application.bot, text)
 
-    application.answer_sync = AnswerSync(application.answer_store, scrape, application.tmdb, alert, resolver=resolver)
+    application.answer_sync = AnswerSync(
+        application.answer_store,
+        scrape,
+        application.tmdb,
+        alert,
+        resolver=resolver,
+        assets=AssetFetcher(client, limiters.site),
+    )
     job_queue = application.job_queue
     if job_queue is None:
         return
