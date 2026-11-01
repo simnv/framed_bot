@@ -313,31 +313,31 @@ def keyboard_rows(reply_markup):
             'framed',
             TopType.TOP_SCORE,
             [
-                [('• Framed', 'top:framed:1'), ('Episode', 'top:episode:1')],
                 [
-                    ('• Очки', 'top:framed:1'),
+                    ('🎥 Очки', 'top:framed:1'),
                     ('Кадры', 'top:framed:2'),
                     ('Фильмы', 'top:framed:3'),
                     ('Участия', 'top:framed:4'),
                 ],
+                [('📺 Переключить на Episode', 'top:episode:1')],
             ],
         ),
         (
             'episode',
             TopType.TOP_WIN,
             [
-                [('Framed', 'top:framed:3'), ('• Episode', 'top:episode:3')],
                 [
                     ('Очки', 'top:episode:1'),
                     ('Кадры', 'top:episode:2'),
-                    ('• Сериалы', 'top:episode:3'),
+                    ('📺 Сериалы', 'top:episode:3'),
                     ('Участия', 'top:episode:4'),
                 ],
+                [('🎥 Переключить на Framed', 'top:framed:3')],
             ],
         ),
     ],
 )
-def test_top_keyboard_marks_active_game_and_metric_and_keeps_metric_on_game_switch(game, kind, expected):
+def test_top_keyboard_marks_the_active_metric_with_the_game_emoji_and_keeps_the_metric_on_switch(game, kind, expected):
     assert keyboard_rows(main.top_reply_markup(game, kind).to_dict()) == expected
 
 
@@ -501,17 +501,24 @@ def test_top_type_lives_in_neutral_module_only():
     ('rows', 'expected'),
     [
         (
-            [[('• Framed', 'top:framed:2'), ('Episode', 'top:episode:2')], [('• Кадры', 'top:framed:2')]],
+            [
+                [('Очки', 'top:framed:1'), ('🎥 Кадры', 'top:framed:2')],
+                [('📺 Переключить на Episode', 'top:episode:2')],
+            ],
             ('framed', TopType.TOP_FRAME),
         ),
-        ([[('• Framed', 'top:framed:2'), ('Episode', 'top:episode:2')], [('• Очки', 'top:framed:1')]], None),
-        ([[('• Framed', 'top:framed:2'), ('• Episode', 'top:episode:2')]], None),
-        ([[('• Framed', 'top:framed:2')], [('• Кадры', 'top:other:2')]], None),
-        ([[('Framed', 'top:framed:2')]], None),
+        (
+            [[('📺 Сериалы', 'top:episode:3')], [('🎥 Переключить на Framed', 'top:framed:3')]],
+            ('episode', TopType.TOP_WIN),
+        ),
+        ([[('📺 Кадры', 'top:framed:2')]], None),
+        ([[('🎥 Очки', 'top:framed:1'), ('🎥 Кадры', 'top:framed:2')]], None),
+        ([[('🎥 Кадры', 'top:other:2')]], None),
+        ([[('• Очки', 'top:framed:1'), ('Кадры', 'top:framed:2')]], None),
     ],
-    ids=['same', 'different-metric', 'two-active-games', 'one-unparsable', 'no-active'],
+    ids=['framed', 'episode', 'emoji-of-other-game', 'two-active', 'unparsable', 'no-active'],
 )
-def test_shown_top_needs_all_active_buttons_to_agree(rows, expected):
+def test_shown_top_reads_the_one_metric_marked_with_its_game_emoji(rows, expected):
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in rows]
     )

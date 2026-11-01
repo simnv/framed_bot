@@ -461,11 +461,12 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
 
-TOP_GAME_BUTTONS: dict[Game, str] = {'framed': 'Framed', 'episode': 'Episode'}
+TOP_GAME_NAMES: dict[Game, str] = {'framed': 'Framed', 'episode': 'Episode'}
+# The same emoji as in the shared results. The active metric button starts with the emoji of the shown game.
+TOP_GAME_EMOJI: dict[Game, str] = {'framed': '🎥', 'episode': '📺'}
 TOP_CALLBACK_PATTERN = r'^top:(framed|episode):([1-4])$'
 # Buttons of the JSON format, for example {"top": 2}, stay in old messages. The bot ignores them.
 LEGACY_TOP_CALLBACK_PATTERN = r'^{"top": [\d]+}$'
-ACTIVE_MARK = '• '
 
 
 def top_callback_data(game: Game, top_type: TopType) -> str:
@@ -481,41 +482,52 @@ def parse_top_callback(data: str) -> tuple[Game, TopType] | None:
 
 
 def top_reply_markup(game: Game, top_type: TopType) -> InlineKeyboardMarkup:
+    """Metrics on the first row, one full-width game switch below.
+
+    Telegram gives the buttons of a row equal widths. Two game buttons over four metric
+    buttons looked like two groups, so the game is one button that names the other game.
+    """
     metric_labels = {
         TopType.TOP_SCORE: 'Очки',
         TopType.TOP_FRAME: 'Кадры',
         TopType.TOP_WIN: TOP_WIN_LABELS[game],
         TopType.TOP_ROUNDS: 'Участия',
     }
-
-    def button(label: str, active: bool, data: str) -> InlineKeyboardButton:
-        return InlineKeyboardButton(f'{ACTIVE_MARK}{label}' if active else label, callback_data=data)
-
+    other: Game = 'episode' if game == 'framed' else 'framed'
     return InlineKeyboardMarkup(
         [
             [
-                button(label, _game == game, top_callback_data(_game, top_type))
-                for _game, label in TOP_GAME_BUTTONS.items()
+                InlineKeyboardButton(
+                    f'{TOP_GAME_EMOJI[game]} {label}' if _type == top_type else label,
+                    callback_data=top_callback_data(game, _type),
+                )
+                for _type, label in metric_labels.items()
             ],
             [
-                button(label, _type == top_type, top_callback_data(game, _type))
-                for _type, label in metric_labels.items()
+                InlineKeyboardButton(
+                    f'{TOP_GAME_EMOJI[other]} Переключить на {TOP_GAME_NAMES[other]}',
+                    callback_data=top_callback_data(other, top_type),
+                )
             ],
         ]
     )
 
 
 def shown_top(message: TelegramMessage) -> tuple[Game, TopType] | None:
-    """Find the leaderboard that a message shows. All active buttons must point to the same leaderboard."""
+    """Find the leaderboard that a message shows from its one metric button marked with the game emoji."""
     markup = message.reply_markup
     if markup is None:
         return None
-    shown = {
-        parse_top_callback(button.callback_data) if isinstance(button.callback_data, str) else None
-        for row in markup.inline_keyboard
-        for button in row
-        if button.text.startswith(ACTIVE_MARK)
-    }
+    shown = set()
+    for row in markup.inline_keyboard:
+        for button in row:
+            parsed = parse_top_callback(button.callback_data) if isinstance(button.callback_data, str) else None
+            marked = any(button.text.startswith(f'{emoji} ') for emoji in TOP_GAME_EMOJI.values())
+            if not marked or 'Переключить' in button.text:
+                continue
+            if parsed is None or not button.text.startswith(f'{TOP_GAME_EMOJI[parsed[0]]} '):
+                return None
+            shown.add(parsed)
     return shown.pop() if len(shown) == 1 else None
 
 
