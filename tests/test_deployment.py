@@ -498,6 +498,30 @@ def test_release_payload_includes_runtime_packages():
     assert 'COPY answers/ ./answers/' in (ROOT / 'Dockerfile').read_text()
 
 
+def test_release_payload_and_image_include_every_root_module_the_app_imports():
+    import ast
+    import runpy
+
+    files = runpy.run_path(str(ROOT / 'deploy/prepare_release.py'))['FILES']
+    dockerfile = (ROOT / 'Dockerfile').read_text()
+    root_modules = {path.stem for path in ROOT.glob('*.py')}
+    imported: set[str] = set()
+    for source in [ROOT / 'main.py', *ROOT.glob('*.py'), *ROOT.glob('models/*.py'), *ROOT.glob('answers/*.py')]:
+        for node in ast.walk(ast.parse(source.read_text())):
+            names = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module]
+                if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module
+                else []
+            )
+            imported.update(name.split('.')[0] for name in names if name.split('.')[0] in root_modules)
+    assert imported, 'expected the app to import root modules'
+    for module in sorted(imported):
+        assert f'{module}.py' in files, f'{module}.py is missing from the release payload'
+        assert f' {module}.py ' in dockerfile, f'{module}.py is missing from the Dockerfile COPY line'
+
+
 @pytest.mark.skipif(os.environ.get('FRAMED_DEPLOY_TEST') != '1', reason='Opt-in disposable Docker integration')
 def test_failed_partial_initialization_stays_unhealthy(tmp_path):
     name = 'framed-check-partial-' + uuid.uuid4().hex[:10]
