@@ -3,6 +3,7 @@ from typing import Any
 import httpx
 import pytest
 
+from answers.ratelimit import RateLimiter, Throttled
 from answers.tmdb import Credit, Match, TitleData, TmdbClient, TmdbError, TmdbRateLimited, normalize, split_year
 
 TOKEN = 'synthetic-tmdb-token'  # noqa: S105 - synthetic test value
@@ -280,11 +281,24 @@ async def test_tv_runtime_rejects_malformed_last_episode(last_episode: Any) -> N
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_raises_tmdb_rate_limited() -> None:
-    tmdb = tmdb_for({'/3/search/movie': httpx.Response(429)}, [])
+async def test_rate_limit_raises_tmdb_rate_limited_and_pauses_the_client() -> None:
+    clock = [0.0]
 
-    with pytest.raises(TmdbRateLimited):
-        await tmdb.find('movie', 'Halloween')
+    async def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={'Retry-After': '9'})
+
+    limiter = RateLimiter(1000, clock=lambda: clock[0], sleep=sleep)
+    tmdb = TmdbClient(TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler)), limiter)
+
+    with pytest.raises(TmdbRateLimited) as raised:
+        await tmdb.search('movie', 'Halloween', None)
+
+    assert isinstance(raised.value, Throttled)
+    await limiter.wait()
+    assert clock[0] == pytest.approx(9.0)
 
 
 @pytest.mark.parametrize(
@@ -416,3 +430,112 @@ async def test_tv_creator_entries_are_validated_before_selection(created_by: lis
     with pytest.raises(TmdbError) as error:
         await tmdb.details('tv', 76331)
     assert str(error.value) == 'TMDB tv details have an unexpected shape'
+
+
+@pytest.mark.asyncio
+async def test_search_returns_validated_candidates_and_passes_the_year() -> None:
+    requests: list[httpx.Request] = []
+    tmdb = tmdb_for(
+        {
+            '/3/search/movie': search(
+                {'id': 1, 'title': 'Dune', 'original_title': 'Dune', 'release_date': '1984-12-14', 'vote_count': 2500},
+                {'id': 2, 'title': 'Dune', 'original_title': '', 'release_date': '', 'vote_count': None},
+            )
+        },
+        requests,
+    )
+
+    found = await tmdb.search('movie', 'Dune', 1984)
+
+    assert [(c.tmdb_id, c.names, c.release, c.votes) for c in found] == [
+        (1, frozenset({'Dune'}), '1984-12-14', 2500),
+        (2, frozenset({'Dune'}), None, 0),
+    ]
+    assert requests[0].url.params['query'] == 'Dune'
+    assert requests[0].url.params['primary_release_year'] == '1984'
+    assert 'page' not in requests[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_search_uses_tv_names_and_air_dates() -> None:
+    requests: list[httpx.Request] = []
+    tmdb = tmdb_for(
+        {'/3/search/tv': search({'id': 5, 'name': 'Dark', 'original_name': 'Dark', 'first_air_date': '2017-12-01'})},
+        requests,
+    )
+
+    [found] = await tmdb.search('tv', 'Dark', 2017)
+
+    assert (found.tmdb_id, found.release, found.votes) == (5, '2017-12-01', 0)
+    assert requests[0].url.params['first_air_date_year'] == '2017'
+
+
+@pytest.mark.parametrize(
+    'entry',
+    [
+        {'id': '1', 'title': 'Dune'},
+        {'id': True, 'title': 'Dune'},
+        {'id': 1, 'title': ''},
+        {'id': 1, 'title': 'Dune', 'release_date': '1984'},
+        {'id': 1, 'title': 'Dune', 'vote_count': '9'},
+        {'title': 'Dune'},
+    ],
+)
+@pytest.mark.asyncio
+async def test_search_rejects_malformed_entries(entry: dict[str, Any]) -> None:
+    tmdb = tmdb_for({'/3/search/movie': search(entry)}, [])
+
+    with pytest.raises(TmdbError, match='unexpected shape'):
+        await tmdb.search('movie', 'Dune', None)
+
+
+@pytest.mark.asyncio
+async def test_client_requests_use_the_rate_limiter() -> None:
+    calls: list[float] = []
+
+    class CountingLimiter(RateLimiter):
+        async def wait(self) -> None:
+            calls.append(1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return search()
+
+    client = TmdbClient(TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler)), CountingLimiter(1))
+
+    await client.search('movie', 'A', None)
+    await client.search('movie', 'B', None)
+
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(
+    'entry',
+    [
+        {'id': 1, 'title': 'Dune', 'release_date': '１９８４-１２-１４'},
+        {'id': 1, 'title': 'Dune', 'vote_count': 9.0},
+        {'id': 1, 'title': 'Dune', 'vote_count': True},
+        {'id': 1.0, 'title': 'Dune'},
+    ],
+)
+@pytest.mark.asyncio
+async def test_search_rejects_non_ascii_dates_floats_and_bools(entry: dict[str, Any]) -> None:
+    tmdb = tmdb_for({'/3/search/movie': search(entry)}, [])
+
+    with pytest.raises(TmdbError, match='unexpected shape'):
+        await tmdb.search('movie', 'Dune', None)
+
+
+@pytest.mark.asyncio
+async def test_requests_do_not_follow_redirects() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(302, headers={'Location': 'https://evil.example/x'})
+
+    tmdb = TmdbClient(TOKEN, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(TmdbError, match='HTTP 302'):
+        await tmdb.search('movie', 'Dune', None)
+
+    assert len(requests) == 1

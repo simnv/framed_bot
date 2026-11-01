@@ -7,12 +7,15 @@ from typing import Any, Final, Literal
 import httpx
 
 from . import Kind
+from .matching import Candidate
+from .ratelimit import API_RATE, RateLimiter, Throttled, retry_after
 
 API_BASE: Final = 'https://api.themoviedb.org/3'
 TIMEOUT: Final = 10.0
 CAST_LIMIT: Final = 10
 YEAR_SUFFIX = re.compile(r'^(?P<name>.+?) \((?P<year>\d{4})\)$')
 NOT_WORD = re.compile(r'[\W_]+')
+ISO_DATE = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}')
 # TV details have no imdb_id without external_ids.
 APPEND: Final[dict[Kind, str]] = {'movie': 'credits', 'tv': 'credits,external_ids'}
 
@@ -23,8 +26,8 @@ class TmdbError(RuntimeError):
     pass
 
 
-class TmdbRateLimited(TmdbError):
-    pass
+class TmdbRateLimited(TmdbError, Throttled):
+    """HTTP 429. The client pauses its limiter; the sync run stops."""
 
 
 class _Malformed(Exception):
@@ -190,18 +193,21 @@ def title_data(kind: Kind, data: dict[str, Any]) -> TitleData:
 
 
 class TmdbClient:
-    def __init__(self, token: str, client: httpx.AsyncClient) -> None:
+    def __init__(self, token: str, client: httpx.AsyncClient, limiter: RateLimiter | None = None) -> None:
         self._headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
         self._client = client
+        self._limiter = limiter or RateLimiter(API_RATE)
 
     async def _get(self, path: str, params: dict[str, str | int]) -> dict[str, Any]:
+        await self._limiter.wait()
         try:
             response = await self._client.get(
-                f'{API_BASE}{path}', params=params, headers=self._headers, timeout=TIMEOUT
+                f'{API_BASE}{path}', params=params, headers=self._headers, timeout=TIMEOUT, follow_redirects=False
             )
         except httpx.HTTPError as error:
             raise TmdbError(f'TMDB request {path} failed: {type(error).__name__}') from None
         if response.status_code == 429:
+            self._limiter.throttled(retry_after(response.headers.get('Retry-After')))
             raise TmdbRateLimited('TMDB rate limit reached')
         if response.status_code != 200:
             raise TmdbError(f'TMDB request {path} returned HTTP {response.status_code}')
@@ -240,6 +246,32 @@ class TmdbClient:
             if wanted in names:
                 return Match(tmdb_id, 'auto')
         return Match(candidates[0][0], 'low_confidence')
+
+    async def search(self, kind: Kind, query: str, year: int | None) -> list[Candidate]:
+        """Page 1 of /search/{kind}. Every entry is validated."""
+        params: dict[str, str | int] = {'query': query}
+        if year is not None:
+            params['primary_release_year' if kind == 'movie' else 'first_air_date_year'] = year
+        data = await self._get(f'/search/{kind}', params)
+        name_key, original_key, date_key = (
+            ('title', 'original_title', 'release_date')
+            if kind == 'movie'
+            else ('name', 'original_name', 'first_air_date')
+        )
+        try:
+            candidates = []
+            for entry in map(_dict, _list(data['results'])):
+                names = {_str(entry[name_key])}
+                if original := _optional_str(entry.get(original_key)):
+                    names.add(original)
+                release = _optional_str(entry.get(date_key))
+                if release is not None and not ISO_DATE.fullmatch(release):
+                    raise _Malformed
+                votes = _optional_int(entry.get('vote_count')) or 0
+                candidates.append(Candidate(_int(entry['id']), frozenset(names), release, votes))
+            return candidates
+        except _Malformed, KeyError:
+            raise TmdbError(f'TMDB {kind} search has an unexpected shape') from None
 
     async def details(self, kind: Kind, tmdb_id: int) -> TitleData:
         data = await self._get(f'/{kind}/{tmdb_id}', {'append_to_response': APPEND[kind]})

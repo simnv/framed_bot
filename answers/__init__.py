@@ -1,6 +1,6 @@
 """Game answers and TMDB title metadata, stored for later SQL analysis."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Final, Literal
 
 type Game = Literal['framed', 'episode']
@@ -35,3 +35,8 @@ def current_round(game: Game, today: date) -> int:
 def round_limit(game: Game, today: date) -> int:
     """The highest round that the bot accepts: one more than today, for players in later time zones."""
     return current_round(game, today) + 1
+
+
+def round_date(game: Game, round_number: int) -> date:
+    """The UTC date of a round."""
+    return FIRST_DAY[game] + timedelta(days=(round_number - 1) * DAYS_PER_ROUND[game])
