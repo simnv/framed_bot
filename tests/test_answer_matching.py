@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from datetime import date
 
 import pytest
@@ -221,3 +224,19 @@ def test_candidate_year_reads_ascii_digits_only() -> None:
     assert film(1, 'X', release='1984-12-14').year == 1984
     assert film(1, 'X', release=None).year is None
     assert film(1, 'X', release='１９８４-12-14').year is None
+
+
+@pytest.mark.parametrize('seed', ['0', '1', '2', '3', '4', '5'])
+def test_choice_does_not_depend_on_the_hash_seed(seed: str) -> None:
+    code = (
+        'from answers.matching import Candidate, choose\n'
+        "one = Candidate(1, frozenset({'Alien', 'Resurrection'}), '2000-01-01', 100)\n"
+        "two = Candidate(2, frozenset({'Alien'}), '2000-01-01', 1000)\n"
+        "chosen = choose('Alien: Resurrection', [one, two])\n"
+        'print(chosen.candidate.tmdb_id, chosen.rule, chosen.length)\n'
+    )
+    run = subprocess.run(  # noqa: S603 - fixed code and interpreter
+        [sys.executable, '-c', code], env={**os.environ, 'PYTHONHASHSEED': seed}, capture_output=True, text=True
+    )
+
+    assert run.stdout.split() == ['1', 'query-tail==title', '12']

@@ -182,13 +182,18 @@ def _name_tier(query: str, name: str) -> tuple[Tier, str, int] | None:
     return None
 
 
+def _name_order(found: tuple[Tier, str, int]) -> tuple[int, int, str]:
+    tier, rule, length = found
+    return tier, -length if tier == 3 else 0, rule
+
+
 def score(query: str, candidate: Candidate) -> Scored | None:
-    best = None
-    for name in candidate.names:
-        found = _name_tier(query, name)
-        if found and (best is None or found[0] < best[0]):
-            best = found
-    return None if best is None else Scored(candidate, *best)
+    """Score the best name of a candidate: best tier, then longest match, then rule name, then name order."""
+    found = [(name, hit) for name in sorted(candidate.names) if (hit := _name_tier(query, name))]
+    if not found:
+        return None
+    _, best = min(found, key=lambda item: _name_order(item[1]))
+    return Scored(candidate, *best)
 
 
 def _order(item: Scored) -> tuple[int, int, int]:
