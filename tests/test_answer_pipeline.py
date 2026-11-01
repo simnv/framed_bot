@@ -168,7 +168,10 @@ async def test_embedder_errors_keep_the_text_choice_and_later_rounds_still_resol
     resolver = Resolver(searching(*REMAKES), visual, FakeEmbedder(EmbedderError('Fail')))
 
     assert await resolver.resolve('framed', 1000, 'Dune', {}, 1000) == Resolution(2, 'low_confidence')
+    assert visual.frame_requests == [('framed', 1000)]
     assert await resolver.resolve('framed', 1001, 'Dune', {}, 1001) == Resolution(2, 'low_confidence')
+    assert visual.frame_requests == [('framed', 1000)]
+    assert visual.image_requests == []
 
 
 @pytest.mark.parametrize('error', [Throttled('429'), TmdbRateLimited('429')], ids=['image-host', 'tmdb'])
@@ -219,3 +222,14 @@ async def test_cancellation_propagates_from_the_tie_break() -> None:
 
 def test_sibling_years_do_not_depend_on_order() -> None:
     assert sibling_years(['A (2001)', 'A (2002)']) == sibling_years(['A (2002)', 'A (2001)'])
+
+
+@pytest.mark.asyncio
+async def test_a_fuzzy_choice_after_the_eighth_entry_keeps_the_group_at_eight() -> None:
+    candidates = [film(20 + n, f'Other {n}') for n in range(8)] + [film(10, 'Moonlight', votes=50)]
+    visual = FakeVisual([b'a'], {10: [b'b'], 20: [b'a']})
+    resolver = Resolver(searching(*candidates), visual, FakeEmbedder())
+
+    await resolver.resolve('framed', 1000, 'Moonlightt', {}, 1000)
+
+    assert visual.image_requests == [10, 20, 21, 22, 23, 24, 25, 26]

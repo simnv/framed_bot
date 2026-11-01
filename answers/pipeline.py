@@ -61,12 +61,14 @@ def sibling_years(source_titles: Iterable[str]) -> dict[str, frozenset[int]]:
 
 
 def visual_group(text: TextChoice) -> list[Candidate]:
-    """The candidates of the tie-break: the tie, or for a low-confidence choice the top of the pool."""
+    """The tie-break group: the tie, or for a low-confidence choice the choice and 7 other pool entries."""
     if text.ties:
         return text.ties
     if text.confident:
         return []
-    return list(dict.fromkeys([text.choice.candidate, *text.pool[:LOW_CONFIDENCE_POOL]]))
+    choice = text.choice.candidate
+    others = [candidate for candidate in text.pool if candidate.tmdb_id != choice.tmdb_id]
+    return [choice, *others[: LOW_CONFIDENCE_POOL - 1]]
 
 
 class Resolver:
@@ -74,6 +76,7 @@ class Resolver:
         self._search = search
         self._visual = visual
         self._embedder = embedder
+        self._visual_disabled = False  # set after an EmbedderError; the backend stays off until restart
 
     async def close(self) -> None:
         """Stop the CLIP child process, if there is one."""
@@ -109,7 +112,7 @@ class Resolver:
         return Resolution(chosen, 'low_confidence')
 
     async def _tie_break(self, game: Game, kind: Kind, image_id: int, group: list[Candidate]) -> int | None:
-        if self._visual is None or self._embedder is None:
+        if self._visual is None or self._embedder is None or self._visual_disabled:
             return None
         try:
             frames = await self._embedder.embed(await self._visual.frames(game, image_id))
@@ -123,7 +126,11 @@ class Resolver:
         except Throttled:
             # HTTP 429 from TMDB or an image host: the sync run stops and tries this round again later.
             raise
-        except (EmbedderError, ImageError, TmdbError) as error:
+        except EmbedderError as error:
+            self._visual_disabled = True
+            logger.warning('Visual step disabled for %s image %d: %s', game, image_id, type(error).__name__)
+            return None
+        except (ImageError, TmdbError) as error:
             logger.warning('Visual tie-break failed for %s image %d: %s', game, image_id, type(error).__name__)
             return None
         winner = pick(game, frames, images)
