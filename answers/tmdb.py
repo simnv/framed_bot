@@ -136,9 +136,15 @@ def _image_path(value: object) -> str:
 def _vote_average(value: object) -> float:
     if value is None:
         return 0.0
-    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
+    if not isinstance(value, int | float) or isinstance(value, bool):
         raise _Malformed
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # an integer too large for a float
+        raise _Malformed from None
+    if not math.isfinite(number):
+        raise _Malformed
+    return number
 
 
 def _pairs(value: object, key: str) -> list[tuple[int, str]]:
@@ -305,8 +311,9 @@ class TmdbClient:
         data = await self._get(f'/{kind}/{tmdb_id}/images', {})
         try:
             backdrops = [_dict(entry) for entry in _list(data.get('backdrops', []))]
-            ranked = sorted(backdrops, key=lambda entry: -_vote_average(entry.get('vote_average')))
-            paths = [_image_path(entry['file_path']) for entry in ranked[:BACKDROP_LIMIT]]
+            # Validate every entry before the ranking drops any of them.
+            rated = [(_vote_average(entry.get('vote_average')), _image_path(entry['file_path'])) for entry in backdrops]
+            paths = [path for _, path in sorted(rated, key=lambda pair: -pair[0])[:BACKDROP_LIMIT]]
         except _Malformed, KeyError:
             raise TmdbError(f'TMDB {kind} images have an unexpected shape') from None
         if kind == 'tv':

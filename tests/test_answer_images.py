@@ -214,3 +214,24 @@ async def test_image_paths_reject_non_finite_votes(literal: str) -> None:
 
     with pytest.raises(TmdbError, match='unexpected shape'):
         await tmdb.image_paths('movie', 7)
+
+
+@pytest.mark.asyncio
+async def test_image_paths_validate_entries_beyond_the_twelve_kept() -> None:
+    backdrops = [{'file_path': f'/b{n}.jpg', 'vote_average': 9} for n in range(12)]
+    backdrops.append({'file_path': '/../bad.jpg', 'vote_average': 1})
+    tmdb = tmdb_for({'/3/movie/7/images': {'backdrops': backdrops}})
+
+    with pytest.raises(TmdbError, match='unexpected shape'):
+        await tmdb.image_paths('movie', 7)
+
+
+@pytest.mark.parametrize('sign', [1, -1])
+@pytest.mark.asyncio
+async def test_image_paths_reject_huge_integer_votes(sign: int) -> None:
+    body = f'{{"backdrops": [{{"file_path": "/a.jpg", "vote_average": {sign * 10**400}}}]}}'
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)))
+    tmdb = TmdbClient('synthetic-tmdb-token', client, RateLimiter(1000))
+
+    with pytest.raises(TmdbError, match='unexpected shape'):
+        await tmdb.image_paths('movie', 7)
