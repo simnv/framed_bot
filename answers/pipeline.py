@@ -119,7 +119,8 @@ class Resolver:
             if winner is not None:
                 return Resolution(winner, 'visual')
         if text.ties and played < self._today() - VOTES_TIEBREAK_MIN_AGE:
-            return Resolution(chosen, 'auto')  # the most-voted tie; a new release can still be the answer
+            # Recent rounds stay low_confidence (a new release can be the answer). max() keeps the first of equal votes.
+            return Resolution(max(text.ties, key=lambda c: c.votes).tmdb_id, 'auto')
         return Resolution(chosen, 'low_confidence')
 
     async def _tie_break(self, game: Game, kind: Kind, image_id: int, group: list[Candidate]) -> int | None:

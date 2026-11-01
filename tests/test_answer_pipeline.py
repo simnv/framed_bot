@@ -295,3 +295,23 @@ async def test_throttling_still_propagates_for_an_old_tie() -> None:
 
     with pytest.raises(TmdbRateLimited):
         await resolver.resolve('framed', 1000, 'Dune', {}, 1000)
+
+
+@pytest.mark.asyncio
+async def test_an_old_tier_3_tie_goes_to_the_most_voted_even_when_its_match_is_shorter() -> None:
+    candidates = (film(1, 'Alpha', votes=1000), film(2, 'Beta', votes=9000))
+    resolver = Resolver(searching(*candidates), today=OLD)
+
+    assert await resolver.resolve('framed', 1000, 'Alpha: Beta', {}, 1000) == Resolution(2, 'auto')
+
+
+@pytest.mark.asyncio
+async def test_an_old_tie_with_equal_votes_keeps_the_text_order() -> None:
+    candidates = (film(1, 'Dune', '1984-12-14', 5000), film(2, 'Dune', '2021-09-15', 5000))
+    resolver = Resolver(searching(*candidates), today=OLD)
+
+    old = await resolver.resolve('framed', 1000, 'Dune', {}, 1000)
+    recent = await Resolver(searching(*candidates), today=NEAR).resolve('framed', 1000, 'Dune', {}, 1000)
+
+    assert old is not None and recent is not None
+    assert (old.tmdb_id, old.status) == (recent.tmdb_id, 'auto')
