@@ -290,6 +290,25 @@ async def test_leagues_use_split_weights_global_game_mean_and_picker_order(datab
 
 
 @pytest.mark.asyncio
+async def test_exact_league_tie_on_a_rounding_boundary_falls_to_the_name(database):
+    # The global mean is 855 / 192. Users 1 and 2 both get exactly 5649 / 1024 = 5.5166015625 points with
+    # 22 rounds, a value that sits on a decimal rounding boundary. The tie must go to the name.
+    add_title(database, genres=(1,))
+    add_title(database, 2, genres=(1, 2, 3, 4, 5))
+    add_rounds(database, user=1, start=1, count=22, title=1, frame=1)
+    add_rounds(database, user=2, start=101, count=110, title=2, frame=1)
+    add_rounds(database, user=3, start=301, count=59, title=1, frame=None)
+    add_rounds(database, user=3, start=360, title=1, frame=3)
+
+    board = await insight.league('framed', 'genre', 1, TODAY)
+
+    assert board is not None
+    assert [row.user_id for row in board.rows] == [1, 2, 3]
+    assert board.rows[0].score == board.rows[1].score == pytest.approx(5649 / 1024)
+    assert board.rows[0].rounds == board.rows[1].rounds == 22.0
+
+
+@pytest.mark.asyncio
 async def test_league_needs_three_players_with_fifteen_weighted_rounds(database):
     add_title(database, genres=(1, 2))
     add_rounds(database, user=1, count=30)

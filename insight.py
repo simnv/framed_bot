@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date
+from fractions import Fraction
 from typing import Any, Final
 
-from sqlalchemy import Select, and_, case, func, or_, select
+from sqlalchemy import Integer, Select, and_, case, func, literal, or_, select
 from sqlalchemy.sql.selectable import CTE
 
 from answers import FRAMES, KIND_BY_GAME, Game, current_round
@@ -106,14 +107,23 @@ def _eligible(game: Game, today: date) -> CTE:
     )
 
 
+def _mean_statement(eligible: CTE) -> Select:
+    return select(func.sum(eligible.c.points).label('total'), func.count().label('count'))
+
+
 async def _rows(statement: Select) -> list[Any]:
     async with AsyncScopedSession() as session:
         return list((await session.execute(statement)).all())
 
 
+# Weights are integers scaled by this number, so SQL sums them exactly. It is the lowest common multiple of
+# 1 to 16, so a title with up to 16 genres gives each genre an exact share.
+WEIGHT_SCALE: Final = 720_720
+
+
 def _bucket_statement(eligible: CTE, dimension: Dimension) -> Select:
     source = eligible
-    weight = 1.0
+    weight: Any = literal(WEIGHT_SCALE, Integer)
     if dimension == 'genre':
         counts = select(TitleGenre.title_id, func.count().label('n')).group_by(TitleGenre.title_id).subquery()
         source = (
@@ -123,7 +133,8 @@ def _bucket_statement(eligible: CTE, dimension: Dimension) -> Select:
         )
         key = Genre.id
         label = Genre.name
-        weight = 1.0 / counts.c.n
+        # Integer division: the share of one genre of a title with n genres, times WEIGHT_SCALE.
+        weight = weight // counts.c.n
     else:
         key = (eligible.c.year // 10) * 10
         label = key
@@ -143,25 +154,26 @@ def _bucket_statement(eligible: CTE, dimension: Dimension) -> Select:
     return statement.where(eligible.c.year.is_not(None)) if dimension == 'decade' else statement
 
 
-# Float sums of 1/n weights are exact to about 1e-15, far below this precision.
-TIE_DECIMALS: Final = 9
+def _exact(total: Any, scale: int = WEIGHT_SCALE) -> Fraction:
+    """A scaled integer sum from SQL as an exact fraction. PostgreSQL returns sums as Decimal."""
+    return Fraction(int(total), scale)
 
 
-def _weighted_total(value: Any) -> float:
-    """Remove float sum error before the gates and tie checks."""
-    return round(float(value), 10)
+async def _mean(statement: Select) -> Fraction:
+    """The exact mean points of a select of (total, count)."""
+    (row,) = await _rows(statement)
+    return Fraction(int(row.total), int(row.count)) if row.count else Fraction(0)
 
 
-def _bucket(row: Any, mean: float, dimension: Dimension) -> Bucket:
-    rounds = _weighted_total(row.rounds)
+def _bucket(row: Any, mean: Fraction, dimension: Dimension, scale: int = WEIGHT_SCALE) -> Bucket:
+    """Smoothed points with exact fractions, so equal buckets tie exactly and the tie rules decide."""
+    rounds = _exact(row.rounds, scale)
     return Bucket(
         key=row.key,
         label=decade_label(row.key) if dimension == 'decade' else row.label,
-        rounds=rounds,
-        # Divide the raw totals and round only the result. Equal buckets then tie exactly and the tie rules
-        # decide. Rounding the totals first can move an exact tie across a rounding boundary.
-        points=round((float(row.points) + SMOOTHING * mean) / (float(row.rounds) + SMOOTHING), TIE_DECIMALS),
-        win_rate=_weighted_total(row.wins) / rounds,
+        rounds=float(rounds),
+        points=float((_exact(row.points, scale) + SMOOTHING * mean) / (rounds + SMOOTHING)),
+        win_rate=float(_exact(row.wins, scale) / rounds),
     )
 
 
@@ -172,7 +184,7 @@ def _section(buckets: list[Bucket]) -> Section:
     return Section(tuple(buckets[:STATS_BEST]), tuple(buckets[-STATS_BEST:]))
 
 
-async def _people(eligible: CTE, user_id: int, game: Game, mean: float) -> Section:
+async def _people(eligible: CTE, user_id: int, game: Game, mean: Fraction) -> Section:
     """One row per person. A person who directs (or creates) one title and plays in another counts both rounds."""
     role = 'director' if game == 'framed' else 'creator'
     # One credit per title and person, so a person with two roles in one title counts that round once.
@@ -203,7 +215,9 @@ async def _people(eligible: CTE, user_id: int, game: Game, mean: float) -> Secti
         .having(func.count() >= MIN_STATS_PERSON)
     )
     # The main role of the game wins over cast.
-    buckets = [dataclasses.replace(_bucket(row, mean, 'genre'), role=role if row.leads else 'cast') for row in rows]
+    buckets = [
+        dataclasses.replace(_bucket(row, mean, 'genre', scale=1), role=role if row.leads else 'cast') for row in rows
+    ]
     buckets.sort(key=lambda bucket: (-bucket.points, bucket.label, bucket.key))
     return Section(tuple(buckets[:STATS_BEST]))
 
@@ -262,13 +276,12 @@ async def _board_ranks(user_id: int, game: Game) -> list[Rank]:
 
 async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
     eligible = _eligible(game, today)
-    means = await _rows(select(func.avg(eligible.c.points).label('mean')).where(eligible.c.user_id == user_id))
-    mean = float(means[0].mean or 0.0)
+    mean = await _mean(_mean_statement(eligible).where(eligible.c.user_id == user_id))
     sections = []
     for dimension in ('genre', 'decade'):
         rows = await _rows(_bucket_statement(eligible, dimension).where(eligible.c.user_id == user_id))
         sections.append(
-            _section([_bucket(row, mean, dimension) for row in rows if _weighted_total(row.rounds) >= MIN_STATS_BUCKET])
+            _section([_bucket(row, mean, dimension) for row in rows if _exact(row.rounds) >= MIN_STATS_BUCKET])
         )
     current, best = await _streaks(user_id, game, today)
     ranks = await _board_ranks(user_id, game)
@@ -288,13 +301,12 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
 
 
 async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
-    means = await _rows(select(func.avg(eligible.c.points).label('mean')))
-    mean = float(means[0].mean or 0.0)
+    mean = await _mean(_mean_statement(eligible))
     rows = await _rows(_bucket_statement(eligible, dimension))
     grouped: dict[int, list[LeagueRow]] = {}
     labels: dict[int, str] = {}
     for row in rows:
-        if _weighted_total(row.rounds) < MIN_LEAGUE_ROUNDS:
+        if _exact(row.rounds) < MIN_LEAGUE_ROUNDS:
             continue
         bucket = _bucket(row, mean, dimension)
         labels[row.key] = bucket.label
