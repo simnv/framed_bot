@@ -15,7 +15,7 @@ COPY --from=uv /uv /bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY --from=clip /opt/clip/ /opt/clip/
-COPY config.py insight.py main.py reaction_delivery.py rich_tables.py safe_logging.py stats.py top_type.py ./
+COPY config.py insight.py insight_types.py main.py reaction_delivery.py rich_tables.py safe_logging.py stats.py top_type.py ./
 COPY models/ ./models/
 COPY answers/ ./answers/
 COPY deploy/healthcheck.py deploy/start-bot.py deploy/role-policy.sql ./

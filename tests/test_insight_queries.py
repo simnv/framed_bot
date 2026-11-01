@@ -152,6 +152,48 @@ async def test_people_use_game_role_and_first_three_cast_with_three_round_gate(d
 
 
 @pytest.mark.asyncio
+async def test_a_person_with_two_roles_is_one_row_and_counts_each_round_once(database):
+    add_title(database, genres=(), year=None)
+    add_title(database, 2, genres=(), year=None)
+    database.execute('INSERT INTO person VALUES (1, ?)', ('Director Actor',))
+    database.executemany(
+        'INSERT INTO title_person VALUES (?, ?, ?, ?)',
+        # Person 1 directs title 1 and also plays in it, and only plays in title 2.
+        [(1, 1, 'director', 0), (1, 1, 'cast', 0), (2, 1, 'cast', 1)],
+    )
+    add_rounds(database, count=2, frame=2)
+    add_rounds(database, start=3, title=2, frame=2)
+
+    result = await insight.game_insight(1, 'framed', TODAY)
+
+    # 2 director rounds and 1 cast round pass the gate of 3 together, and the directing role wins.
+    assert [(b.key, b.role, b.rounds, b.win_rate) for b in result.people.best] == [(1, 'director', 3.0, 1.0)]
+    assert result.people.best[0].points == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_equal_smoothed_points_tie_exactly_and_sort_by_label(database):
+    # All rounds win on frame 4, so every round and the mean give 3 points, and every bucket has 3.0.
+    add_title(database, genres=(2, 3, 4))
+    add_title(database, 2, genres=(1,), year=2005)
+    add_rounds(database, count=46, frame=4)
+    add_rounds(database, start=47, count=20, title=2, frame=4)
+
+    result = await insight.game_insight(1, 'framed', TODAY)
+
+    assert [b.points for b in result.genres.best] == [3.0, 3.0, 3.0, 3.0]
+    assert [b.key for b in result.genres.best] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_a_won_round_without_a_frame_breaks_the_streak(database):
+    add_rounds(database, count=5, frame=1, title=None)
+    database.execute('UPDATE framed_result SET win_frame = NULL WHERE framed_round = 3')
+    result = await insight.game_insight(1, 'framed', round_date('framed', 6))
+    assert (result.current_streak, result.best_streak) == (2, 2)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('history', 'today_round', 'current', 'best'),
     [

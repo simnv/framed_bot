@@ -15,7 +15,7 @@ from telegram import Bot, InlineKeyboardMarkup, Message, ReplyParameters
 from telegram.error import TelegramError
 
 from answers import FRAMES, Game
-from insight import (
+from insight_types import (
     MIN_LEAGUE_PLAYERS,
     MIN_LEAGUE_ROUNDS,
     MIN_TITLE_PLAYERS,
@@ -386,7 +386,7 @@ def _trimmed_insights_html(insights: Mapping[Game, GameInsight], head_length: in
     """Build the insight sections and trim them step by step until the whole message fits the limit.
 
     The steps: best and worst 3 become 2, then the people sections go, then the Episode sections go.
-    The last step is kept even when the message is still too long.
+    If the last step is still too long, no insight is shown, because Telegram rejects a longer message.
     """
     steps: tuple[tuple[int, bool, tuple[Game, ...]], ...] = (
         (STATS_BEST, True, ('framed', 'episode')),
@@ -394,14 +394,13 @@ def _trimmed_insights_html(insights: Mapping[Game, GameInsight], head_length: in
         (2, False, ('framed', 'episode')),
         (2, False, ('framed',)),
     )
-    html = ''
     for limit, people, games in steps:
         html = ''.join(
             _game_insight_html(game, insights[game], limit=limit, people=people) for game in games if game in insights
         )
         if head_length + len(html) <= STATS_HTML_LIMIT:
-            break
-    return html
+            return html
+    return ''
 
 
 def render_stats(

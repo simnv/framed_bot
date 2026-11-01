@@ -479,13 +479,20 @@ TOP_CALLBACK_PATTERN = r'^top:(framed|episode):([1-4])$'
 LEGACY_TOP_CALLBACK_PATTERN = r'^{"top": [\d]+}$'
 # The metadata screens of /top: two pickers, one league of each picker, and the hard titles.
 TOP_SCREEN_LABELS: dict[str, str] = {'genres': 'Жанры', 'decades': 'Десятилетия', 'hard': 'Сложные'}
-TOP_SCREEN_PATTERN = r'^top:(framed|episode):(genres|decades|hard|genre:[0-9]{1,9}|decade:[0-9]{4})$'
+TOP_SCREEN_PATTERN = r'^top:(framed|episode):(genres|decades|hard|genre:[0-9]{1,9}|decade:[0-9]{1,4})$'
+# The picker screen of each league dimension.
+PICKER_SCREENS: dict[Dimension, str] = {'genre': 'genres', 'decade': 'decades'}
 PICKER_COLUMNS = 3
 BACK_LABEL = '← Назад'
 
 
 def top_callback_data(game: Game, top_type: TopType) -> str:
     return f'top:{game}:{top_type.value}'
+
+
+def top_screen_data(game: Game, screen: str) -> str:
+    """Callback data of a metadata screen of /top, for example top:framed:genres or top:framed:genre:18."""
+    return f'top:{game}:{screen}'
 
 
 def parse_top_callback(data: str) -> tuple[Game, TopType] | None:
@@ -519,7 +526,7 @@ def top_reply_markup(game: Game, top_type: TopType) -> InlineKeyboardMarkup:
                 for _type, label in metric_labels.items()
             ],
             [
-                InlineKeyboardButton(label, callback_data=f'top:{game}:{screen}')
+                InlineKeyboardButton(label, callback_data=top_screen_data(game, screen))
                 for screen, label in TOP_SCREEN_LABELS.items()
             ],
             [
@@ -609,7 +616,8 @@ def back_markup(callback_data: str) -> InlineKeyboardMarkup:
 def picker_markup(game: Game, dimension: Dimension, choices: Sequence[Choice]) -> InlineKeyboardMarkup:
     """Only leagues that have a board get a button. Back opens the main score board of the game."""
     buttons = [
-        InlineKeyboardButton(choice.label, callback_data=f'top:{game}:{dimension}:{choice.key}') for choice in choices
+        InlineKeyboardButton(choice.label, callback_data=top_screen_data(game, f'{dimension}:{choice.key}'))
+        for choice in choices
     ]
     rows = [buttons[start : start + PICKER_COLUMNS] for start in range(0, len(buttons), PICKER_COLUMNS)]
     rows.append([InlineKeyboardButton(BACK_LABEL, callback_data=top_callback_data(game, TopType.TOP_SCORE))])
@@ -627,9 +635,9 @@ async def top_screen(
             return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
         case ['genre' | 'decade' as dimension, key]:
             board = await league(game, dimension, int(key), today)
-            back = back_markup(f'top:{game}:{dimension}s')
+            back = back_markup(top_screen_data(game, PICKER_SCREENS[dimension]))
             if board is None:
-                # The board can stop to exist between two taps. The picker then shows the boards that exist.
+                # Between two taps, a board can disappear. Then the picker shows the boards that exist now.
                 choices = await league_choices(game, dimension, today)
                 return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
             profiles = await enrich_top_profiles(

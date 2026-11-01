@@ -7,12 +7,38 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date
-from typing import Any, Final, Literal
+from typing import Any
 
 from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.sql.selectable import CTE
 
 from answers import FRAMES, KIND_BY_GAME, Game, current_round
+from insight_types import (
+    CAST_MAX_ORDER,
+    ELIGIBLE_STATUSES,
+    LEAGUE_LIMIT,
+    MIN_LEAGUE_PLAYERS,
+    MIN_LEAGUE_ROUNDS,
+    MIN_STATS_BUCKET,
+    MIN_STATS_PERSON,
+    MIN_TITLE_PLAYERS,
+    SMOOTHING,
+    STATS_BEST,
+    TITLE_LIMIT,
+    Bucket,
+    Choice,
+    Dimension,
+    GameInsight,
+    HardTitles,
+    League,
+    LeagueRow,
+    Rank,
+    RankBoard,
+    Role,
+    Section,
+    TitleRow,
+    decade_label,
+)
 from models.db import AsyncScopedSession
 from models.game_answer import GameAnswer
 from models.title import Genre, Person, Title, TitleGenre, TitlePerson
@@ -20,103 +46,36 @@ from models.top import MODELS, top_statement
 from models.user import User
 from top_type import TopType
 
-type Dimension = Literal['genre', 'decade']
-type Role = Literal['director', 'creator', 'cast']
-type RankBoard = Literal['score', 'frame', 'win', 'rounds', 'genre', 'decade']
-
-SMOOTHING: Final = 10
-MIN_STATS_BUCKET: Final = 5
-MIN_STATS_PERSON: Final = 3
-MIN_LEAGUE_ROUNDS: Final = 15
-MIN_LEAGUE_PLAYERS: Final = 3
-MIN_TITLE_PLAYERS: Final = 5
-LEAGUE_LIMIT: Final = 10
-TITLE_LIMIT: Final = 5
-STATS_BEST: Final = 3
-CAST_MAX_ORDER: Final = 2
-ELIGIBLE_STATUSES: Final = ('site', 'auto', 'visual', 'low_confidence', 'manual')
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Bucket:
-    """One genre, decade or person of one player. rounds is the sum of the weights."""
-
-    key: int
-    label: str
-    rounds: float
-    points: float
-    win_rate: float
-    role: Role | None = None
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Section:
-    """Buckets that pass the minimum. If all buckets fit, best holds all of them and worst is empty."""
-
-    best: tuple[Bucket, ...]
-    worst: tuple[Bucket, ...] = ()
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Rank:
-    board: RankBoard
-    place: int
-    total: int
-    # The genre name or the decade label for a league rank, else None.
-    label: str | None = None
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class GameInsight:
-    genres: Section
-    decades: Section
-    people: Section
-    current_streak: int
-    best_streak: int
-    ranks: tuple[Rank, ...]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class Choice:
-    key: int
-    label: str
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class LeagueRow:
-    user_id: int
-    name: str | None
-    score: float
-    rounds: float
-    win_rate: float
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class League:
-    dimension: Dimension
-    key: int
-    label: str
-    rows: tuple[LeagueRow, ...]
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class TitleRow:
-    round: int
-    name: str
-    year: int | None
-    players: int
-    win_rate: float
-    points: float
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class HardTitles:
-    hardest: tuple[TitleRow, ...]
-    easiest: tuple[TitleRow, ...]
-
-
-def decade_label(year: int) -> str:
-    return f'{year}-е'
+__all__ = [
+    'Bucket',
+    'CAST_MAX_ORDER',
+    'Choice',
+    'Dimension',
+    'ELIGIBLE_STATUSES',
+    'GameInsight',
+    'HardTitles',
+    'LEAGUE_LIMIT',
+    'League',
+    'LeagueRow',
+    'MIN_LEAGUE_PLAYERS',
+    'MIN_LEAGUE_ROUNDS',
+    'MIN_STATS_BUCKET',
+    'MIN_STATS_PERSON',
+    'MIN_TITLE_PLAYERS',
+    'Rank',
+    'RankBoard',
+    'Role',
+    'SMOOTHING',
+    'STATS_BEST',
+    'Section',
+    'TITLE_LIMIT',
+    'TitleRow',
+    'decade_label',
+    'game_insight',
+    'hard_titles',
+    'league',
+    'league_choices',
+]
 
 
 def _eligible(game: Game, today: date) -> CTE:
@@ -195,7 +154,8 @@ def _bucket(row: Any, mean: float, dimension: Dimension) -> Bucket:
         key=row.key,
         label=decade_label(row.key) if dimension == 'decade' else row.label,
         rounds=rounds,
-        points=(_weighted_total(row.points) + SMOOTHING * mean) / (rounds + SMOOTHING),
+        # Rounded like the totals, so equal buckets tie exactly and the tie rules decide.
+        points=_weighted_total((_weighted_total(row.points) + SMOOTHING * mean) / (rounds + SMOOTHING)),
         win_rate=_weighted_total(row.wins) / rounds,
     )
 
@@ -208,46 +168,74 @@ def _section(buckets: list[Bucket]) -> Section:
 
 
 async def _people(eligible: CTE, user_id: int, game: Game, mean: float) -> Section:
+    """One row per person. A person who directs (or creates) one title and plays in another counts both rounds."""
     role = 'director' if game == 'framed' else 'creator'
+    # One credit per title and person, so a person with two roles in one title counts that round once.
+    credits = (
+        select(
+            TitlePerson.title_id,
+            TitlePerson.person_id,
+            func.max(case((TitlePerson.role == role, 1), else_=0)).label('leads'),
+        )
+        .where(or_(TitlePerson.role == role, and_(TitlePerson.role == 'cast', TitlePerson.order <= CAST_MAX_ORDER)))
+        .group_by(TitlePerson.title_id, TitlePerson.person_id)
+        .subquery()
+    )
     rows = await _rows(
         select(
             Person.id.label('key'),
             Person.name.label('label'),
-            TitlePerson.role.label('role'),
+            func.max(credits.c.leads).label('leads'),
             func.count().label('rounds'),
             func.sum(eligible.c.points).label('points'),
             func.sum(eligible.c.won).label('wins'),
         )
         .select_from(eligible)
-        .join(TitlePerson, TitlePerson.title_id == eligible.c.title_id)
-        .join(Person, Person.id == TitlePerson.person_id)
-        .where(
-            eligible.c.user_id == user_id,
-            or_(TitlePerson.role == role, and_(TitlePerson.role == 'cast', TitlePerson.order <= CAST_MAX_ORDER)),
-        )
-        .group_by(Person.id, Person.name, TitlePerson.role)
+        .join(credits, credits.c.title_id == eligible.c.title_id)
+        .join(Person, Person.id == credits.c.person_id)
+        .where(eligible.c.user_id == user_id)
+        .group_by(Person.id, Person.name)
         .having(func.count() >= MIN_STATS_PERSON)
     )
-    buckets = [dataclasses.replace(_bucket(row, mean, 'genre'), role=row.role) for row in rows]
-    buckets.sort(key=lambda bucket: (-bucket.points, bucket.label, bucket.key, bucket.role or ''))
+    # The main role of the game wins over cast.
+    buckets = [dataclasses.replace(_bucket(row, mean, 'genre'), role=role if row.leads else 'cast') for row in rows]
+    buckets.sort(key=lambda bucket: (-bucket.points, bucket.label, bucket.key))
     return Section(tuple(buckets[:STATS_BEST]))
 
 
 async def _streaks(user_id: int, game: Game, today: date) -> tuple[int, int]:
+    """Win runs over consecutive round numbers, found in SQL so the bot does not load the history."""
     model = MODELS[game]
-    rows = await _rows(
-        select(model.framed_round.label('round'), model.won.label('won'))
-        .where(model.user_id == user_id)
-        .order_by(model.framed_round)
+    won = model.won.is_(True)
+    valid = (
+        select(model.framed_round.label('round'), won.label('won'))
+        .where(model.user_id == user_id, ~and_(won, model.win_frame.is_(None)))
+        .subquery()
     )
-    run = best = 0
-    previous = None
-    for row in rows:
-        run = (run + 1 if previous == row.round - 1 else 1) if row.won else 0
-        best = max(best, run)
-        previous = row.round
-    current = run if previous is not None and previous >= current_round(game, today) - 1 else 0
-    return current, best
+    wins = (
+        select(
+            valid.c.round,
+            # Consecutive won rounds share one value; a gap or a loss changes it.
+            (valid.c.round - func.row_number().over(order_by=valid.c.round)).label('island'),
+        )
+        .where(valid.c.won.is_(True))
+        .subquery()
+    )
+    islands = (
+        select(func.count().label('length'), func.max(wins.c.round).label('last')).group_by(wins.c.island).subquery()
+    )
+    latest = select(func.max(valid.c.round)).scalar_subquery()
+    (row,) = await _rows(
+        select(
+            func.max(islands.c.length).label('best'),
+            func.max(case((islands.c.last == latest, islands.c.length), else_=0)).label('run'),
+            latest.label('latest'),
+        )
+    )
+    if row.latest is None or row.best is None:
+        return 0, 0
+    current = row.run if row.latest >= current_round(game, today) - 1 else 0
+    return int(current), int(row.best)
 
 
 async def _board_ranks(user_id: int, game: Game) -> list[Rank]:

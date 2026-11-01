@@ -1,5 +1,9 @@
 # Renderers on fixed inputs built from the insight dataclasses. No handler, no database.
+import os
+import subprocess
+import sys
 from html.parser import HTMLParser
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -292,16 +296,12 @@ def test_longest_insights_then_drop_the_episode_sections():
     assert len(titles) == 4
 
 
-def test_trimming_stops_after_the_last_step_even_if_the_html_is_still_long():
+def test_insights_that_never_fit_are_left_out_so_telegram_accepts_the_message():
     rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(400), long_insight(400)))
-    assert len(rich['html']) > STATS_HTML_LIMIT
-    titles = rendered_titles(rich)
-    assert titles == [
-        'Framed: жанры',
-        'Framed: десятилетия',
-        'Framed: серия побед сейчас 1, лучшая 2.',
-        'Framed: места в /top',
-    ]
+    assert len(rich['html']) <= STATS_HTML_LIMIT
+    assert rendered_titles(rich) == []
+    # The main table and its explanation stay.
+    assert 'Прочерк значит' in rich['html']
 
 
 def test_trimmed_section_with_all_buckets_keeps_two_best_and_two_worst():
@@ -396,3 +396,12 @@ def test_hard_titles_for_episode_use_the_series_noun_and_say_when_empty():
     assert parsed.paragraphs[0] == 'Episode: сложные сериалы'
     assert parsed.tables == []
     assert 'Пока нет раундов' in rich['html']
+
+
+def test_rich_tables_does_not_load_the_database_or_the_configuration():
+    code = 'import sys, rich_tables; sys.exit(int(any(m in sys.modules for m in ("insight", "models.db", "config"))))'
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and code
+        [sys.executable, '-c', code], cwd=root, env={**os.environ}, check=False
+    )
+    assert result.returncode == 0
