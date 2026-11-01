@@ -15,7 +15,8 @@ class GameAnswer(Base):
     __table_args__ = (
         CheckConstraint("game IN ('framed', 'episode')", name='ck_game_answer_game'),
         CheckConstraint(
-            "match_status IN ('auto', 'low_confidence', 'manual', 'unmatched')", name='ck_game_answer_match_status'
+            "match_status IN ('site', 'auto', 'visual', 'low_confidence', 'unmatched', 'manual')",
+            name='ck_game_answer_match_status',
         ),
     )
 

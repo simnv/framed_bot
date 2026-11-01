@@ -43,7 +43,7 @@ def test_revision_0002_downgrade_drops_only_new_tables() -> None:
 
 
 def test_revision_0003_clears_low_confidence_matches() -> None:
-    sql = offline_sql('upgrade', '0002:head')
+    sql = offline_sql('upgrade', '0002:0003')
 
     assert (
         "UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() "
@@ -53,7 +53,48 @@ def test_revision_0003_clears_low_confidence_matches() -> None:
     assert 'DROP' not in sql
 
 
+def test_revision_0004_adds_assets_new_statuses_and_resets_non_manual_rows() -> None:
+    sql = offline_sql('upgrade', '0003:0004')
+
+    assert re.findall(r'^CREATE TABLE (\w+)', sql, re.MULTILINE) == ['framed_asset']
+    assert 'PRIMARY KEY (mode, day)' in sql
+    assert "CONSTRAINT ck_framed_asset_mode CHECK (mode IN ('titleshot', 'poster'))" in sql
+    assert 'CREATE INDEX ix_framed_asset_classic_day ON framed_asset (classic_day)' in sql
+    drop = sql.index('ALTER TABLE game_answer DROP CONSTRAINT ck_game_answer_match_status')
+    add = sql.index(
+        'ALTER TABLE game_answer ADD CONSTRAINT ck_game_answer_match_status CHECK '
+        "(match_status IN ('site', 'auto', 'visual', 'low_confidence', 'unmatched', 'manual'))"
+    )
+    reset = sql.index(
+        'UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() '
+        "WHERE match_status IS DISTINCT FROM 'manual'"
+    )
+    assert drop < add < reset
+    assert 'DROP TABLE' not in sql
+    assert "UPDATE alembic_version SET version_num='0004' WHERE alembic_version.version_num = '0003'" in sql
+
+
+def test_revision_0004_downgrade_restores_the_old_check() -> None:
+    sql = offline_sql('downgrade', '0004:0003')
+
+    reset = sql.index(
+        'UPDATE game_answer SET title_id = NULL, match_status = NULL, updated_at = now() '
+        "WHERE match_status IN ('site', 'visual')"
+    )
+    old = sql.index(
+        'ADD CONSTRAINT ck_game_answer_match_status CHECK '
+        "(match_status IN ('auto', 'low_confidence', 'manual', 'unmatched'))"
+    )
+    assert reset < old < sql.index('DROP TABLE framed_asset')
+
+
 def test_models_register_new_tables() -> None:
     from models import Base
 
-    assert set(NEW_TABLES) <= set(Base.metadata.tables)
+    assert set(NEW_TABLES) | {'framed_asset'} <= set(Base.metadata.tables)
+    check = next(
+        constraint
+        for constraint in Base.metadata.tables['game_answer'].constraints
+        if constraint.name == 'ck_game_answer_match_status'
+    )
+    assert "'site'" in str(check.sqltext) and "'visual'" in str(check.sqltext)

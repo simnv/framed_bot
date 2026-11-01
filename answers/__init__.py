@@ -5,7 +5,7 @@ from typing import Final, Literal
 
 type Game = Literal['framed', 'episode']
 type Kind = Literal['movie', 'tv']
-type MatchStatus = Literal['auto', 'low_confidence', 'manual', 'unmatched']
+type MatchStatus = Literal['site', 'auto', 'visual', 'low_confidence', 'unmatched', 'manual']
 
 GAMES: Final[tuple[Game, ...]] = ('framed', 'episode')
 KIND_BY_GAME: Final[dict[Game, Kind]] = {'framed': 'movie', 'episode': 'tv'}

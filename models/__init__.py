@@ -1,5 +1,6 @@
 from .db import Base, engine
 from .episode_result import EpisodeResult
+from .framed_asset import FramedAsset
 from .framed_result import FramedResult
 from .game_answer import GameAnswer
 from .group import Group
@@ -10,6 +11,7 @@ __all__ = [
     'Base',
     'Company',
     'EpisodeResult',
+    'FramedAsset',
     'FramedResult',
     'GameAnswer',
     'Genre',
