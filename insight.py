@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.sql.selectable import CTE
@@ -143,6 +143,10 @@ def _bucket_statement(eligible: CTE, dimension: Dimension) -> Select:
     return statement.where(eligible.c.year.is_not(None)) if dimension == 'decade' else statement
 
 
+# Float sums of 1/n weights are exact to about 1e-15, far below this precision.
+TIE_DECIMALS: Final = 9
+
+
 def _weighted_total(value: Any) -> float:
     """Remove float sum error before the gates and tie checks."""
     return round(float(value), 10)
@@ -154,8 +158,9 @@ def _bucket(row: Any, mean: float, dimension: Dimension) -> Bucket:
         key=row.key,
         label=decade_label(row.key) if dimension == 'decade' else row.label,
         rounds=rounds,
-        # Rounded like the totals, so equal buckets tie exactly and the tie rules decide.
-        points=_weighted_total((_weighted_total(row.points) + SMOOTHING * mean) / (rounds + SMOOTHING)),
+        # Divide the raw totals and round only the result. Equal buckets then tie exactly and the tie rules
+        # decide. Rounding the totals first can move an exact tie across a rounding boundary.
+        points=round((float(row.points) + SMOOTHING * mean) / (float(row.rounds) + SMOOTHING), TIE_DECIMALS),
         win_rate=_weighted_total(row.wins) / rounds,
     )
 

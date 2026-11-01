@@ -186,6 +186,23 @@ async def test_equal_smoothed_points_tie_exactly_and_sort_by_label(database):
 
 
 @pytest.mark.asyncio
+async def test_fractional_rounds_do_not_split_an_exact_tie_by_rounding(database):
+    # Each block of 11 rounds has one win on frame 1 (6 points) and 10 misses: 16 / 11 points a round.
+    add_title(database, genres=(2, 3, 4))
+    add_title(database, 2, genres=(1,), year=2005)
+    for start, count, title in ((1, 22, 1), (23, 11, 2)):
+        add_rounds(database, start=start, count=count, title=title, frame=None)
+        for block in range(start, start + count, 11):
+            database.execute('UPDATE framed_result SET won = 1, win_frame = 1 WHERE framed_round = ?', (block,))
+
+    result = await insight.game_insight(1, 'framed', TODAY)
+
+    assert [b.points for b in result.genres.best] == pytest.approx([16 / 11] * 4)
+    assert len({b.points for b in result.genres.best}) == 1
+    assert [b.key for b in result.genres.best] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
 async def test_a_won_round_without_a_frame_breaks_the_streak(database):
     add_rounds(database, count=5, frame=1, title=None)
     database.execute('UPDATE framed_result SET win_frame = NULL WHERE framed_round = 3')
