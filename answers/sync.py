@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 # Shutdown ends within SHUTDOWN_TIMEOUT: the active syncs get ACTIVE_TIMEOUT, the CLIP child the rest.
 SHUTDOWN_TIMEOUT: Final = 5.0
 ACTIVE_TIMEOUT: Final = 3.0
+# A 404 within this many mode days is not stored, so the next sync asks again.
+RECENT_DAYS: Final = 14
 
 type Scrape = Callable[[Game], Awaitable[list[BundleEntry]]]
 type Alert = Callable[[str], Awaitable[None]]
@@ -181,7 +183,10 @@ class AnswerSync:
         except Throttled:
             raise
         except (ScrapeError, httpx.HTTPError) as error:
-            logger.warning('Cannot scrape %s answers: %s', game, error)
+            # ScrapeError text is ours; transport exception text is not logged.
+            logger.warning(
+                'Cannot scrape %s answers: %s', game, error if isinstance(error, ScrapeError) else type(error).__name__
+            )
             if game not in self._alerted:
                 self._alerted.add(game)
                 await self._alert(f'Не удалось получить ответы {game}: {type(error).__name__}. Подробности в логах.')
@@ -203,9 +208,14 @@ class AnswerSync:
         """Fetch the mode days that the asset table lacks, from day 1 up to today's day. Never a future day."""
         today = self._today()
         for mode in MODES:
+            newest = current_mode_day(mode, today)
             try:
-                for day in await self._store.missing_asset_days(mode, current_mode_day(mode, today)):
-                    await self._store.save_asset(await assets.fetch(mode, day))
+                for day in await self._store.missing_asset_days(mode, newest):
+                    asset = await assets.fetch(mode, day)
+                    # A 404 on a recent day may mean a late publication: keep it missing to fetch it again.
+                    if asset.tmdb_id is None and asset.classic_day is None and day > newest - RECENT_DAYS:
+                        continue
+                    await self._store.save_asset(asset)
             except Throttled:
                 raise
             except AssetError as error:

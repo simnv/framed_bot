@@ -499,8 +499,9 @@ async def test_framed_sync_fetches_mode_days_up_to_today_only() -> None:
     await sync.sync('framed', 2)
     await sync.sync('framed', 2)
 
-    assert assets.requests == [('titleshot', 1), ('titleshot', 2), ('titleshot', 3)]
-    assert store.assets[('titleshot', 2)] == Asset('titleshot', 2, None, None, None)
+    # All three days are recent 404s: both syncs ask again, and neither goes past day 3.
+    assert assets.requests == [('titleshot', day) for day in (1, 2, 3, 1, 2, 3)]
+    assert store.assets == {}
 
 
 @pytest.mark.asyncio
@@ -746,3 +747,40 @@ async def test_shutdown_logs_a_failing_resolver_close_by_type(
 
     assert 'OSError' in caplog.text
     assert 'sensitive path' not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_recent_404_day_is_fetched_again_and_an_old_one_is_not() -> None:
+    # 2025-06-20 is titleshot day 16: days 3..16 are recent, days 1 and 2 are old.
+    assets = FakeAssets()
+    sync, store, _, _, _ = make_sync(today=date(2025, 6, 20), assets=assets)
+
+    await sync.sync('framed', 1)
+    first = len(assets.requests)
+    await sync.sync('framed', 1)
+
+    assert sorted(day for mode, day in store.assets if mode == 'titleshot') == [1, 2]
+    again = assets.requests[first:]
+    assert ('titleshot', 1) not in again
+    assert ('titleshot', 2) not in again
+    assert [day for mode, day in again if mode == 'titleshot'] == list(range(3, 17))
+
+
+@pytest.mark.asyncio
+async def test_a_recent_day_with_ids_is_stored() -> None:
+    assets = FakeAssets({('titleshot', 3): site_asset('titleshot', 3, 5, 900)})
+    sync, store, _, _, _ = make_sync(today=date(2025, 6, 7), assets=assets)
+
+    await sync.sync('framed', 1)
+
+    assert ('titleshot', 3) in store.assets
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_failure_does_not_log_the_transport_text(caplog: pytest.LogCaptureFixture) -> None:
+    sync, _, _, _, _ = make_sync(scraper=FakeScraper(error=httpx.ConnectError('synthetic transport secret')))
+
+    await sync.sync('framed', 1)
+
+    assert 'ConnectError' in caplog.text
+    assert 'synthetic transport secret' not in caplog.text
