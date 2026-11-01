@@ -8,7 +8,8 @@ import pytest
 from telegram.error import BadRequest, Forbidden, NetworkError
 
 import rich_tables
-from rich_tables import TopType, enrich_top_profiles, render_top
+from rich_tables import enrich_top_profiles, render_top
+from top_type import TopType
 
 
 def row(user_id, *, username='stale_owner', name='Name <b>& 👩‍💻', score=2):
@@ -30,7 +31,7 @@ async def test_imported_user_unknown_to_bot_resolves_via_current_group_membershi
     enriched = await enrich_top_profiles(
         Mock(get_chat=lookup, get_chat_member=member_lookup), [row(42)], group_chat_id=-123
     )
-    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    html = render_top('framed', TopType.TOP_SCORE, enriched)['html']
     assert 'href="https://t.me/current_member?profile"' in html
     assert 'stale_owner' not in html
     assert 'tg://user?' not in html
@@ -63,7 +64,7 @@ async def test_group_lookup_never_trusts_invalid_identity_or_stored_username(res
         [row(42)],
         group_chat_id=-123,
     )
-    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    html = render_top('framed', TopType.TOP_SCORE, enriched)['html']
     assert 'href="tg://user?id=42"' in html
     assert 'https://t.me/' not in html
     assert 'stale_owner' not in html
@@ -78,7 +79,7 @@ async def test_group_lookup_requires_a_negative_integer_context(group_chat_id):
         [row(42)],
         group_chat_id=group_chat_id,
     )
-    assert 'href="tg://user?id=42"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    assert 'href="tg://user?id=42"' in render_top('framed', TopType.TOP_SCORE, enriched)['html']
     member_lookup.assert_not_awaited()
 
 
@@ -90,7 +91,7 @@ async def test_valid_private_chat_username_does_not_request_group_membership():
         [row(42)],
         group_chat_id=-123,
     )
-    assert 'href="https://t.me/fresh_owner?profile"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    assert 'href="https://t.me/fresh_owner?profile"' in render_top('framed', TopType.TOP_SCORE, enriched)['html']
     member_lookup.assert_not_awaited()
 
 
@@ -103,11 +104,11 @@ async def test_fresh_verified_username_replaces_stale_db_username_and_is_not_cac
     second = await enrich_top_profiles(bot, results)
     assert isinstance(first, tuple)
     assert first[0].name == results[0].name and first[0].score == 2 and first[0].user_id == 42
-    assert 'https://t.me/new_owner?profile' in render_top(TopType.TOP_SCORE, first)['html']
-    assert 'https://t.me/renamed_owner?profile' in render_top(TopType.TOP_SCORE, second)['html']
-    assert 'stale_owner' not in render_top(TopType.TOP_SCORE, first)['html']
-    assert 'https://t.me/' not in render_top(TopType.TOP_SCORE, results)['html']
-    assert '&lt;b&gt;&amp;' in render_top(TopType.TOP_SCORE, first)['html']
+    assert 'https://t.me/new_owner?profile' in render_top('framed', TopType.TOP_SCORE, first)['html']
+    assert 'https://t.me/renamed_owner?profile' in render_top('framed', TopType.TOP_SCORE, second)['html']
+    assert 'stale_owner' not in render_top('framed', TopType.TOP_SCORE, first)['html']
+    assert 'https://t.me/' not in render_top('framed', TopType.TOP_SCORE, results)['html']
+    assert '&lt;b&gt;&amp;' in render_top('framed', TopType.TOP_SCORE, first)['html']
     assert get_chat.await_count == 2
     for call in get_chat.await_args_list:
         assert call.args == (42,)
@@ -140,7 +141,7 @@ async def test_fresh_verified_username_replaces_stale_db_username_and_is_not_cac
 async def test_invalid_or_unavailable_lookup_keeps_id_fallback(response):
     lookup = AsyncMock(side_effect=response) if isinstance(response, Exception) else AsyncMock(return_value=response)
     enriched = await enrich_top_profiles(Mock(get_chat=lookup), [row(42)])
-    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    html = render_top('framed', TopType.TOP_SCORE, enriched)['html']
     assert 'href="tg://user?id=42"' in html
     assert 'https://t.me/' not in html
 
@@ -149,7 +150,7 @@ async def test_invalid_or_unavailable_lookup_keeps_id_fallback(response):
 @pytest.mark.parametrize('username', ['a', 'A_9', 'a' * 32])
 async def test_safe_collectible_and_regular_username_paths(username):
     enriched = await enrich_top_profiles(Mock(get_chat=AsyncMock(return_value=chat(42, username))), [row(42)])
-    assert f'href="https://t.me/{username}?profile"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    assert f'href="https://t.me/{username}?profile"' in render_top('framed', TopType.TOP_SCORE, enriched)['html']
 
 
 @pytest.mark.asyncio
@@ -188,7 +189,7 @@ async def test_lookup_batch_caps_at_ten_rows_and_three_concurrent_requests(via_g
     assert calls == list(range(1, 11))
     assert peak == 3 and active == 0
     assert len(enriched) == 12
-    assert 'href="tg://user?id=12"' in render_top(TopType.TOP_SCORE, enriched)['html']
+    assert 'href="tg://user?id=12"' in render_top('framed', TopType.TOP_SCORE, enriched)['html']
     if via_group:
         assert private_lookup.await_count == 10
 
@@ -219,7 +220,7 @@ async def test_deadline_preserves_completed_lookup_and_cleans_up_remaining_reque
         timeout=1,
     )
     assert started == finished
-    html = render_top(TopType.TOP_SCORE, enriched)['html']
+    html = render_top('framed', TopType.TOP_SCORE, enriched)['html']
     assert 'https://t.me/finished?profile' in html
     assert 'href="tg://user?id=2"' in html
     assert len(started) <= 4
@@ -261,4 +262,4 @@ async def test_unhashable_invalid_id_uses_plain_name_without_lookup():
     lookup = AsyncMock()
     enriched = await enrich_top_profiles(Mock(get_chat=lookup), [row([])])
     lookup.assert_not_awaited()
-    assert '<a ' not in render_top(TopType.TOP_SCORE, enriched)['html']
+    assert '<a ' not in render_top('framed', TopType.TOP_SCORE, enriched)['html']

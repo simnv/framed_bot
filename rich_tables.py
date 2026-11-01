@@ -8,21 +8,16 @@ import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import IntEnum
 from html import escape
 from typing import Literal, Protocol, TypedDict, TypeGuard
 
 from telegram import Bot, InlineKeyboardMarkup, Message, ReplyParameters
 from telegram.error import TelegramError
 
+from answers import FRAMES, Game
+from top_type import TopType
+
 _PROFILE_LOOKUP_DEADLINE = 8
-
-
-class TopType(IntEnum):
-    TOP_SCORE = 1
-    TOP_FRAME = 2
-    TOP_WIN = 3
-    TOP_ROUNDS = 4
 
 
 class TopResult(Protocol):
@@ -45,6 +40,12 @@ class GameStats(Protocol):
 
     @property
     def average_frame(self) -> float | None: ...
+
+    @property
+    def points(self) -> int: ...
+
+    @property
+    def average_frame_all(self) -> float | None: ...
 
 
 class RichMessage(TypedDict):
@@ -187,7 +188,7 @@ def _average(value: float | None) -> str:
 
 
 def _table(
-    headers: Sequence[str],
+    headers: Sequence[str | _Link],
     rows: Sequence[Sequence[str | int | float | _ProfileName | _Link | None]],
     *,
     alignments: Sequence[Literal['left', 'center', 'right']] = (),
@@ -207,13 +208,46 @@ def _table(
     return html + '</table>'
 
 
-def render_top(top_type: TopType, results: Sequence[TopResult]) -> RichMessage:
+_GAME_TITLES: dict[Game, str] = {'framed': 'Framed', 'episode': 'Episode'}
+# Genitive plural and nominative singular of the answer noun of each game.
+_ANSWER_WORDS: dict[Game, tuple[str, str]] = {'framed': ('фильмам', 'фильм'), 'episode': ('сериалам', 'сериал')}
+TOP_WIN_LABELS: dict[Game, str] = {'framed': 'Фильмы', 'episode': 'Сериалы'}
+
+
+def _top_explanation(game: Game, top_type: TopType) -> str:
+    frames = FRAMES[game]
+    miss = frames + 1
+    answer = _ANSWER_WORDS[game][1]
+    more_rounds = 'При равенстве выше стоит игрок, у которого больше раундов.'
+    match top_type:
+        case TopType.TOP_SCORE:
+            return (
+                f'Бот даёт очки за каждый раунд. Победа на кадре N даёт {miss} \u2212 N очков. '
+                f'Кадр 1 даёт {frames} очков, кадр {frames} даёт 1. Проигрыш даёт 1 очко за участие. '
+                'При равных очках выше стоит игрок, у которого больше раундов.'
+            )
+        case TopType.TOP_FRAME:
+            return (
+                'Бот берёт средний кадр по всем раундам игрока. '
+                f'Неугаданный {answer} считается как кадр {miss}. Чем меньше число, тем лучше. '
+                'В таблицу попадают игроки, у которых не меньше 10 раундов. ' + more_rounds
+            )
+        case TopType.TOP_WIN:
+            return f'Число раундов, в которых игрок угадал {answer}. Номер кадра не важен. ' + more_rounds
+        case TopType.TOP_ROUNDS:
+            return (
+                'Число раундов, которые игрок прислал боту. Бот считает каждый раунд один раз, повтор не учитывается. '
+                'При равенстве выше стоит игрок, у которого больше побед.'
+            )
+
+
+def render_top(game: Game, top_type: TopType, results: Sequence[TopResult]) -> RichMessage:
     """Render already ranked query results without changing their order or values."""
     title, column = {
-        TopType.TOP_SCORE: ('Топ по очкам', 'Очки'),
-        TopType.TOP_FRAME: ('Топ по среднему кадру', 'Средний кадр'),
-        TopType.TOP_WIN: ('Топ по количеству отгаданных фильмов', 'Фильмы'),
-        TopType.TOP_ROUNDS: ('Топ по количеству участий', 'Участия'),
+        TopType.TOP_SCORE: ('по очкам', 'Очки'),
+        TopType.TOP_FRAME: ('по среднему кадру', 'Средний кадр'),
+        TopType.TOP_WIN: (f'по угаданным {_ANSWER_WORDS[game][0]}', TOP_WIN_LABELS[game]),
+        TopType.TOP_ROUNDS: ('по участиям', 'Участия'),
     }[top_type]
     rows = [
         (
@@ -227,21 +261,34 @@ def render_top(top_type: TopType, results: Sequence[TopResult]) -> RichMessage:
         )
         for rank, result in enumerate(results, 1)
     ]
-    html = f'<p>{title}</p>' + _table(('#', 'Имя', column), rows, alignments=('center', 'left', 'center'))
-    if top_type == TopType.TOP_FRAME:
-        html += '<p>Неугаданный фильм = 7 кадров; меньше — лучше.</p>'
+    html = f'<p>Топ {_GAME_TITLES[game]} {title}</p>'
+    html += _table(('#', 'Имя', column), rows, alignments=('center', 'left', 'center'))
     if not results:
         html += '<p>Пока нет результатов.</p>'
+    html += f'<p>{_top_explanation(game, top_type)}</p>'
     return {'html': html, 'skip_entity_detection': True}
 
 
+_STATS_NOTE = (
+    'Очки и «Ср. кадр (все)» бот считает так же, как в /top. '
+    'Во Framed промах считается как кадр 7, в Episode как кадр 11. '
+    '«Ср. кадр (победы)» учитывает только угаданные раунды. '
+    'Прочерк значит, что побед или раундов пока нет.'
+)
+
+
 def render_stats(framed_stats: GameStats, episode_stats: GameStats) -> RichMessage:
+    games = (framed_stats, episode_stats)
     rows = [
-        (_Link(game, f'https://{game}/'), stats.rounds_count, stats.rounds_won_count, _average(stats.average_frame))
-        for game, stats in (('framed.wtf', framed_stats), ('episode.wtf', episode_stats))
+        ('Раунды', *(stats.rounds_count for stats in games)),
+        ('Победы', *(stats.rounds_won_count for stats in games)),
+        ('Очки', *(stats.points for stats in games)),
+        ('Ср. кадр (победы)', *(_average(stats.average_frame) for stats in games)),
+        ('Ср. кадр (все)', *(_average(stats.average_frame_all) for stats in games)),
     ]
-    html = '<p>Твоя статистика</p>' + _table(('Игра', 'Раунды', 'Победы', 'Средний кадр'), rows)
-    html += '<p>Средний кадр — только по победам. «—» означает, что побед пока нет.</p>'
+    headers = ('Показатель', _Link('Framed', 'https://framed.wtf/'), _Link('Episode', 'https://episode.wtf/'))
+    html = '<p>Твоя статистика</p>' + _table(headers, rows)
+    html += f'<p>{_STATS_NOTE}</p>'
     return {'html': html, 'skip_entity_detection': True}
 
 

@@ -1,19 +1,23 @@
 # The request adapter records real PTB JSON serialization without network access.
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from telegram import CallbackQuery, Chat, Message, Update, User
-from telegram.ext import AIORateLimiter, ApplicationBuilder, ContextTypes, JobQueue
+from telegram import CallbackQuery, Chat, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
+from telegram.error import BadRequest
+from telegram.ext import AIORateLimiter, ApplicationBuilder, CallbackQueryHandler, ContextTypes, JobQueue
 from telegram.request import BaseRequest
 from telegram.warnings import PTBUserWarning
 
 import main
-from rich_tables import TopType, render_stats, render_top
+import rich_tables
+from rich_tables import render_stats, render_top
 from stats import Stats
+from top_type import TopType
 
 
 class TableParser(HTMLParser):
@@ -46,18 +50,21 @@ class TableParser(HTMLParser):
             self.cell = None
 
 
+@pytest.mark.parametrize('game', ['framed', 'episode'])
 @pytest.mark.parametrize(
-    ('kind', 'label', 'value'),
+    ('kind', 'labels', 'value'),
     [
-        (TopType.TOP_SCORE, 'Очки', '123'),
-        (TopType.TOP_WIN, 'Фильмы', '123'),
-        (TopType.TOP_ROUNDS, 'Участия', '123'),
-        (TopType.TOP_FRAME, 'Средний кадр', '123.00'),
+        (TopType.TOP_SCORE, ('Очки', 'Очки'), '123'),
+        (TopType.TOP_WIN, ('Фильмы', 'Сериалы'), '123'),
+        (TopType.TOP_ROUNDS, ('Участия', 'Участия'), '123'),
+        (TopType.TOP_FRAME, ('Средний кадр', 'Средний кадр'), '123.00'),
     ],
 )
-def test_top_native_table_preserves_order_and_escapes_names(kind, label, value):
+def test_top_native_table_preserves_order_and_escapes_names(game, kind, labels, value):
+    label = labels[game == 'episode']
     name = '👨‍👩‍👧‍👦 <b>A & "B"</b> @someone https://example.org'
     rich = render_top(
+        game,
         kind,
         [
             SimpleNamespace(name=name, score=123, user_id=5_000_000_123),
@@ -82,48 +89,134 @@ def test_top_native_table_preserves_order_and_escapes_names(kind, label, value):
 
 
 def test_empty_top_and_missing_name_have_explicit_display():
-    empty = render_top(TopType.TOP_SCORE, [])
+    empty = render_top('framed', TopType.TOP_SCORE, [])
     assert TableParser(empty['html']).rows == [['#', 'Имя', 'Очки']]
     assert 'Пока нет результатов' in empty['html']
-    rendered = render_top(TopType.TOP_SCORE, [SimpleNamespace(name=None, score=0)])
+    rendered = render_top('framed', TopType.TOP_SCORE, [SimpleNamespace(name=None, score=0)])
     assert TableParser(rendered['html']).rows[-1] == ['1', '—', '0']
     assert TableParser(rendered['html']).links == []
 
 
-@pytest.mark.parametrize('kind', list(TopType))
-def test_average_frame_explanation_only_appears_for_frame_leaderboard(kind):
-    rich = render_top(kind, [SimpleNamespace(name='User', score=3)])
-    explanation = '<p>Неугаданный фильм = 7 кадров; меньше — лучше.</p>'
-    assert (explanation in rich['html']) is (kind == TopType.TOP_FRAME)
-    if kind == TopType.TOP_FRAME:
-        assert rich['html'].index(explanation) > rich['html'].index('</table>')
+TOP_TEXTS = {
+    ('framed', TopType.TOP_SCORE): (
+        'Топ Framed по очкам',
+        'Бот даёт очки за каждый раунд. Победа на кадре N даёт 7 \u2212 N очков. Кадр 1 даёт 6 очков, '
+        'кадр 6 даёт 1. Проигрыш даёт 1 очко за участие. '
+        'При равных очках выше стоит игрок, у которого больше раундов.',
+    ),
+    ('framed', TopType.TOP_FRAME): (
+        'Топ Framed по среднему кадру',
+        'Бот берёт средний кадр по всем раундам игрока. Неугаданный фильм считается как кадр 7. '
+        'Чем меньше число, тем лучше. В таблицу попадают игроки, у которых не меньше 10 раундов. '
+        'При равенстве выше стоит игрок, у которого больше раундов.',
+    ),
+    ('framed', TopType.TOP_WIN): (
+        'Топ Framed по угаданным фильмам',
+        'Число раундов, в которых игрок угадал фильм. Номер кадра не важен. '
+        'При равенстве выше стоит игрок, у которого больше раундов.',
+    ),
+    ('framed', TopType.TOP_ROUNDS): (
+        'Топ Framed по участиям',
+        'Число раундов, которые игрок прислал боту. Бот считает каждый раунд один раз, повтор не учитывается. '
+        'При равенстве выше стоит игрок, у которого больше побед.',
+    ),
+    ('episode', TopType.TOP_SCORE): (
+        'Топ Episode по очкам',
+        'Бот даёт очки за каждый раунд. Победа на кадре N даёт 11 \u2212 N очков. Кадр 1 даёт 10 очков, '
+        'кадр 10 даёт 1. Проигрыш даёт 1 очко за участие. '
+        'При равных очках выше стоит игрок, у которого больше раундов.',
+    ),
+    ('episode', TopType.TOP_FRAME): (
+        'Топ Episode по среднему кадру',
+        'Бот берёт средний кадр по всем раундам игрока. Неугаданный сериал считается как кадр 11. '
+        'Чем меньше число, тем лучше. В таблицу попадают игроки, у которых не меньше 10 раундов. '
+        'При равенстве выше стоит игрок, у которого больше раундов.',
+    ),
+    ('episode', TopType.TOP_WIN): (
+        'Топ Episode по угаданным сериалам',
+        'Число раундов, в которых игрок угадал сериал. Номер кадра не важен. '
+        'При равенстве выше стоит игрок, у которого больше раундов.',
+    ),
+    ('episode', TopType.TOP_ROUNDS): (
+        'Топ Episode по участиям',
+        'Число раундов, которые игрок прислал боту. Бот считает каждый раунд один раз, повтор не учитывается. '
+        'При равенстве выше стоит игрок, у которого больше побед.',
+    ),
+}
 
 
-def test_personal_stats_show_both_games_and_no_wins_without_fabricated_average():
-    framed = SimpleNamespace(rounds_count=123, rounds_won_count=99, average_frame=1.23456)
-    episode = SimpleNamespace(rounds_count=0, rounds_won_count=0, average_frame=None)
+@pytest.mark.parametrize(('game', 'kind'), list(TOP_TEXTS))
+@pytest.mark.parametrize('results', [[SimpleNamespace(name='User', score=3)], []])
+def test_top_title_and_explanation_match_game_and_metric(game, kind, results):
+    title, explanation = TOP_TEXTS[game, kind]
+    html = render_top(game, kind, results)['html']
+    assert html.startswith(f'<p>{title}</p><table ')
+    assert html.count(f'<p>{explanation}</p>') == 1
+    assert html.index(f'<p>{explanation}</p>') > html.index('</table>')
+    assert html.count('<p>') == 2 + (not results)
+    assert 'кадров; меньше' not in html
+
+
+STATS_NOTE = (
+    '<p>Очки и «Ср. кадр (все)» бот считает так же, как в /top. '
+    'Во Framed промах считается как кадр 7, в Episode как кадр 11. '
+    '«Ср. кадр (победы)» учитывает только угаданные раунды. '
+    'Прочерк значит, что побед или раундов пока нет.</p>'
+)
+
+
+def test_personal_stats_transpose_games_into_columns_without_fabricated_averages():
+    framed = SimpleNamespace(
+        rounds_count=123, rounds_won_count=99, average_frame=1.23456, points=500, average_frame_all=2.5
+    )
+    episode = SimpleNamespace(rounds_count=0, rounds_won_count=0, average_frame=None, points=0, average_frame_all=None)
     rich = render_stats(framed, episode)
+    assert rich['html'].startswith('<p>Твоя статистика</p>')
     assert TableParser(rich['html']).rows == [
-        ['Игра', 'Раунды', 'Победы', 'Средний кадр'],
-        ['framed.wtf', '123', '99', '1.23'],
-        ['episode.wtf', '0', '0', '—'],
+        ['Показатель', 'Framed', 'Episode'],
+        ['Раунды', '123', '0'],
+        ['Победы', '99', '0'],
+        ['Очки', '500', '0'],
+        ['Ср. кадр (победы)', '1.23', '—'],
+        ['Ср. кадр (все)', '2.50', '—'],
     ]
-    assert 'Средний кадр — только по победам' in rich['html']
+
+
+def test_personal_stats_explain_points_and_averages_under_the_table():
+    rich = render_stats(Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
+    assert rich['html'].endswith(STATS_NOTE)
+    assert rich['html'].index(STATS_NOTE) > rich['html'].index('</table>')
+    assert 'Средний кадр — только по победам' not in rich['html']
 
 
 def test_personal_stats_game_names_link_to_the_official_sites():
-    rich = render_stats(Stats(9, 5, 2.4), Stats(4, 0, None))
+    rich = render_stats(Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
     table = TableParser(rich['html'])
     assert table.links == [{'href': 'https://framed.wtf/'}, {'href': 'https://episode.wtf/'}]
-    assert table.rows[1][0] == 'framed.wtf'
-    assert table.rows[2][0] == 'episode.wtf'
+    assert table.rows[0][1:] == ['Framed', 'Episode']
     assert rich['skip_entity_detection'] is True
 
 
+@pytest.mark.parametrize(
+    ('frames', 'rounds', 'wins', 'win_frames', 'expected'),
+    [
+        # Framed: miss = 7. Wins on frames 1 and 3 give 6 + 4 points, 2 misses give 1 point each.
+        (6, 4, 2, 4, Stats(4, 2, 2.0, 12, (4 + 2 * 7) / 4)),
+        # Episode: miss = 11.
+        (10, 3, 1, 2, Stats(3, 1, 2.0, 9 + 2, (2 + 2 * 11) / 3)),
+        (10, 2, 0, 0, Stats(2, 0, None, 2, 11.0)),
+        (6, 0, 0, 0, Stats(0, 0, None, 0, None)),
+    ],
+)
+def test_stats_from_totals_derive_points_and_average_with_misses(frames, rounds, wins, win_frames, expected):
+    assert Stats.from_totals(rounds, wins, win_frames, frames=frames) == expected
+
+
 class TelegramRequest(BaseRequest):
-    def __init__(self, *, private_lookup_fails=False):
+    def __init__(self, *, private_lookup_fails=False, edit_error=None):
         self.calls = []
         self.private_lookup_fails = private_lookup_fails
+        self.edit_error = edit_error
 
     @property
     def read_timeout(self):
@@ -148,6 +241,8 @@ class TelegramRequest(BaseRequest):
         endpoint = url.rsplit('/', 1)[-1]
         parameters = request_data.json_parameters if request_data else {}
         self.calls.append((endpoint, parameters))
+        if endpoint == 'editMessageText' and self.edit_error:
+            return 400, json.dumps({'ok': False, 'error_code': 400, 'description': self.edit_error}).encode()
         if endpoint == 'getMe':
             result = {'id': 1, 'is_bot': True, 'first_name': 'Test', 'username': 'test_bot'}
         elif endpoint == 'getChat':
@@ -207,6 +302,72 @@ def make_context(request, *, job_queue=True):
     return ContextTypes.DEFAULT_TYPE(application)
 
 
+def keyboard_rows(reply_markup):
+    return [[(button['text'], button['callback_data']) for button in row] for row in reply_markup['inline_keyboard']]
+
+
+@pytest.mark.parametrize(
+    ('game', 'kind', 'expected'),
+    [
+        (
+            'framed',
+            TopType.TOP_SCORE,
+            [
+                [('• Framed', 'top:framed:1'), ('Episode', 'top:episode:1')],
+                [
+                    ('• Очки', 'top:framed:1'),
+                    ('Кадры', 'top:framed:2'),
+                    ('Фильмы', 'top:framed:3'),
+                    ('Участия', 'top:framed:4'),
+                ],
+            ],
+        ),
+        (
+            'episode',
+            TopType.TOP_WIN,
+            [
+                [('Framed', 'top:framed:3'), ('• Episode', 'top:episode:3')],
+                [
+                    ('Очки', 'top:episode:1'),
+                    ('Кадры', 'top:episode:2'),
+                    ('• Сериалы', 'top:episode:3'),
+                    ('Участия', 'top:episode:4'),
+                ],
+            ],
+        ),
+    ],
+)
+def test_top_keyboard_marks_active_game_and_metric_and_keeps_metric_on_game_switch(game, kind, expected):
+    assert keyboard_rows(main.top_reply_markup(game, kind).to_dict()) == expected
+
+
+def test_top_callback_pattern_accepts_only_compact_format():
+    pattern = re.compile(main.TOP_CALLBACK_PATTERN)
+    for game in ('framed', 'episode'):
+        for kind in TopType:
+            assert pattern.fullmatch(main.top_callback_data(game, kind))
+    for data in ('top:framed:0', 'top:framed:5', 'top:other:1', 'top:framed:1 ', 'xtop:framed:1', '{"top": 1}'):
+        assert not pattern.search(data)
+    legacy = re.compile(main.LEGACY_TOP_CALLBACK_PATTERN)
+    assert legacy.search('{"top": 2}')
+    assert not legacy.search('top:framed:2')
+
+
+def test_application_registers_new_and_legacy_top_callbacks(monkeypatch):
+    monkeypatch.setattr(main, 'BOT_TOKEN', '123:synthetic-only')
+    application = main.build_application()
+    handlers = {
+        handler.callback: handler.pattern.pattern
+        for group in application.handlers.values()
+        for handler in group
+        if isinstance(handler, CallbackQueryHandler) and isinstance(handler.pattern, re.Pattern)
+    }
+    assert handlers == {
+        main.inline_top: main.TOP_CALLBACK_PATTERN,
+        main.ignore_legacy_top: main.LEGACY_TOP_CALLBACK_PATTERN,
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('chat_type', 'private_lookup_fails'),
@@ -219,28 +380,27 @@ async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(
     context = make_context(request)
     results = [SimpleNamespace(name='A < B 👨‍👩‍👧‍👦', score=42, user_id=5_000_000_123)]
     query = AsyncMock(return_value=results)
-    monkeypatch.setattr(main.FramedResult, 'top_score', query)
+    monkeypatch.setattr(main, 'top_results', query)
     limiter = context.bot.rate_limiter
     process = AsyncMock(wraps=limiter.process_request)
     monkeypatch.setattr(type(limiter), 'process_request', process)
     async with context.bot:
         await main.top(command_update('/top', chat_type=chat_type), context)
-    query.assert_awaited_once_with()
+    query.assert_awaited_once_with('framed', TopType.TOP_SCORE)
     endpoint, params = next(call for call in request.calls if call[0] == 'sendRichMessage')
     assert endpoint == 'sendRichMessage'
     uses_group_lookup = private_lookup_fails and chat_type in ('group', 'supergroup')
     profile_url = 'https://t.me/fresh_owner?profile'
     if private_lookup_fails:
         profile_url = 'https://t.me/group_owner?profile' if uses_group_lookup else 'tg://user?id=5000000123'
-    expected = render_top(TopType.TOP_SCORE, results)
+    expected = render_top('framed', TopType.TOP_SCORE, results)
     expected['html'] = expected['html'].replace('tg://user?id=5000000123', profile_url)
     assert json.loads(params['rich_message']) == expected
     assert TableParser(json.loads(params['rich_message'])['html']).links == [{'href': profile_url}]
     assert json.loads(params['reply_parameters']) == {'message_id': 456}
     assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
     assert 'text' not in params and 'entities' not in params and 'parse_mode' not in params
-    buttons = json.loads(params['reply_markup'])['inline_keyboard'][0]
-    assert {json.loads(button['callback_data'])['top'] for button in buttons} == {2, 3, 4}
+    assert json.loads(params['reply_markup']) == main.top_reply_markup('framed', TopType.TOP_SCORE).to_dict()
     assert any(call.kwargs['endpoint'] == 'sendRichMessage' for call in process.await_args_list)
     assert any(call.kwargs['endpoint'] == 'getChat' for call in process.await_args_list)
     assert sum(endpoint == 'getChat' for endpoint, _params in request.calls) == 1
@@ -251,43 +411,51 @@ async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(
         assert any(call.kwargs['endpoint'] == 'getChatMember' for call in process.await_args_list)
 
 
+def top_callback(context, data, *, chat_type='group', shown=('framed', TopType.TOP_SCORE)):
+    """A callback on a bot message that shows the leaderboard `shown`, or has no keyboard when it is None."""
+    chat_id = 99 if chat_type == 'private' else -123
+    message = Message(
+        456,
+        datetime.now(UTC),
+        Chat(chat_id, chat_type),
+        from_user=User(1, 'Bot', True),
+        reply_markup=main.top_reply_markup(*shown) if shown else None,
+    )
+    callback = CallbackQuery('sort-query', User(99, 'Test', False), 'instance', message=message, data=data)
+    callback.set_bot(context.bot)
+    return Update(2, callback_query=callback)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ('chat_type', 'private_lookup_fails'),
     [('group', False), ('group', True), ('supergroup', True), ('private', True), ('channel', True)],
 )
 @pytest.mark.parametrize(
-    ('kind', 'query_name'),
+    ('game', 'kind', 'shown'),
     [
-        (TopType.TOP_SCORE, 'top_score'),
-        (TopType.TOP_FRAME, 'top_average_frame'),
-        (TopType.TOP_WIN, 'top_won'),
-        (TopType.TOP_ROUNDS, 'top_rounds'),
+        ('framed', TopType.TOP_FRAME, ('framed', TopType.TOP_SCORE)),
+        ('framed', TopType.TOP_WIN, ('framed', TopType.TOP_SCORE)),
+        ('framed', TopType.TOP_ROUNDS, ('framed', TopType.TOP_SCORE)),
+        ('episode', TopType.TOP_SCORE, ('framed', TopType.TOP_SCORE)),
+        ('framed', TopType.TOP_SCORE, ('episode', TopType.TOP_SCORE)),
+        ('episode', TopType.TOP_FRAME, ('episode', TopType.TOP_WIN)),
+        ('episode', TopType.TOP_ROUNDS, None),
     ],
 )
 async def test_sort_callback_edits_native_table_in_place_and_acknowledges(
-    monkeypatch, kind, query_name, chat_type, private_lookup_fails
+    monkeypatch, game, kind, shown, chat_type, private_lookup_fails
 ):
     request = TelegramRequest(private_lookup_fails=private_lookup_fails)
     context = make_context(request)
     results = [SimpleNamespace(name='Имя & 李', score=2, user_id=5_000_000_123)]
-    queries = {}
-    for name in ('top_score', 'top_average_frame', 'top_won', 'top_rounds'):
-        queries[name] = AsyncMock(return_value=results)
-        monkeypatch.setattr(main.FramedResult, name, queries[name])
-    command = command_update('/top', chat_type=chat_type)
-    callback = CallbackQuery(
-        'sort-query', command.effective_user, 'instance', message=command.message, data=json.dumps({'top': kind})
-    )
-    callback.set_bot(context.bot)
+    query = AsyncMock(return_value=results)
+    monkeypatch.setattr(main, 'top_results', query)
+    update = top_callback(context, f'top:{game}:{kind.value}', chat_type=chat_type, shown=shown)
     async with context.bot:
         with pytest.warns(PTBUserWarning, match='editMessageText'):
-            await main.inline_top(Update(2, callback_query=callback), context)
-    for name, query in queries.items():
-        if name == query_name:
-            query.assert_awaited_once_with()
-        else:
-            query.assert_not_awaited()
+            await main.inline_top(update, context)
+    query.assert_awaited_once_with(game, kind)
     params = next(params for endpoint, params in request.calls if endpoint == 'editMessageText')
     assert params['message_id'] == '456'
     assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
@@ -295,13 +463,12 @@ async def test_sort_callback_edits_native_table_in_place_and_acknowledges(
     profile_url = 'https://t.me/fresh_owner?profile'
     if private_lookup_fails:
         profile_url = 'https://t.me/group_owner?profile' if uses_group_lookup else 'tg://user?id=5000000123'
-    expected = render_top(kind, results)
+    expected = render_top(game, kind, results)
     expected['html'] = expected['html'].replace('tg://user?id=5000000123', profile_url)
     assert json.loads(params['rich_message']) == expected
     assert TableParser(json.loads(params['rich_message'])['html']).links == [{'href': profile_url}]
     assert 'text' not in params and 'entities' not in params
-    buttons = json.loads(params['reply_markup'])['inline_keyboard'][0]
-    assert {json.loads(button['callback_data'])['top'] for button in buttons} == set(TopType) - {kind}
+    assert json.loads(params['reply_markup']) == main.top_reply_markup(game, kind).to_dict()
     assert [endpoint for endpoint, _ in request.calls][-1] == 'answerCallbackQuery'
     assert not any(endpoint == 'sendRichMessage' for endpoint, _ in request.calls)
     assert sum(endpoint == 'getChat' for endpoint, _params in request.calls) == 1
@@ -312,11 +479,91 @@ async def test_sort_callback_edits_native_table_in_place_and_acknowledges(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('shown', [('framed', TopType.TOP_SCORE), ('episode', TopType.TOP_FRAME)])
+async def test_tap_on_active_button_only_acknowledges(monkeypatch, shown):
+    request = TelegramRequest()
+    context = make_context(request)
+    query = AsyncMock()
+    monkeypatch.setattr(main, 'top_results', query)
+    update = top_callback(context, main.top_callback_data(*shown), shown=shown)
+    async with context.bot:
+        await main.inline_top(update, context)
+    query.assert_not_awaited()
+    assert [endpoint for endpoint, _ in request.calls if endpoint != 'getMe'] == ['answerCallbackQuery']
+
+
+def test_top_type_lives_in_neutral_module_only():
+    assert TopType.__module__ == 'top_type'
+    assert rich_tables.TopType is TopType
+
+
+@pytest.mark.parametrize(
+    ('rows', 'expected'),
+    [
+        (
+            [[('• Framed', 'top:framed:2'), ('Episode', 'top:episode:2')], [('• Кадры', 'top:framed:2')]],
+            ('framed', TopType.TOP_FRAME),
+        ),
+        ([[('• Framed', 'top:framed:2'), ('Episode', 'top:episode:2')], [('• Очки', 'top:framed:1')]], None),
+        ([[('• Framed', 'top:framed:2'), ('• Episode', 'top:episode:2')]], None),
+        ([[('• Framed', 'top:framed:2')], [('• Кадры', 'top:other:2')]], None),
+        ([[('Framed', 'top:framed:2')]], None),
+    ],
+    ids=['same', 'different-metric', 'two-active-games', 'one-unparsable', 'no-active'],
+)
+def test_shown_top_needs_all_active_buttons_to_agree(rows, expected):
+    markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in rows]
+    )
+    message = Message(456, datetime.now(UTC), Chat(-123, 'group'), reply_markup=markup)
+    assert main.shown_top(message) == expected
+
+
+@pytest.mark.asyncio
+async def test_unmodified_message_error_is_ignored_and_callback_answered(monkeypatch):
+    request = TelegramRequest(edit_error='Bad Request: message is not modified')
+    context = make_context(request)
+    monkeypatch.setattr(main, 'top_results', AsyncMock(return_value=[]))
+    update = top_callback(context, 'top:episode:1')
+    async with context.bot:
+        with pytest.warns(PTBUserWarning, match='editMessageText'):
+            await main.inline_top(update, context)
+    endpoints = [endpoint for endpoint, _ in request.calls]
+    assert endpoints[-2:] == ['editMessageText', 'answerCallbackQuery']
+
+
+@pytest.mark.asyncio
+async def test_other_edit_error_propagates_after_callback_answer(monkeypatch):
+    request = TelegramRequest(edit_error='Bad Request: message to edit not found')
+    context = make_context(request)
+    monkeypatch.setattr(main, 'top_results', AsyncMock(return_value=[]))
+    update = top_callback(context, 'top:episode:1')
+    async with context.bot:
+        with pytest.warns(PTBUserWarning, match='editMessageText'), pytest.raises(BadRequest, match='not found'):
+            await main.inline_top(update, context)
+    endpoints = [endpoint for endpoint, _ in request.calls]
+    assert endpoints[-2:] == ['editMessageText', 'answerCallbackQuery']
+
+
+@pytest.mark.asyncio
+async def test_legacy_top_button_only_acknowledges(monkeypatch):
+    request = TelegramRequest()
+    context = make_context(request)
+    query = AsyncMock()
+    monkeypatch.setattr(main, 'top_results', query)
+    update = top_callback(context, json.dumps({'top': 2}), shown=None)
+    async with context.bot:
+        await main.ignore_legacy_top(update, context)
+    query.assert_not_awaited()
+    assert [endpoint for endpoint, _ in request.calls if endpoint != 'getMe'] == ['answerCallbackQuery']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('has_job_queue', [True, False])
 async def test_stats_uses_read_only_aggregate_and_preserves_thirty_second_deletion(monkeypatch, has_job_queue):
     request = TelegramRequest()
     context = make_context(request, job_queue=has_job_queue)
-    aggregates = (Stats(9, 5, 2.4), Stats(4, 0, None))
+    aggregates = (Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
     get_stats = AsyncMock(return_value=aggregates)
     monkeypatch.setattr(main, 'get_user_stats', get_stats)
     update_user = AsyncMock()
@@ -363,7 +610,7 @@ async def test_unknown_stats_user_keeps_existing_reply(monkeypatch):
 @pytest.mark.parametrize('user_id', [None, 0, -1, True, False, '123', '1" onclick="evil', 1.5])
 def test_profile_link_invalid_ids_remain_escaped_plain_names(user_id):
     name = '<a href="https://evil.invalid/">name</a> & "quoted" 👩‍💻'
-    rich = render_top(TopType.TOP_SCORE, [SimpleNamespace(name=name, score=1, user_id=user_id)])
+    rich = render_top('framed', TopType.TOP_SCORE, [SimpleNamespace(name=name, score=1, user_id=user_id)])
     table = TableParser(rich['html'])
     assert table.rows[-1] == ['1', name, '1']
     assert table.links == []
@@ -372,7 +619,7 @@ def test_profile_link_invalid_ids_remain_escaped_plain_names(user_id):
 
 def test_profile_link_escapes_name_instead_of_accepting_markup():
     name = '</a><script>evil()</script><a href="https://evil.invalid/">'
-    rich = render_top(TopType.TOP_SCORE, [SimpleNamespace(name=name, score=1, user_id=42)])
+    rich = render_top('framed', TopType.TOP_SCORE, [SimpleNamespace(name=name, score=1, user_id=42)])
     table = TableParser(rich['html'])
     assert table.rows[-1] == ['1', name, '1']
     assert table.links == [{'href': 'tg://user?id=42'}]

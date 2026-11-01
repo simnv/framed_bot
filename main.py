@@ -1,7 +1,6 @@
 # ruff: noqa: E402
 # Configure redaction before importing configuration, models, or Telegram.
 import asyncio
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -59,9 +58,11 @@ from models import FramedResult, User
 from models.episode_result import EpisodeResult
 from models.group import Group
 from models.migrate import upgrade_database
+from models.top import top_results
 from reaction_delivery import ReactionDelivery, ReactionIntent
-from rich_tables import TopType, enrich_top_profiles, render_stats, render_top, send_rich_message
+from rich_tables import TOP_WIN_LABELS, enrich_top_profiles, render_stats, render_top, send_rich_message
 from stats import get_user_stats
+from top_type import TopType
 
 framed_pattern = r'Framed #(?P<round>[\d]+)\n🎥(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){6})\n\nhttps:\/\/framed\.wtf'
 episode_pattern = r'Episode #(?P<round>[\d]+)\n📺(?P<result>(?: 🟥| 🟩| ⬛| ⬛️){10})\n\nhttps:\/\/episode\.wtf'
@@ -391,11 +392,7 @@ async def set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     application = answer_application_for(context.application)
     args = context.args or []
     game = parse_game(args[0]) if len(args) == 3 else None
-    if (
-        game is None
-        or re.fullmatch(r'[0-9]{1,10}', args[1]) is None
-        or re.fullmatch(r'[0-9]{1,9}', args[2]) is None
-    ):
+    if game is None or re.fullmatch(r'[0-9]{1,10}', args[1]) is None or re.fullmatch(r'[0-9]{1,9}', args[2]) is None:
         await context.bot.send_message(chat_id=chat.id, text=set_title_usage)
         return
     round_number, tmdb_id = int(args[1]), int(args[2])
@@ -464,22 +461,62 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 break
 
 
-def top_reply_markup(top_type: TopType):
-    type_to_text = {
-        TopType.TOP_SCORE: 'По очкам',
-        TopType.TOP_ROUNDS: 'По участиям',
-        TopType.TOP_FRAME: 'По кадрам',
-        TopType.TOP_WIN: 'По фильмам',
+TOP_GAME_BUTTONS: dict[Game, str] = {'framed': 'Framed', 'episode': 'Episode'}
+TOP_CALLBACK_PATTERN = r'^top:(framed|episode):([1-4])$'
+# Buttons of the JSON format, for example {"top": 2}, stay in old messages. The bot ignores them.
+LEGACY_TOP_CALLBACK_PATTERN = r'^{"top": [\d]+}$'
+ACTIVE_MARK = '• '
+
+
+def top_callback_data(game: Game, top_type: TopType) -> str:
+    return f'top:{game}:{top_type.value}'
+
+
+def parse_top_callback(data: str) -> tuple[Game, TopType] | None:
+    match = re.fullmatch(TOP_CALLBACK_PATTERN, data)
+    if match is None:
+        return None
+    game = parse_game(match.group(1))
+    return (game, TopType(int(match.group(2)))) if game else None
+
+
+def top_reply_markup(game: Game, top_type: TopType) -> InlineKeyboardMarkup:
+    metric_labels = {
+        TopType.TOP_SCORE: 'Очки',
+        TopType.TOP_FRAME: 'Кадры',
+        TopType.TOP_WIN: TOP_WIN_LABELS[game],
+        TopType.TOP_ROUNDS: 'Участия',
     }
+
+    def button(label: str, active: bool, data: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(f'{ACTIVE_MARK}{label}' if active else label, callback_data=data)
+
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(type_to_text[_type], callback_data=json.dumps({'top': _type}))
-                for _type in type_to_text
-                if _type != top_type
-            ]
+                button(label, _game == game, top_callback_data(_game, top_type))
+                for _game, label in TOP_GAME_BUTTONS.items()
+            ],
+            [
+                button(label, _type == top_type, top_callback_data(game, _type))
+                for _type, label in metric_labels.items()
+            ],
         ]
     )
+
+
+def shown_top(message: TelegramMessage) -> tuple[Game, TopType] | None:
+    """Find the leaderboard that a message shows. All active buttons must point to the same leaderboard."""
+    markup = message.reply_markup
+    if markup is None:
+        return None
+    shown = {
+        parse_top_callback(button.callback_data) if isinstance(button.callback_data, str) else None
+        for row in markup.inline_keyboard
+        for button in row
+        if button.text.startswith(ACTIVE_MARK)
+    }
+    return shown.pop() if len(shown) == 1 else None
 
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,7 +524,9 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if effective_chat is None or message is None:
         return
-    results = await FramedResult.top_score()
+    game: Game = 'framed'
+    top_type = TopType.TOP_SCORE
+    results = await top_results(game, top_type)
     profiles = await enrich_top_profiles(
         context.bot,
         results,
@@ -496,9 +535,9 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_rich_message(
         context.bot,
         effective_chat.id,
-        render_top(TopType.TOP_SCORE, profiles),
+        render_top(game, top_type, profiles),
         reply_to_message_id=message.id,
-        reply_markup=top_reply_markup(TopType.TOP_SCORE),
+        reply_markup=top_reply_markup(game, top_type),
     )
 
 
@@ -506,41 +545,42 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is None or query.data is None:
         return
-    data = json.loads(query.data)
-    top_type = TopType(data['top'])
-    results = []
-    match top_type:
-        case TopType.TOP_WIN:
-            results = await FramedResult.top_won()
-        case TopType.TOP_FRAME:
-            results = await FramedResult.top_average_frame()
-        case TopType.TOP_SCORE:
-            results = await FramedResult.top_score()
-        case TopType.TOP_ROUNDS:
-            results = await FramedResult.top_rounds()
-
+    selected = parse_top_callback(query.data)
     query_message = query.message
-    if not isinstance(query_message, TelegramMessage):
+    if selected is None or not isinstance(query_message, TelegramMessage) or shown_top(query_message) == selected:
         await query.answer()
         return
+    game, top_type = selected
+    results = await top_results(game, top_type)
     profiles = await enrich_top_profiles(
         context.bot,
         results,
         group_chat_id=query_message.chat_id if query_message.chat.type in ('group', 'supergroup') else None,
     )
-    # PTB's typed edit_message_text still requires text; the public API bridge
-    # allows the new rich_message parameter without sending a plain text field.
-    await context.bot.do_api_request(
-        'editMessageText',
-        api_kwargs={
-            'chat_id': query_message.chat_id,
-            'message_id': query_message.message_id,
-            'rich_message': render_top(top_type, profiles),
-            'reply_markup': top_reply_markup(top_type),
-        },
-    )
+    try:
+        # PTB's typed edit_message_text still requires text; the public API bridge
+        # allows the new rich_message parameter without sending a plain text field.
+        await context.bot.do_api_request(
+            'editMessageText',
+            api_kwargs={
+                'chat_id': query_message.chat_id,
+                'message_id': query_message.message_id,
+                'rich_message': render_top(game, top_type, profiles),
+                'reply_markup': top_reply_markup(game, top_type),
+            },
+        )
+    except BadRequest as error:
+        # Two fast taps can ask for the same leaderboard. Telegram then rejects the second edit.
+        if 'message is not modified' not in str(error).lower():
+            raise
+    finally:
+        await query.answer()
 
-    await query.answer()
+
+async def ignore_legacy_top(update: Update, _context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is not None:
+        await query.answer()
 
 
 async def initialize_database(
@@ -612,8 +652,11 @@ def build_application() -> ReactionApplication:
     top_handler = CommandHandler('top', top, block=False)
     application.add_handler(top_handler)
 
-    inline_top_handler = CallbackQueryHandler(inline_top, pattern=r'^{"top": [\d]+}$', block=False)
+    inline_top_handler = CallbackQueryHandler(inline_top, pattern=TOP_CALLBACK_PATTERN, block=False)
     application.add_handler(inline_top_handler)
+
+    legacy_top_handler = CallbackQueryHandler(ignore_legacy_top, pattern=LEGACY_TOP_CALLBACK_PATTERN, block=False)
+    application.add_handler(legacy_top_handler)
 
     return application
 

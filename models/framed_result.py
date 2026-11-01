@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from sqlalchemy import Float, ForeignKey, Integer, Select, UniqueConstraint, case, cast, desc, func, text
+from sqlalchemy import ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import AsyncScopedSession, Base
-from .user import User
 
 
 class FramedResult(Base):
@@ -30,69 +29,3 @@ class FramedResult(Base):
             saved = result.scalar_one_or_none() is not None
             await session.commit()
             return saved
-
-    @staticmethod
-    async def top_score():
-        async with AsyncScopedSession() as session:
-            result = await session.execute(
-                Select(
-                    FramedResult.user_id.label('user_id'),
-                    User.full_name.label('name'),
-                    func.sum(case((FramedResult.won.is_(True), 7 - FramedResult.win_frame), else_=1)).label('score'),
-                )
-                .select_from(FramedResult)
-                .join(User, User.id == FramedResult.user_id)
-                .group_by(FramedResult.user_id, User.full_name)
-                .order_by(desc(text('score')))
-                .limit(10)
-            )
-            return result.all()
-
-    @staticmethod
-    async def top_average_frame():
-        async with AsyncScopedSession() as session:
-            result = await session.execute(
-                Select(
-                    FramedResult.user_id.label('user_id'),
-                    User.full_name.label('name'),
-                    func.avg(cast(case((FramedResult.won.is_(True), FramedResult.win_frame), else_=7), Float)).label(
-                        'score'
-                    ),
-                )
-                .select_from(FramedResult)
-                .join(User, User.id == FramedResult.user_id)
-                .group_by(FramedResult.user_id, User.full_name)
-                .order_by(text('score'))
-                .limit(10)
-            )
-            return result.all()
-
-    @staticmethod
-    async def top_rounds():
-        async with AsyncScopedSession() as session:
-            result = await session.execute(
-                Select(FramedResult.user_id.label('user_id'), User.full_name.label('name'), func.count().label('score'))
-                .select_from(FramedResult)
-                .join(User, User.id == FramedResult.user_id)
-                .group_by(FramedResult.user_id, User.full_name)
-                .order_by(desc(text('score')))
-                .limit(10)
-            )
-            return result.all()
-
-    @staticmethod
-    async def top_won():
-        async with AsyncScopedSession() as session:
-            result = await session.execute(
-                Select(
-                    FramedResult.user_id.label('user_id'),
-                    User.full_name.label('name'),
-                    func.sum(cast(FramedResult.won, Integer)).label('score'),
-                )
-                .select_from(FramedResult)
-                .join(User, User.id == FramedResult.user_id)
-                .group_by(FramedResult.user_id, User.full_name)
-                .order_by(desc(text('score')))
-                .limit(10)
-            )
-            return result.all()

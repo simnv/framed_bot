@@ -9,6 +9,8 @@ type MatchStatus = Literal['site', 'auto', 'visual', 'low_confidence', 'unmatche
 
 GAMES: Final[tuple[Game, ...]] = ('framed', 'episode')
 KIND_BY_GAME: Final[dict[Game, Kind]] = {'framed': 'movie', 'episode': 'tv'}
+# Frames that a player can open in one round.
+FRAMES: Final[dict[Game, int]] = {'framed': 6, 'episode': 10}
 # Round 1 dates. Framed has one round each day, Episode one round each week.
 FIRST_DAY: Final[dict[Game, date]] = {'framed': date(2022, 3, 12), 'episode': date(2022, 9, 5)}
 DAYS_PER_ROUND: Final[dict[Game, int]] = {'framed': 1, 'episode': 7}

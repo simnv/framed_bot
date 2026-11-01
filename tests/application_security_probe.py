@@ -162,22 +162,31 @@ async def aggregate_stats():
     assert len(sent) == 1
     rich = sent[0]['rich_message']
     assert rich['skip_entity_detection'] is True
-    for game in ('framed.wtf', 'episode.wtf'):
-        assert f'<td><a href="https://{game}/">{game}</a></td><td>600</td><td>300</td><td>2.00</td>' in rich['html']
+    headers = '<th><a href="https://framed.wtf/">Framed</a></th><th><a href="https://episode.wtf/">Episode</a></th>'
+    assert headers in rich['html']
+    # 300 wins on frame 2 and 300 misses per game; a miss is frame 7 in Framed and frame 11 in Episode.
+    for label, framed, episode in (
+        ('Раунды', '600', '600'),
+        ('Победы', '300', '300'),
+        ('Очки', '1800', '3000'),
+        ('Ср. кадр (победы)', '2.00', '2.00'),
+        ('Ср. кадр (все)', '4.50', '6.50'),
+    ):
+        assert f'<tr><td>{label}</td><td>{framed}</td><td>{episode}</td></tr>' in rich['html']
     assert sum(max(0, count) for count in fetched) <= 3, f'/stats materialized history rows: {fetched}'
     assert len(statements) <= 3
     assert await stats_module.get_user_stats(USER_ID + 1) is None
     await User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Empty', False))
     assert await stats_module.get_user_stats(USER_ID + 1) == (
-        stats_module.Stats(0, 0, None),
-        stats_module.Stats(0, 0, None),
+        stats_module.Stats(0, 0, None, 0, None),
+        stats_module.Stats(0, 0, None, 0, None),
     )
     async with engine.begin() as conn:
         await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=1, won=False, win_frame=None))
         await conn.execute(insert(EpisodeResult).values(user_id=USER_ID + 1, framed_round=1, won=True, win_frame=3))
     assert await stats_module.get_user_stats(USER_ID + 1) == (
-        stats_module.Stats(1, 0, None),
-        stats_module.Stats(1, 1, 3.0),
+        stats_module.Stats(1, 0, None, 1, 7.0),
+        stats_module.Stats(1, 1, 3.0, 8, 3.0),
     )
     async with engine.begin() as conn:
         await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=2, won=True, win_frame=None))

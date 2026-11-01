@@ -1,10 +1,9 @@
 import dataclasses
-from collections.abc import Sequence
-from typing import override
 
 from sqlalchemy import func, select
 
-from models.db import AsyncScopedSession, ResultForStats
+from answers import FRAMES
+from models.db import AsyncScopedSession
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.user import User
@@ -15,31 +14,28 @@ class Stats:
     rounds_count: int
     rounds_won_count: int
     average_frame: float | None
+    points: int
+    average_frame_all: float | None
+
+    @classmethod
+    def from_totals(cls, rounds: int, wins: int, win_frames: int, *, frames: int) -> Stats:
+        """Score like /top: a win earns (frames + 1 - win_frame), a miss earns 1 and counts as frame frames + 1."""
+        miss_frame = frames + 1
+        losses = rounds - wins
+        return cls(
+            rounds_count=rounds,
+            rounds_won_count=wins,
+            average_frame=win_frames / wins if wins else None,
+            points=wins * miss_frame - win_frames + losses,
+            average_frame_all=(win_frames + losses * miss_frame) / rounds if rounds else None,
+        )
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
 class MissingWinFrameError(Exception):
-    result_index: int | None
+    """A won result has no win frame, so the bot cannot give a correct average."""
 
-    @override
-    def __str__(self) -> str:
-        if self.result_index is None:
-            return 'winning result has no win_frame'
-        return f'winning result at index {self.result_index} has no win_frame'
-
-
-async def count_stats(results: Sequence[ResultForStats]) -> Stats:
-    rounds_count = len(results)
-    rounds_won = [result for result in results if result.won]
-    rounds_won_count = len(rounds_won)
-    total_frames = 0
-    for result_index, result in enumerate(rounds_won):
-        if result.win_frame is None:
-            raise MissingWinFrameError(result_index=result_index)
-        total_frames += result.win_frame
-    average_frame = (total_frames / rounds_won_count) if rounds_won_count else None
-
-    return Stats(rounds_count=rounds_count, rounds_won_count=rounds_won_count, average_frame=average_frame)
+    def __init__(self) -> None:
+        super().__init__('winning result has no win_frame')
 
 
 async def get_user_stats(user_id: int) -> tuple[Stats, Stats] | None:
@@ -48,8 +44,8 @@ async def get_user_stats(user_id: int) -> tuple[Stats, Stats] | None:
         if (await session.execute(select(User.id).where(User.id == user_id))).scalar_one_or_none() is None:
             return None
         game_stats: list[Stats] = []
-        for model in (FramedResult, EpisodeResult):
-            rounds, wins, frames, missing = (
+        for model, frames in ((FramedResult, FRAMES['framed']), (EpisodeResult, FRAMES['episode'])):
+            rounds, wins, win_frames, missing = (
                 await session.execute(
                     select(
                         func.count(model.id),
@@ -60,6 +56,6 @@ async def get_user_stats(user_id: int) -> tuple[Stats, Stats] | None:
                 )
             ).one()
             if missing:
-                raise MissingWinFrameError(result_index=None)
-            game_stats.append(Stats(rounds, wins, (frames or 0) / wins if wins else None))
+                raise MissingWinFrameError
+            game_stats.append(Stats.from_totals(rounds, wins, win_frames or 0, frames=frames))
         return game_stats[0], game_stats[1]
