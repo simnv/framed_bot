@@ -23,7 +23,7 @@ TOP_LIMIT: Final = 10
 MIN_ROUNDS_FOR_AVERAGE: Final = 10
 
 
-def top_statement(game: Game, top_type: TopType) -> Select[int, str, Any]:
+def top_statement(game: Game, top_type: TopType, limit: int | None = TOP_LIMIT) -> Select[int, str, Any]:
     """Return the ranked rows (user_id, name, score) of one leaderboard."""
     model = MODELS[game]
     miss = FRAMES[game] + 1
@@ -49,7 +49,7 @@ def top_statement(game: Game, top_type: TopType) -> Select[int, str, Any]:
     # A lower average frame is better; for the other metrics a higher number is better.
     primary = score.asc() if top_type == TopType.TOP_FRAME else score.desc()
     secondary = wins if top_type == TopType.TOP_ROUNDS else rounds
-    return statement.order_by(primary, secondary.desc(), User.full_name.asc(), model.user_id.asc()).limit(TOP_LIMIT)
+    return statement.order_by(primary, secondary.desc(), User.full_name.asc(), model.user_id.asc()).limit(limit)
 
 
 async def top_results(game: Game, top_type: TopType) -> Sequence[Row[int, str, Any]]:
