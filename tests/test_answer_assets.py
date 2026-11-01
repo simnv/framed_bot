@@ -129,3 +129,33 @@ async def test_fetch_asset_raises_throttled_and_pauses_the_site_group() -> None:
 
     await limiter.wait()
     assert clock[0] == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+async def test_fetch_asset_does_not_follow_redirects_of_a_redirect_enabled_client() -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(302, headers={'Location': 'https://core.framed.wtf/titleshot/challenges/day/1'})
+        return httpx.Response(200, json=body(day=1))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+    with pytest.raises(AssetError):
+        await fetch_asset(client, RateLimiter(1000), 'titleshot', 1)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('day', [True, 1.0])
+def test_parse_asset_rejects_a_day_that_is_not_an_int(day: Any) -> None:
+    with pytest.raises(AssetError):
+        parse_asset('titleshot', 1, body(day=day))
+
+
+@pytest.mark.parametrize('imdb_id', ['tt１２３', 'tt١٢٣'])
+def test_parse_asset_rejects_non_ascii_imdb_digits(imdb_id: str) -> None:
+    with pytest.raises(AssetError):
+        parse_asset('titleshot', 7, body(imdb_id=imdb_id))

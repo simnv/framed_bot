@@ -3,7 +3,7 @@
 import re
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeIs
 
 import httpx
 
@@ -17,7 +17,7 @@ MODE_FIRST_DAY: Final[dict[Mode, date]] = {'titleshot': date(2025, 6, 5), 'poste
 CORE: Final = 'https://core.framed.wtf'
 HEADERS: Final = {'User-Agent': 'framed-bot/1.0', 'Accept': 'application/json'}
 TIMEOUT: Final = 20.0
-IMDB_ID = re.compile(r'tt\d{1,10}')
+IMDB_ID = re.compile(r'tt[0-9]{1,10}')
 
 
 class AssetError(RuntimeError):
@@ -39,17 +39,24 @@ def current_mode_day(mode: Mode, today: date) -> int:
     return (today - first).days + 1 if today >= first else 0
 
 
+def _is_int(value: object) -> TypeIs[int]:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _positive(value: object) -> int | None:
     if value is None:
         return None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+    if not _is_int(value) or value < 1:
         raise AssetError('Asset id has an unexpected type')
     return value
 
 
 def parse_asset(mode: Mode, day: int, data: object) -> Asset:
     """Map a challenge response. Raise AssetError when a field has an unexpected type."""
-    if not isinstance(data, dict) or data.get('day') != day or not isinstance(data.get('asset'), dict):
+    if not isinstance(data, dict):
+        raise AssetError(f'{mode} day {day} has an unexpected shape')
+    received = data.get('day')
+    if not _is_int(received) or received != day or not isinstance(data.get('asset'), dict):
         raise AssetError(f'{mode} day {day} has an unexpected shape')
     asset: dict[str, Any] = data['asset']
     imdb_id = asset.get('imdb_id')
@@ -69,7 +76,9 @@ async def fetch_asset(client: httpx.AsyncClient, limiter: RateLimiter, mode: Mod
     """
     await limiter.wait()
     try:
-        response = await client.get(f'{CORE}/{mode}/challenges/day/{day}', headers=HEADERS, timeout=TIMEOUT)
+        response = await client.get(
+            f'{CORE}/{mode}/challenges/day/{day}', headers=HEADERS, timeout=TIMEOUT, follow_redirects=False
+        )
     except httpx.HTTPError as error:
         raise AssetError(f'{mode} day {day} request failed: {type(error).__name__}') from None
     if response.status_code == 404:
