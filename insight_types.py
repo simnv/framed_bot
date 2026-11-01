@@ -21,13 +21,19 @@ MIN_TITLE_PLAYERS: Final = 5
 LEAGUE_LIMIT: Final = 10
 TITLE_LIMIT: Final = 5
 STATS_BEST: Final = 3
+# The People section: all people up to PEOPLE_BEST + PEOPLE_WORST, else the best and the worst.
+PEOPLE_BEST: Final = 5
+PEOPLE_WORST: Final = 3
 CAST_MAX_ORDER: Final = 2
 ELIGIBLE_STATUSES: Final = ('site', 'auto', 'visual', 'low_confidence', 'manual')
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Bucket:
-    """One genre, decade or person of one player. rounds is the sum of the weights."""
+    """One genre, decade or person of one player. rounds is the sum of the weights.
+
+    points is the smoothed points. strength is points minus the own mean: above 0 is better than usual.
+    """
 
     key: int
     label: str
@@ -35,6 +41,7 @@ class Bucket:
     points: float
     win_rate: float
     role: Role | None = None
+    strength: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -77,6 +84,8 @@ class LeagueRow:
     score: float
     rounds: float
     win_rate: float
+    # The score minus the mean of all players of the game: above 0 is better than the average player.
+    strength: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

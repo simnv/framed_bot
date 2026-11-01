@@ -23,6 +23,8 @@ from insight_types import (
     MIN_STATS_BUCKET,
     MIN_STATS_PERSON,
     MIN_TITLE_PLAYERS,
+    PEOPLE_BEST,
+    PEOPLE_WORST,
     SMOOTHING,
     STATS_BEST,
     TITLE_LIMIT,
@@ -67,6 +69,8 @@ __all__ = [
     'RankBoard',
     'Role',
     'SMOOTHING',
+    'PEOPLE_BEST',
+    'PEOPLE_WORST',
     'STATS_BEST',
     'Section',
     'TITLE_LIMIT',
@@ -168,20 +172,28 @@ async def _mean(statement: Select) -> Fraction:
 def _bucket(row: Any, mean: Fraction, dimension: Dimension, scale: int = WEIGHT_SCALE) -> Bucket:
     """Smoothed points with exact fractions, so equal buckets tie exactly and the tie rules decide."""
     rounds = _exact(row.rounds, scale)
+    smoothed = (_exact(row.points, scale) + SMOOTHING * mean) / (rounds + SMOOTHING)
     return Bucket(
         key=row.key,
         label=decade_label(row.key) if dimension == 'decade' else row.label,
         rounds=float(rounds),
-        points=float((_exact(row.points, scale) + SMOOTHING * mean) / (rounds + SMOOTHING)),
+        points=float(smoothed),
         win_rate=float(_exact(row.wins, scale) / rounds),
+        strength=float(smoothed - mean),
     )
 
 
-def _section(buckets: list[Bucket]) -> Section:
-    buckets.sort(key=lambda bucket: (-bucket.points, bucket.label, bucket.key))
-    if len(buckets) <= 2 * STATS_BEST:
-        return Section(tuple(buckets))
-    return Section(tuple(buckets[:STATS_BEST]), tuple(buckets[-STATS_BEST:]))
+def _by_strength(bucket: Bucket) -> tuple[float, str, int]:
+    return -bucket.strength, bucket.label, bucket.key
+
+
+def _section(buckets: list[Bucket], dimension: Dimension) -> Section:
+    """Genres come most played first. Decades come strongest first."""
+    if dimension == 'genre':
+        buckets.sort(key=lambda bucket: (-bucket.rounds, bucket.label, bucket.key))
+    else:
+        buckets.sort(key=_by_strength)
+    return Section(tuple(buckets))
 
 
 async def _people(eligible: CTE, user_id: int, game: Game, mean: Fraction) -> Section:
@@ -218,8 +230,10 @@ async def _people(eligible: CTE, user_id: int, game: Game, mean: Fraction) -> Se
     buckets = [
         dataclasses.replace(_bucket(row, mean, 'genre', scale=1), role=role if row.leads else 'cast') for row in rows
     ]
-    buckets.sort(key=lambda bucket: (-bucket.points, bucket.label, bucket.key))
-    return Section(tuple(buckets[:STATS_BEST]))
+    buckets.sort(key=_by_strength)
+    if len(buckets) <= PEOPLE_BEST + PEOPLE_WORST:
+        return Section(tuple(buckets))
+    return Section(tuple(buckets[:PEOPLE_BEST]), tuple(buckets[-PEOPLE_WORST:]))
 
 
 async def _streaks(user_id: int, game: Game, today: date) -> tuple[int, int]:
@@ -281,7 +295,9 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
     for dimension in ('genre', 'decade'):
         rows = await _rows(_bucket_statement(eligible, dimension).where(eligible.c.user_id == user_id))
         sections.append(
-            _section([_bucket(row, mean, dimension) for row in rows if _exact(row.rounds) >= MIN_STATS_BUCKET])
+            _section(
+                [_bucket(row, mean, dimension) for row in rows if _exact(row.rounds) >= MIN_STATS_BUCKET], dimension
+            )
         )
     current, best = await _streaks(user_id, game, today)
     ranks = await _board_ranks(user_id, game)
@@ -311,7 +327,7 @@ async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
         bucket = _bucket(row, mean, dimension)
         labels[row.key] = bucket.label
         grouped.setdefault(row.key, []).append(
-            LeagueRow(row.user_id, row.name, bucket.points, bucket.rounds, bucket.win_rate)
+            LeagueRow(row.user_id, row.name, bucket.points, bucket.rounds, bucket.win_rate, bucket.strength)
         )
     boards = []
     for key, players in grouped.items():

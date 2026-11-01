@@ -159,20 +159,16 @@ async def aggregate_stats():
             await main.stats(Update(1, message=message), context)
     finally:
         event.remove(engine.sync_engine, 'after_cursor_execute', observe)
-    assert len(sent) == 1
-    rich = sent[0]['rich_message']
-    assert rich['skip_entity_detection'] is True
-    headers = '<th><a href="https://framed.wtf/">Framed</a></th><th><a href="https://episode.wtf/">Episode</a></th>'
-    assert headers in rich['html']
+    # One message for each game, each with its own numbers line.
+    assert len(sent) == 2
+    assert all(message['rich_message']['skip_entity_detection'] is True for message in sent)
+    framed_html, episode_html = (message['rich_message']['html'] for message in sent)
+    assert framed_html.startswith('<h3>🎥 <a href="https://framed.wtf/">Framed</a>')
+    assert episode_html.startswith('<h3>📺 <a href="https://episode.wtf/">Episode</a>')
     # 300 wins on frame 2 and 300 misses per game; a miss is frame 7 in Framed and frame 11 in Episode.
-    for label, framed, episode in (
-        ('Раунды', '600', '600'),
-        ('Победы', '300', '300'),
-        ('Очки', '1800', '3000'),
-        ('Ср. кадр (победы)', '2.00', '2.00'),
-        ('Ср. кадр (все)', '4.50', '6.50'),
-    ):
-        assert f'<tr><td>{label}</td><td>{framed}</td><td>{episode}</td></tr>' in rich['html']
+    for html, points, average_all in ((framed_html, '1800', '4.50'), (episode_html, '3000', '6.50')):
+        line = f'Раунды 600 · Победы 300 (50%) · Очки {points} · Ср. кадр 2.00 в победах, {average_all} во всех раундах'
+        assert f'<p>{line}</p>' in html
     # The history has 600 rounds per game. Each statement returns aggregates (a few rows at most), never the
     # history, and the number of statements does not change with the history length.
     assert max(max(0, count) for count in fetched) <= 2, f'/stats materialized history rows: {fetched}'

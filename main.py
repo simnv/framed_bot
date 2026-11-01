@@ -66,10 +66,10 @@ from rich_tables import (
     TOP_WIN_LABELS,
     RichMessage,
     enrich_top_profiles,
+    render_game_stats,
     render_hard_titles,
     render_league,
     render_league_picker,
-    render_stats,
     render_top,
     send_rich_message,
 )
@@ -369,22 +369,27 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=effective_chat.id, text='Я тебя не знаю', reply_to_message_id=message.id)
         return
 
-    framed_stats, episode_stats = user_stats
+    # One message for each game that the user played. The bot keeps the messages.
+    played = [(game, game_stats) for game, game_stats in zip(GAMES, user_stats, strict=True) if game_stats.rounds_count]
+    if not played:
+        await context.bot.send_message(
+            chat_id=effective_chat.id, text='У тебя пока нет результатов', reply_to_message_id=message.id
+        )
+        return
     today = utc_today()
-    insights = {game: await game_insight(effective_user.id, game, today) for game in GAMES}
     (owner,) = await enrich_top_profiles(
         context.bot,
         [StatsOwner(effective_user.id, effective_user.full_name)],
         group_chat_id=effective_chat.id if effective_chat.type in ('group', 'supergroup') else None,
     )
-
-    # The message is long, so the bot keeps it. The first line names the owner of the stats.
-    await send_rich_message(
-        context.bot,
-        effective_chat.id,
-        render_stats(framed_stats, episode_stats, owner=owner, insights=insights),
-        reply_to_message_id=message.id,
-    )
+    for game, game_stats in played:
+        insight = await game_insight(effective_user.id, game, today)
+        await send_rich_message(
+            context.bot,
+            effective_chat.id,
+            render_game_stats(game, game_stats, insight, owner=owner),
+            reply_to_message_id=message.id,
+        )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -483,6 +488,7 @@ TOP_SCREEN_PATTERN = r'^top:(framed|episode):(genres|decades|hard|genre:[0-9]{1,
 # The picker screen of each league dimension.
 PICKER_SCREENS: dict[Dimension, str] = {'genre': 'genres', 'decade': 'decades'}
 PICKER_COLUMNS = 3
+PICKER_LIMIT = 99
 BACK_LABEL = '← Назад'
 
 
@@ -615,9 +621,10 @@ def back_markup(callback_data: str) -> InlineKeyboardMarkup:
 
 def picker_markup(game: Game, dimension: Dimension, choices: Sequence[Choice]) -> InlineKeyboardMarkup:
     """Only leagues that have a board get a button. Back opens the main score board of the game."""
+    # Telegram allows at most 100 buttons in one keyboard, and the back button needs one.
     buttons = [
         InlineKeyboardButton(choice.label, callback_data=top_screen_data(game, f'{dimension}:{choice.key}'))
-        for choice in choices
+        for choice in choices[:PICKER_LIMIT]
     ]
     rows = [buttons[start : start + PICKER_COLUMNS] for start in range(0, len(buttons), PICKER_COLUMNS)]
     rows.append([InlineKeyboardButton(BACK_LABEL, callback_data=top_callback_data(game, TopType.TOP_SCORE))])

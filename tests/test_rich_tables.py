@@ -16,7 +16,7 @@ from telegram.warnings import PTBUserWarning
 import main
 import rich_tables
 from insight import GameInsight, Section
-from rich_tables import render_stats, render_top
+from rich_tables import render_top
 from stats import Stats
 from top_type import TopType
 
@@ -156,46 +156,6 @@ def test_top_title_and_explanation_match_game_and_metric(game, kind, results):
     assert html.index(f'<p>{explanation}</p>') > html.index('</table>')
     assert html.count('<p>') == 2 + (not results)
     assert 'кадров; меньше' not in html
-
-
-STATS_NOTE = (
-    '<p>Очки и «Ср. кадр (все)» бот считает так же, как в /top. '
-    'Во Framed промах считается как кадр 7, в Episode как кадр 11. '
-    '«Ср. кадр (победы)» учитывает только угаданные раунды. '
-    'Прочерк значит, что побед или раундов пока нет.</p>'
-)
-
-
-def test_personal_stats_transpose_games_into_columns_without_fabricated_averages():
-    framed = SimpleNamespace(
-        rounds_count=123, rounds_won_count=99, average_frame=1.23456, points=500, average_frame_all=2.5
-    )
-    episode = SimpleNamespace(rounds_count=0, rounds_won_count=0, average_frame=None, points=0, average_frame_all=None)
-    rich = render_stats(framed, episode)
-    assert rich['html'].startswith('<p>Твоя статистика</p>')
-    assert TableParser(rich['html']).rows == [
-        ['Показатель', 'Framed', 'Episode'],
-        ['Раунды', '123', '0'],
-        ['Победы', '99', '0'],
-        ['Очки', '500', '0'],
-        ['Ср. кадр (победы)', '1.23', '—'],
-        ['Ср. кадр (все)', '2.50', '—'],
-    ]
-
-
-def test_personal_stats_explain_points_and_averages_under_the_table():
-    rich = render_stats(Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
-    assert rich['html'].endswith(STATS_NOTE)
-    assert rich['html'].index(STATS_NOTE) > rich['html'].index('</table>')
-    assert 'Средний кадр — только по победам' not in rich['html']
-
-
-def test_personal_stats_game_names_link_to_the_official_sites():
-    rich = render_stats(Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
-    table = TableParser(rich['html'])
-    assert table.links == [{'href': 'https://framed.wtf/'}, {'href': 'https://episode.wtf/'}]
-    assert table.rows[0][1:] == ['Framed', 'Episode']
-    assert rich['skip_entity_detection'] is True
 
 
 @pytest.mark.parametrize(
@@ -574,7 +534,7 @@ async def test_legacy_top_button_only_acknowledges(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stats_sends_one_kept_message_that_names_its_owner(monkeypatch):
+async def test_stats_sends_one_kept_message_per_played_game_that_names_its_owner(monkeypatch):
     request = TelegramRequest()
     context = make_context(request)
     aggregates = (Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
@@ -592,15 +552,40 @@ async def test_stats_sends_one_kept_message_that_names_its_owner(monkeypatch):
     get_stats.assert_awaited_once_with(99)
     assert [call.args[:2] for call in get_insight.await_args_list] == [(99, 'framed'), (99, 'episode')]
     update_user.assert_not_awaited()
-    params = next(params for endpoint, params in request.calls if endpoint == 'sendRichMessage')
-    html = json.loads(params['rich_message'])['html']
-    assert 'Статистика для' in html
-    # The owner name links to the profile, like a name in /top.
-    assert '?profile">Test</a>' in html
-    assert json.loads(params['reply_parameters']) == {'message_id': 456}
-    # The long message stays: the bot does not delete the command or the reply.
+    sent = [params for endpoint, params in request.calls if endpoint == 'sendRichMessage']
+    headers = [json.loads(params['rich_message'])['html'].split('</h3>', 1)[0] for params in sent]
+    # Each header names the game with its emoji and links the owner to the profile, like a name in /top.
+    assert headers[0].startswith('<h3>🎥 <a href="https://framed.wtf/">Framed</a> · ')
+    assert headers[1].startswith('<h3>📺 <a href="https://episode.wtf/">Episode</a> · ')
+    assert all(header.endswith('?profile">Test</a>') for header in headers)
+    assert [json.loads(params['reply_parameters']) for params in sent] == [{'message_id': 456}] * 2
+    # The messages stay: the bot does not delete the command or the replies.
     schedule.assert_not_called()
     assert not any(endpoint == 'deleteMessage' for endpoint, _ in request.calls)
+
+
+@pytest.mark.asyncio
+async def test_stats_skip_a_game_without_rounds_and_say_so_when_there_are_none(monkeypatch):
+    request = TelegramRequest()
+    context = make_context(request)
+    zero = Stats(0, 0, None, 0, None)
+    monkeypatch.setattr(main, 'get_user_stats', AsyncMock(return_value=(zero, Stats(4, 0, None, 4, 11.0))))
+    monkeypatch.setattr(main, 'game_insight', AsyncMock(return_value=None))
+    async with context.bot:
+        await main.stats(command_update('/stats'), context)
+    sent = [
+        json.loads(params['rich_message'])['html']
+        for endpoint, params in request.calls
+        if endpoint == 'sendRichMessage'
+    ]
+    assert len(sent) == 1 and sent[0].startswith('<h3>📺')
+    request.calls.clear()
+    monkeypatch.setattr(main, 'get_user_stats', AsyncMock(return_value=(zero, zero)))
+    async with context.bot:
+        await main.stats(command_update('/stats'), context)
+    texts = [params['text'] for endpoint, params in request.calls if endpoint == 'sendMessage']
+    assert texts == ['У тебя пока нет результатов']
+    assert not any(endpoint == 'sendRichMessage' for endpoint, _ in request.calls)
 
 
 @pytest.mark.asyncio

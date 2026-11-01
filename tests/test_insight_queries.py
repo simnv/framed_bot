@@ -306,6 +306,8 @@ async def test_exact_league_tie_on_a_rounding_boundary_falls_to_the_name(databas
     assert [row.user_id for row in board.rows] == [1, 2, 3]
     assert board.rows[0].score == board.rows[1].score == pytest.approx(5649 / 1024)
     assert board.rows[0].rounds == board.rows[1].rounds == 22.0
+    # Strength in a league is the smoothed score minus the mean of all players, 855 / 192.
+    assert board.rows[0].strength == pytest.approx(5649 / 1024 - 855 / 192)
 
 
 @pytest.mark.asyncio
@@ -400,24 +402,40 @@ async def test_hard_titles_empty_game_has_no_rows(database):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('count', 'best_keys', 'worst_keys', 'best_decades', 'worst_decades'),
-    [
-        (6, [1, 2, 3, 4, 5, 6], [], ['1910-е', '1920-е', '1930-е', '1940-е', '1950-е', '1960-е'], []),
-        (7, [1, 7, 2], [4, 5, 6], ['1910-е', '1970-е', '1920-е'], ['1940-е', '1950-е', '1960-е']),
-    ],
-)
-async def test_personal_sections_show_all_up_to_six_else_best_and_worst_three(
-    database, count, best_keys, worst_keys, best_decades, worst_decades
-):
-    for key in range(1, count + 1):
-        add_title(database, key, genres=(key,), year=1900 + key * 10)
-        add_rounds(database, start=key * 10, count=5, title=key, frame=key if key <= 6 else 1)
+async def test_genres_come_by_rounds_and_decades_by_strength_against_the_own_mean(database):
+    # 12 wins on frame 1 (6 points), 8 wins on frame 4 (3 points), 6 misses (1 point), 4 wins on frame 2 (5 points).
+    add_title(database, 1, genres=(1,), year=1995)
+    add_title(database, 2, genres=(2,), year=2005)
+    add_title(database, 3, genres=(3,), year=1985)
+    add_title(database, 4, genres=(4,), year=2015)
+    add_rounds(database, start=1, count=12, title=1, frame=1)
+    add_rounds(database, start=21, count=6, title=2, frame=None)
+    add_rounds(database, start=31, count=8, title=3, frame=4)
+    add_rounds(database, start=41, count=4, title=4, frame=2)
+
     result = await insight.game_insight(1, 'framed', TODAY)
-    assert [b.key for b in result.genres.best] == best_keys
-    assert [b.key for b in result.genres.worst] == worst_keys
-    assert [b.label for b in result.decades.best] == best_decades
-    assert [b.label for b in result.decades.worst] == worst_decades
+
+    # The own mean is 122 / 30 = 61 / 15. Strength = n * (average - mean) / (n + 10).
+    assert [(b.key, b.rounds) for b in result.genres.best] == [(1, 12.0), (3, 8.0), (2, 6.0)]
+    assert [b.strength for b in result.genres.best] == pytest.approx([58 / 55, -64 / 135, -23 / 20])
+    assert result.genres.worst == ()
+    assert [b.label for b in result.decades.best] == ['1990-е', '1980-е', '2000-е']
+    assert [b.strength for b in result.decades.best] == pytest.approx([58 / 55, -64 / 135, -23 / 20])
+    assert result.decades.worst == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('people', 'best', 'worst'), [(8, list(range(1, 9)), []), (9, [1, 2, 3, 4, 5], [7, 8, 9])])
+async def test_people_show_all_up_to_eight_else_the_best_five_and_worst_three(database, people, best, worst):
+    for key in range(1, people + 1):
+        add_title(database, key, genres=(), kind='tv')
+        database.execute('INSERT INTO person VALUES (?, ?)', (key, f'Person {key}'))
+        database.execute('INSERT INTO title_person VALUES (?, ?, ?, ?)', (key, key, 'creator', 0))
+        # Person k gets 11 - k points a round, so the strength falls with k.
+        add_rounds(database, start=key * 10, count=3, title=key, frame=key, game='episode')
+    result = await insight.game_insight(1, 'episode', TODAY)
+    assert [b.key for b in result.people.best] == best
+    assert [b.key for b in result.people.worst] == worst
 
 
 @pytest.mark.asyncio
@@ -439,18 +457,6 @@ async def test_genre_win_rates_use_the_same_split_weights_as_points(database):
     add_rounds(database, count=10)
     add_rounds(database, start=11, count=5, title=2, frame=None)
     result = await insight.game_insight(1, 'framed', TODAY)
-    assert [(b.key, b.rounds, b.win_rate) for b in result.genres.best] == [(2, 5.0, 1.0), (1, 10.0, 0.5)]
-    assert [b.points for b in result.genres.best] == pytest.approx([4.8888888889, 3.9166666667])
-
-
-@pytest.mark.asyncio
-async def test_people_show_only_the_best_three_by_smoothed_points(database):
-    for key in range(1, 5):
-        add_title(database, key, genres=())
-        database.execute('INSERT INTO person VALUES (?, ?)', (key, f'Person {5 - key}'))
-        database.execute('INSERT INTO title_person VALUES (?, ?, ?, ?)', (key, key, 'director', 0))
-        add_rounds(database, start=key * 10, count=3, title=key, frame=key)
-    result = await insight.game_insight(1, 'framed', TODAY)
-    assert [b.key for b in result.people.best] == [1, 2, 3]
-    assert [b.points for b in result.people.best] == pytest.approx([4.8461538462, 4.6153846154, 4.3846153846])
-    assert result.people.worst == ()
+    # Genres come most played first.
+    assert [(b.key, b.rounds, b.win_rate) for b in result.genres.best] == [(1, 10.0, 0.5), (2, 5.0, 1.0)]
+    assert [b.points for b in result.genres.best] == pytest.approx([3.9166666667, 4.8888888889])

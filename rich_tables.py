@@ -6,9 +6,9 @@ Use the public do_api_request bridge until PTB exposes sendRichMessage directly.
 
 import asyncio
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from html import escape
+from html import escape, unescape
 from typing import Literal, Protocol, TypedDict, TypeGuard
 
 from telegram import Bot, InlineKeyboardMarkup, Message, ReplyParameters
@@ -18,9 +18,10 @@ from answers import FRAMES, Game
 from insight_types import (
     MIN_LEAGUE_PLAYERS,
     MIN_LEAGUE_ROUNDS,
+    MIN_STATS_BUCKET,
+    MIN_STATS_PERSON,
     MIN_TITLE_PLAYERS,
     SMOOTHING,
-    STATS_BEST,
     Bucket,
     Choice,
     Dimension,
@@ -33,8 +34,10 @@ from insight_types import (
 from top_type import TopType
 
 _PROFILE_LOOKUP_DEADLINE = 8
-# Telegram rejects a longer rich message. render_stats trims the insight sections to fit.
-STATS_HTML_LIMIT = 4096
+# Telegram limits a rich message to 32768 characters of text and 500 blocks. render_game_stats drops
+# sections to fit.
+STATS_TEXT_LIMIT = 32768
+STATS_BLOCK_LIMIT = 500
 
 
 class TopResult(Protocol):
@@ -286,14 +289,6 @@ def render_top(game: Game, top_type: TopType, results: Sequence[TopResult]) -> R
     return {'html': html, 'skip_entity_detection': True}
 
 
-_STATS_NOTE = (
-    'Очки и «Ср. кадр (все)» бот считает так же, как в /top. '
-    'Во Framed промах считается как кадр 7, в Episode как кадр 11. '
-    '«Ср. кадр (победы)» учитывает только угаданные раунды. '
-    'Прочерк значит, что побед или раундов пока нет.'
-)
-
-
 def _rounds(value: float) -> str:
     """Weighted round counts get one decimal only when they are fractional."""
     rounded = round(value, 1)
@@ -304,128 +299,137 @@ def _percent(value: float) -> str:
     return f'{value:.0%}'
 
 
-def _bucket_row(bucket: Bucket) -> tuple[str, ...]:
-    return (bucket.label, _average(bucket.points), _rounds(bucket.rounds), _percent(bucket.win_rate))
+def _strength(value: float) -> str:
+    """A signed strength with a real minus sign. A value that rounds to zero has no sign."""
+    text = f'{value:+.2f}'
+    if text in ('+0.00', '-0.00'):
+        return '0.00'
+    return text.replace('-', '\u2212')
 
 
-def _trim_section(section: Section, limit: int) -> tuple[tuple[Bucket, ...], tuple[Bucket, ...]]:
-    """Keep at most limit best and limit worst buckets. The worst stay in points order, best first.
-
-    A section that holds all its buckets in best stays whole when it has 2 * limit buckets or fewer.
-    """
-    if section.worst:
-        worst = tuple(sorted(section.worst, key=lambda bucket: bucket.points, reverse=True))
-        return section.best[:limit], worst[-limit:]
-    if len(section.best) > 2 * limit:
-        return section.best[:limit], section.best[-limit:]
-    return section.best, ()
-
-
-_RANKED_SECTIONS: dict[str, tuple[str, str, str, str]] = {
-    # section title, table column, verdict for one bucket, verdict for two buckets
-    'genres': ('жанры', 'Жанр', 'Лучший жанр', 'Лучшие жанры'),
-    'decades': ('десятилетия', 'Десятилетие', 'Лучшее десятилетие', 'Лучшие десятилетия'),
-}
-_LEAGUE_ALIGNMENTS: tuple[Literal['left', 'center'], ...] = ('center', 'left', 'center', 'center', 'center')
+_GAME_EMOJI: dict[Game, str] = {'framed': '🎥', 'episode': '📺'}
+_GAME_SITES: dict[Game, str] = {'framed': 'https://framed.wtf/', 'episode': 'https://episode.wtf/'}
 _ROLE_LABELS = {'director': 'режиссёр', 'creator': 'создатель', 'cast': 'актёр'}
-_BOARD_LABELS = {'score': 'Очки', 'frame': 'Средний кадр', 'rounds': 'Участия'}
+_BOARD_LABELS = {'score': 'очки', 'frame': 'кадры', 'rounds': 'участия'}
+_LEAGUE_ALIGNMENTS: tuple[Literal['left', 'center'], ...] = ('center', 'left', 'center', 'center', 'center')
 
 
-def _ranked_section_html(title: str, section: Section, kind: str, limit: int) -> str:
-    best, worst = _trim_section(section, limit)
-    if not best:
-        return ''
-    name, column, one, many = _RANKED_SECTIONS[kind]
-    rows: list[Sequence[str]] = [_bucket_row(bucket) for bucket in best]
-    if worst:
-        rows.append(('…',) * 4)
-        rows.extend(_bucket_row(bucket) for bucket in worst)
-    html = f'<p>{title}: {name}</p>' + _table((column, 'Очки', 'Раунды', 'Победы'), rows)
-    leaders = best[:2]
-    verdict = one if len(leaders) == 1 else many
-    return html + f'<p>{verdict}: {", ".join(escape(bucket.label) for bucket in leaders)}.</p>'
-
-
-def _people_html(title: str, section: Section) -> str:
-    if not section.best:
-        return ''
-    rows = [
-        (bucket.label, _ROLE_LABELS.get(bucket.role or '', '—'), *_bucket_row(bucket)[1:]) for bucket in section.best
-    ]
-    headers = ('Кто', 'Роль', 'Очки', 'Раунды', 'Победы')
-    return f'<p>{title}: люди</p>' + _table(headers, rows)
+def _numbers_line(stats: GameStats) -> str:
+    share = stats.rounds_won_count / stats.rounds_count if stats.rounds_count else 0.0
+    return (
+        f'Раунды {stats.rounds_count} · Победы {stats.rounds_won_count} ({_percent(share)}) · Очки {stats.points} · '
+        f'Ср. кадр {_average(stats.average_frame)} в победах, {_average(stats.average_frame_all)} во всех раундах'
+    )
 
 
 def _rank_label(game: Game, rank: Rank) -> str:
     match rank.board:
         case 'win':
-            return TOP_WIN_LABELS[game]
-        case 'genre':
-            return f'Жанр {rank.label}'
-        case 'decade':
-            return f'Десятилетие {rank.label}'
+            return TOP_WIN_LABELS[game].lower()
+        case 'genre' | 'decade':
+            return rank.label or ''
         case board:
             return _BOARD_LABELS[board]
 
 
-def _game_insight_html(game: Game, insight: GameInsight, *, limit: int, people: bool) -> str:
-    title = _GAME_TITLES[game]
-    html = _ranked_section_html(title, insight.genres, 'genres', limit)
-    html += _ranked_section_html(title, insight.decades, 'decades', limit)
-    if people:
-        html += _people_html(title, insight.people)
-    if insight.best_streak > 0:
-        html += f'<p>{title}: серия побед сейчас {insight.current_streak}, лучшая {insight.best_streak}.</p>'
-    if insight.ranks:
-        rows = [(_rank_label(game, rank), f'{rank.place} из {rank.total}') for rank in insight.ranks]
-        html += f'<p>{title}: места в /top</p>' + _table(('Таблица', 'Место'), rows)
-    return html
+def _verdict(buckets: Sequence[Bucket]) -> str:
+    """Name the 2 strongest and the 2 weakest genres; with 2 or 3 genres only 1 of each."""
+    if len(buckets) < 2:
+        return ''
+    count = 2 if len(buckets) >= 4 else 1
+    ordered = sorted(buckets, key=lambda bucket: (-bucket.strength, bucket.label))
+    strongest = ', '.join(escape(bucket.label) for bucket in ordered[:count])
+    weakest = ', '.join(escape(bucket.label) for bucket in reversed(ordered[-count:]))
+    return f'<p>Сильнее всего: {strongest}. Слабее всего: {weakest}.</p>'
 
 
-def _trimmed_insights_html(insights: Mapping[Game, GameInsight], head_length: int) -> str:
-    """Build the insight sections and trim them step by step until the whole message fits the limit.
+def _bucket_cells(bucket: Bucket) -> tuple[str, ...]:
+    return (_rounds(bucket.rounds), _percent(bucket.win_rate), _strength(bucket.strength))
 
-    The steps: best and worst 3 become 2, then the people sections go, then the Episode sections go.
-    If the last step is still too long, no insight is shown, because Telegram rejects a longer message.
-    """
-    steps: tuple[tuple[int, bool, tuple[Game, ...]], ...] = (
-        (STATS_BEST, True, ('framed', 'episode')),
-        (2, True, ('framed', 'episode')),
-        (2, False, ('framed', 'episode')),
-        (2, False, ('framed',)),
+
+def _genres_html(section: Section) -> str:
+    if not section.best:
+        return ''
+    rows = [(bucket.label, *_bucket_cells(bucket)) for bucket in section.best]
+    html = '<h4>Жанры</h4>' + _table(('Жанр', 'Раунды', 'Победы', 'Сила'), rows)
+    return html + _verdict(section.best)
+
+
+def _decades_html(section: Section) -> str:
+    if not section.best:
+        return ''
+    rows = [(bucket.label, *_bucket_cells(bucket)) for bucket in section.best]
+    return '<h4>Десятилетия</h4>' + _table(('Десятилетие', 'Раунды', 'Победы', 'Сила'), rows)
+
+
+def _people_html(section: Section) -> str:
+    if not section.best:
+        return ''
+
+    def row(bucket: Bucket) -> tuple[str, ...]:
+        return (bucket.label, _ROLE_LABELS.get(bucket.role or '', '—'), *_bucket_cells(bucket))
+
+    rows = [row(bucket) for bucket in section.best]
+    if section.worst:
+        rows.append(('…',) * 5)
+        rows.extend(row(bucket) for bucket in section.worst)
+    return '<h4>Люди</h4>' + _table(('Кто', 'Роль', 'Раунды', 'Победы', 'Сила'), rows)
+
+
+def _stats_note(game: Game) -> str:
+    miss = FRAMES[game] + 1
+    return (
+        '<details><summary>Как считаются числа</summary>'
+        f'<p>Очки — как в /top: победа на кадре N даёт {miss} \u2212 N очков, промах даёт 1. '
+        f'«Во всех раундах» средний кадр считает промах как кадр {miss}. Прочерк значит, что побед пока нет.</p>'
+        '<p>Сила — насколько ты играешь лучше (+) или хуже (\u2212) своего обычного уровня, в очках за раунд. '
+        f'К твоим раундам в жанре бот добавляет {SMOOTHING} раундов с твоими средними очками. '
+        'Поэтому 2 удачных раунда не делают жанр лучшим, а много раундов показывают настоящий уровень. '
+        'Пример: в среднем у тебя 3.5 очка за раунд, 2 раунда в жанре дали по 6 очков. '
+        f'Тогда (12 + {SMOOTHING} × 3.5) / (2 + {SMOOTHING}) = 3.92, и сила равна +0.42.</p>'
+        f'<p>Если у {_ANSWER_WORDS[game][1]}а несколько жанров, раунд делится между ними поровну, '
+        f'поэтому раунды бывают дробными. В таблицах есть жанры и десятилетия, где у тебя не меньше '
+        f'{MIN_STATS_BUCKET} раундов, и люди, где не меньше {MIN_STATS_PERSON}.</p>'
+        '</details>'
     )
-    for limit, people, games in steps:
-        html = ''.join(
-            _game_insight_html(game, insights[game], limit=limit, people=people) for game in games if game in insights
-        )
-        if head_length + len(html) <= STATS_HTML_LIMIT:
-            return html
-    return ''
 
 
-def render_stats(
-    framed_stats: GameStats,
-    episode_stats: GameStats,
-    *,
-    owner: TopResult | None = None,
-    insights: Mapping[Game, GameInsight] | None = None,
+def _text_length(html: str) -> int:
+    return len(unescape(re.sub(r'<[^>]+>', '', html)))
+
+
+def block_count(html: str) -> int:
+    """An upper estimate of the Telegram blocks: every paragraph, heading, table, row and details block."""
+    return len(re.findall(r'<(?:p|h[1-6]|table|tr|details|summary|footer)[ >]', html))
+
+
+def _fits(html: str) -> bool:
+    return _text_length(html) <= STATS_TEXT_LIMIT and block_count(html) <= STATS_BLOCK_LIMIT
+
+
+def render_game_stats(
+    game: Game, stats: GameStats, insight: GameInsight | None = None, *, owner: TopResult | None = None
 ) -> RichMessage:
-    """Render the result table, then the insight sections per game, trimmed to STATS_HTML_LIMIT."""
-    games = (framed_stats, episode_stats)
-    rows = [
-        ('Раунды', *(stats.rounds_count for stats in games)),
-        ('Победы', *(stats.rounds_won_count for stats in games)),
-        ('Очки', *(stats.points for stats in games)),
-        ('Ср. кадр (победы)', *(_average(stats.average_frame) for stats in games)),
-        ('Ср. кадр (все)', *(_average(stats.average_frame_all) for stats in games)),
-    ]
-    headers = ('Показатель', _Link('Framed', 'https://framed.wtf/'), _Link('Episode', 'https://episode.wtf/'))
-    html = f'<p>Статистика для {_cell(_profile_name(owner))}</p>' if owner is not None else '<p>Твоя статистика</p>'
-    html += _table(headers, rows)
-    html += f'<p>{_STATS_NOTE}</p>'
-    if insights:
-        html += _trimmed_insights_html(insights, len(html))
-    return {'html': html, 'skip_entity_detection': True}
+    """One /stats message for one game: the numbers, the streak, the ranks, then genres, decades and people.
+
+    If the message does not fit the Telegram limits, the people go first, then all the insight sections.
+    """
+    header = f'{_GAME_EMOJI[game]} {_cell(_Link(_GAME_TITLES[game], _GAME_SITES[game]))}'
+    if owner is not None:
+        header += f' · {_cell(_profile_name(owner))}'
+    head = f'<h3>{header}</h3><p>{_numbers_line(stats)}</p>'
+    if insight is not None and insight.best_streak > 0:
+        head += f'<p>Серия побед: сейчас {insight.current_streak}, лучшая {insight.best_streak}</p>'
+    if insight is not None and insight.ranks:
+        places = ' · '.join(f'{escape(_rank_label(game, rank))} {rank.place}/{rank.total}' for rank in insight.ranks)
+        head += f'<p>Места в /top: {places}</p>'
+    note = _stats_note(game)
+    sections = ''
+    if insight is not None:
+        with_people = _genres_html(insight.genres) + _decades_html(insight.decades) + _people_html(insight.people)
+        without_people = _genres_html(insight.genres) + _decades_html(insight.decades)
+        sections = next((html for html in (with_people, without_people) if _fits(head + html + note)), '')
+    return {'html': head + sections + note, 'skip_entity_detection': True}
 
 
 _DIMENSION_WORDS: dict[Dimension, tuple[str, str, str, str]] = {
@@ -455,18 +459,23 @@ def render_league_picker(game: Game, dimension: Dimension, choices: Sequence[Cho
 def render_league(game: Game, league: League, profiles: Sequence[TopResult]) -> RichMessage:
     """Numbers come from league.rows, linked names from profiles, which follow the same order."""
     rows = [
-        (rank, _profile_name(profile), _average(row.score), _rounds(row.rounds), _percent(row.win_rate))
+        (rank, _profile_name(profile), _rounds(row.rounds), _percent(row.win_rate), _strength(row.strength))
         for rank, (row, profile) in enumerate(zip(league.rows, profiles, strict=True), 1)
     ]
     html = f'<p>{_GAME_TITLES[game]}: лига {_DIMENSION_WORDS[league.dimension][3]} {escape(league.label)}</p>'
-    html += _table(('#', 'Имя', 'Очки', 'Раунды', 'Победы'), rows, alignments=_LEAGUE_ALIGNMENTS)
+    html += _table(('#', 'Имя', 'Раунды', 'Победы', 'Сила'), rows, alignments=_LEAGUE_ALIGNMENTS)
+    html += f'<p>{_league_rule(league.dimension)}</p>'
     note = (
-        f'Очки — средние очки за раунд в этой лиге со сглаживанием: бот добавляет {SMOOTHING} раундов '
-        'со средними очками всех игроков. '
+        '<p>Сила — насколько игрок играет лучше (+) или хуже (\u2212) среднего уровня всех игроков, '
+        f'в очках за раунд. К раундам игрока в лиге бот добавляет {SMOOTHING} раундов со средними очками '
+        'всех игроков, поэтому несколько удачных раундов не поднимают игрока на первое место.</p>'
     )
     if league.dimension == 'genre':
-        note += f'Раунды — сумма весов: {_ANSWER_WORDS[game][1]} с несколькими жанрами делит раунд между ними поровну. '
-    html += f'<p>{note}{_league_rule(league.dimension)}</p>'
+        note += (
+            f'<p>Если у {_ANSWER_WORDS[game][1]}а несколько жанров, раунд делится между ними поровну, '
+            'поэтому раунды бывают дробными.</p>'
+        )
+    html += f'<details><summary>Как считается сила</summary>{note}</details>'
     return {'html': html, 'skip_entity_detection': True}
 
 

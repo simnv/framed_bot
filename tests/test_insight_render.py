@@ -1,7 +1,9 @@
 # Renderers on fixed inputs built from the insight dataclasses. No handler, no database.
 import os
+import re
 import subprocess
 import sys
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,12 +13,14 @@ import pytest
 from answers import Game
 from insight import Bucket, Choice, GameInsight, HardTitles, League, LeagueRow, Rank, Section, TitleRow
 from rich_tables import (
-    STATS_HTML_LIMIT,
+    STATS_BLOCK_LIMIT,
+    STATS_TEXT_LIMIT,
     _ResolvedTopResult,
+    block_count,
+    render_game_stats,
     render_hard_titles,
     render_league,
     render_league_picker,
-    render_stats,
 )
 from stats import Stats
 
@@ -95,222 +99,197 @@ def insights(framed: GameInsight | None = None, episode: GameInsight | None = No
     return result
 
 
-def test_stats_without_owner_and_insights_keep_the_old_output():
-    assert render_stats(FRAMED, EPISODE, owner=None, insights=None) == render_stats(FRAMED, EPISODE)
-
-
-def test_stats_with_an_empty_insight_map_add_nothing():
-    assert render_stats(FRAMED, EPISODE, insights=insights()) == render_stats(FRAMED, EPISODE)
-    assert render_stats(FRAMED, EPISODE, insights=insights(framed=insight())) == render_stats(FRAMED, EPISODE)
-
-
-def test_stats_owner_is_named_with_an_id_mention_in_the_first_line():
-    owner = SimpleNamespace(user_id=99, name='Имя & <b>', score=None)
-    rich = render_stats(FRAMED, EPISODE, owner=owner)
-    parsed = RichParser(rich['html'])
-    assert parsed.paragraphs[0] == 'Статистика для Имя & <b>'
-    assert rich['html'].startswith('<p>Статистика для <a href="tg://user?id=99">Имя &amp; &lt;b&gt;</a></p><table')
-    assert 'Твоя статистика' not in rich['html']
-    assert parsed.links[0] == {'href': 'tg://user?id=99'}
-    assert rich['html'].endswith('</p>')
-    assert rich['skip_entity_detection'] is True
-
-
-def test_stats_owner_with_a_fresh_public_username_links_to_the_profile():
-    owner = _ResolvedTopResult(user_id=99, name='Имя', score=None, public_username='fresh_owner')
-    rich = render_stats(FRAMED, EPISODE, owner=owner)
-    assert rich['html'].startswith('<p>Статистика для <a href="https://t.me/fresh_owner?profile">Имя</a></p>')
-
-
-def test_stats_owner_without_a_valid_id_stays_a_plain_name():
-    rich = render_stats(FRAMED, EPISODE, owner=SimpleNamespace(user_id=None, name='Имя', score=None))
-    assert rich['html'].startswith('<p>Статистика для Имя</p>')
-    assert '<a ' not in rich['html'].split('<table', 1)[0]
-
-
-def test_genre_section_lists_best_and_worst_with_a_gap_and_a_verdict():
-    genres = section(
-        [bucket('Drama', 4.123, 12.5, 0.6), bucket('Comedy & Co', 3.9, 7, 0.5), bucket('Action', 3.5, 5.25, 0.4)],
-        [bucket('Horror', 2.1, 6, 0.2), bucket('War', 1.9, 5, 0.1), bucket('Western', 2.4, 5.5, 0.3)],
+def bucketed(label, strength, rounds=12.0, win_rate=0.5, role=None, key=1):
+    return Bucket(
+        key=key, label=label, rounds=rounds, points=3.0 + strength, win_rate=win_rate, role=role, strength=strength
     )
-    rich = render_stats(FRAMED, EPISODE, insights=insights(framed=insight(genres=genres)))
-    parsed = RichParser(rich['html'])
-    assert parsed.paragraphs[2:] == ['Framed: жанры', 'Лучшие жанры: Drama, Comedy & Co.']
-    assert parsed.tables[1] == [
-        ['Жанр', 'Очки', 'Раунды', 'Победы'],
-        ['Drama', '4.12', '12.5', '60%'],
-        ['Comedy & Co', '3.90', '7', '50%'],
-        ['Action', '3.50', '5.2', '40%'],
-        ['…', '…', '…', '…'],
-        ['Western', '2.40', '5.5', '30%'],
-        ['Horror', '2.10', '6', '20%'],
-        ['War', '1.90', '5', '10%'],
-    ]
-    assert 'Comedy &amp; Co' in rich['html']
 
 
-def test_genre_section_with_all_buckets_has_no_gap_and_a_singular_verdict_for_one_bucket():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(framed=insight(genres=section([bucket('Drama', 4.0)]))))
-    parsed = RichParser(rich['html'])
-    assert parsed.tables[1] == [['Жанр', 'Очки', 'Раунды', 'Победы'], ['Drama', '4.00', '12', '50%']]
-    assert parsed.paragraphs[-1] == 'Лучший жанр: Drama.'
-    assert '…' not in rich['html']
+def headings(rich):
+    return re.findall(r'<h[1-6]>(.*?)</h[1-6]>', rich['html'])
 
 
-def test_decade_section_uses_its_own_column_and_verdict():
-    decades = section([bucket('1990-е', 4.0), bucket('2000-е', 3.5)])
-    rich = render_stats(FRAMED, EPISODE, insights=insights(episode=insight(decades=decades)))
-    parsed = RichParser(rich['html'])
-    assert parsed.paragraphs[2:] == ['Episode: десятилетия', 'Лучшие десятилетия: 1990-е, 2000-е.']
-    assert parsed.tables[1][0] == ['Десятилетие', 'Очки', 'Раунды', 'Победы']
+def text_of(fragment):
+    return unescape(re.sub(r'<[^>]+>', '', fragment))
 
 
-def test_people_section_shows_russian_roles():
-    people = section(
+def test_game_stats_header_has_the_game_emoji_the_site_link_and_the_linked_owner():
+    owner = _ResolvedTopResult(user_id=99, name='Имя & <b>', score=None, public_username='fresh_owner')
+    framed = render_game_stats('framed', FRAMED, owner=owner)
+    episode = render_game_stats('episode', EPISODE, owner=SimpleNamespace(user_id=99, name='Имя', score=None))
+    assert framed['html'].startswith(
+        '<h3>🎥 <a href="https://framed.wtf/">Framed</a> · '
+        '<a href="https://t.me/fresh_owner?profile">Имя &amp; &lt;b&gt;</a></h3>'
+    )
+    assert episode['html'].startswith(
+        '<h3>📺 <a href="https://episode.wtf/">Episode</a> · <a href="tg://user?id=99">Имя</a></h3>'
+    )
+    assert framed['skip_entity_detection'] is True
+
+
+def test_game_stats_without_owner_or_valid_id_name_the_game_only_or_a_plain_name():
+    assert headings(render_game_stats('framed', FRAMED)) == ['🎥 <a href="https://framed.wtf/">Framed</a>']
+    plain = render_game_stats('framed', FRAMED, owner=SimpleNamespace(user_id=None, name='Имя', score=None))
+    assert headings(plain) == ['🎥 <a href="https://framed.wtf/">Framed</a> · Имя']
+
+
+def test_game_numbers_are_one_line_with_the_win_share_and_dashes_without_wins():
+    framed = RichParser(render_game_stats('framed', Stats(1020, 735, 2.4123, 4630, 3.69))['html']).paragraphs
+    episode = RichParser(render_game_stats('episode', Stats(4, 0, None, 4, 11.0))['html']).paragraphs
+    assert framed[0] == 'Раунды 1020 · Победы 735 (72%) · Очки 4630 · Ср. кадр 2.41 в победах, 3.69 во всех раундах'
+    assert episode[0] == 'Раунды 4 · Победы 0 (0%) · Очки 4 · Ср. кадр — в победах, 11.00 во всех раундах'
+
+
+def test_streak_and_ranks_are_one_line_each_and_the_streak_needs_a_win():
+    ranks = (
+        Rank('score', 2, 14),
+        Rank('frame', 4, 11),
+        Rank('win', 2, 14),
+        Rank('rounds', 3, 14),
+        Rank('genre', 1, 6, 'Horror'),
+        Rank('decade', 2, 5, '1990-е'),
+    )
+    paragraphs = RichParser(
+        render_game_stats('framed', FRAMED, insight(current_streak=3, best_streak=17, ranks=ranks))['html']
+    ).paragraphs
+    assert paragraphs[1] == 'Серия побед: сейчас 3, лучшая 17'
+    assert (
+        paragraphs[2] == 'Места в /top: очки 2/14 · кадры 4/11 · фильмы 2/14 · участия 3/14 · Horror 1/6 · 1990-е 2/5'
+    )
+    episode = render_game_stats('episode', EPISODE, insight(ranks=(Rank('win', 1, 3),)))['html']
+    assert 'Серия побед' not in episode
+    assert 'сериалы 1/3' in episode
+
+
+def test_genres_keep_the_query_order_and_name_the_strongest_and_weakest_two():
+    genres = section(
         [
-            bucket('Christopher Nolan', 5.0, 4, 0.75, role='director'),
-            bucket('Vince Gilligan', 4.5, 3, 1.0, role='creator'),
-            bucket('Tom Hanks', 4.0, 3, 0.67, role='cast'),
+            bucketed('Drama', 0.123, rounds=260.7, win_rate=0.71),
+            bucketed('Thriller', 0.3, rounds=88.3),
+            bucketed('Horror', 0.42, rounds=41.5),
+            bucketed('Animation', -0.374, rounds=30),
+            bucketed('Musical', -0.6, rounds=6.5),
         ]
     )
-    rich = render_stats(FRAMED, EPISODE, insights=insights(framed=insight(people=people)))
+    rich = render_game_stats('framed', FRAMED, insight(genres=genres))
     parsed = RichParser(rich['html'])
-    assert parsed.paragraphs[2] == 'Framed: люди'
-    assert parsed.tables[1] == [
-        ['Кто', 'Роль', 'Очки', 'Раунды', 'Победы'],
-        ['Christopher Nolan', 'режиссёр', '5.00', '4', '75%'],
-        ['Vince Gilligan', 'создатель', '4.50', '3', '100%'],
-        ['Tom Hanks', 'актёр', '4.00', '3', '67%'],
+    assert '<h4>Жанры</h4>' in rich['html']
+    assert parsed.tables[0] == [
+        ['Жанр', 'Раунды', 'Победы', 'Сила'],
+        ['Drama', '260.7', '71%', '+0.12'],
+        ['Thriller', '88.3', '50%', '+0.30'],
+        ['Horror', '41.5', '50%', '+0.42'],
+        ['Animation', '30', '50%', '−0.37'],
+        ['Musical', '6.5', '50%', '−0.60'],
     ]
-    assert len(parsed.paragraphs) == 3
+    assert 'Сильнее всего: Horror, Thriller. Слабее всего: Musical, Animation.' in parsed.paragraphs
 
 
-def test_streaks_are_one_line_and_hidden_without_a_win():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(framed=insight(current_streak=3, best_streak=7)))
-    assert RichParser(rich['html']).paragraphs[2:] == ['Framed: серия побед сейчас 3, лучшая 7.']
-    rich = render_stats(FRAMED, EPISODE, insights=insights(framed=insight(current_streak=0, best_streak=0)))
-    assert 'серия' not in rich['html']
+@pytest.mark.parametrize(
+    ('labels', 'verdict'),
+    [
+        (['A'], None),
+        (['A', 'B'], 'Сильнее всего: A. Слабее всего: B.'),
+        (['A', 'B', 'C'], 'Сильнее всего: A. Слабее всего: C.'),
+    ],
+)
+def test_short_genre_lists_name_one_strongest_and_one_weakest_or_nothing(labels, verdict):
+    genres = section([bucketed(label, 1.0 - index) for index, label in enumerate(labels)])
+    paragraphs = RichParser(render_game_stats('framed', FRAMED, insight(genres=genres))['html']).paragraphs
+    verdicts = [paragraph for paragraph in paragraphs if paragraph.startswith('Сильнее')]
+    assert verdicts == ([verdict] if verdict else [])
 
 
-def test_ranks_name_the_boards_and_the_leagues_of_the_game():
-    ranks = (
-        Rank('score', 3, 25),
-        Rank('frame', 10, 20),
-        Rank('win', 1, 25),
-        Rank('rounds', 25, 25),
-        Rank('genre', 2, 5, 'Drama'),
-        Rank('decade', 1, 3, '1990-е'),
+def test_decades_keep_the_strength_order_and_zero_strength_has_no_sign():
+    decades = section([bucketed('1970-е', 0.5), bucketed('1990-е', 0.0), bucketed('2020-е', -0.004)])
+    parsed = RichParser(render_game_stats('framed', FRAMED, insight(decades=decades))['html'])
+    assert parsed.tables[0] == [
+        ['Десятилетие', 'Раунды', 'Победы', 'Сила'],
+        ['1970-е', '12', '50%', '+0.50'],
+        ['1990-е', '12', '50%', '0.00'],
+        ['2020-е', '12', '50%', '0.00'],
+    ]
+
+
+def test_people_show_roles_and_a_gap_row_between_the_best_and_the_worst():
+    people = section(
+        [bucketed('Nolan', 0.9, rounds=7, role='director'), bucketed('Hanks', 0.5, rounds=9, role='cast')],
+        [bucketed('Bay', -0.8, rounds=4, role='director')],
     )
-    rich = render_stats(FRAMED, EPISODE, insights=insights(episode=insight(ranks=ranks)))
-    parsed = RichParser(rich['html'])
-    assert parsed.paragraphs[2] == 'Episode: места в /top'
-    assert parsed.tables[1] == [
-        ['Таблица', 'Место'],
-        ['Очки', '3 из 25'],
-        ['Средний кадр', '10 из 20'],
-        ['Сериалы', '1 из 25'],
-        ['Участия', '25 из 25'],
-        ['Жанр Drama', '2 из 5'],
-        ['Десятилетие 1990-е', '1 из 3'],
+    parsed = RichParser(render_game_stats('framed', FRAMED, insight(people=people))['html'])
+    assert parsed.tables[0] == [
+        ['Кто', 'Роль', 'Раунды', 'Победы', 'Сила'],
+        ['Nolan', 'режиссёр', '7', '50%', '+0.90'],
+        ['Hanks', 'актёр', '9', '50%', '+0.50'],
+        ['…', '…', '…', '…', '…'],
+        ['Bay', 'режиссёр', '4', '50%', '−0.80'],
     ]
+    creators = section([bucketed('Gilligan', 0.2, role='creator')])
+    assert 'создатель' in render_game_stats('episode', EPISODE, insight(people=creators))['html']
 
 
-def test_sections_follow_the_spec_order_with_framed_before_episode():
+def test_sections_come_in_order_and_empty_sections_are_hidden():
     full = insight(
-        genres=section([bucket('Drama', 4.0)]),
-        decades=section([bucket('1990-е', 4.0)]),
-        people=section([bucket('Tom Hanks', 4.0, role='cast')]),
-        current_streak=1,
-        best_streak=2,
-        ranks=(Rank('score', 1, 2),),
+        genres=section([bucketed('Drama', 0.1)]),
+        decades=section([bucketed('1990-е', 0.1)]),
+        people=section([bucketed('Nolan', 0.1, role='director')]),
     )
-    owner = SimpleNamespace(user_id=99, name='Имя', score=None)
-    rich = render_stats(FRAMED, EPISODE, owner=owner, insights=insights(episode=full, framed=full))
-    titles = rendered_titles(rich)
-    assert titles == [
-        'Framed: жанры',
-        'Framed: десятилетия',
-        'Framed: люди',
-        'Framed: серия побед сейчас 1, лучшая 2.',
-        'Framed: места в /top',
-        'Episode: жанры',
-        'Episode: десятилетия',
-        'Episode: люди',
-        'Episode: серия побед сейчас 1, лучшая 2.',
-        'Episode: места в /top',
+    assert re.findall(r'<h4>(.*?)</h4>', render_game_stats('framed', FRAMED, full)['html']) == [
+        'Жанры',
+        'Десятилетия',
+        'Люди',
     ]
-    # The explanation of the main table stays directly under it.
-    assert rich['html'].index('Прочерк значит') < rich['html'].index('Framed: жанры')
+    only_decades = insight(decades=section([bucketed('1990-е', 0.1)]))
+    assert re.findall(r'<h4>(.*?)</h4>', render_game_stats('framed', FRAMED, only_decades)['html']) == ['Десятилетия']
 
 
-def long_insight(width):
-    """Six genre buckets and six decade buckets with labels of the given width, plus people and ranks."""
-    best = [bucket('B' * width + str(index), 5.0 - index) for index in range(3)]
-    worst = [bucket('W' * width + str(index), 2.0 - index * 0.1) for index in range(3)]
-    people = section([bucket('P' * width + str(index), 4.0 - index, role='cast') for index in range(3)])
-    return insight(
-        genres=section(best, worst),
-        decades=section(best, worst),
-        people=people,
-        current_streak=1,
-        best_streak=2,
-        ranks=(Rank('score', 1, 2), Rank('genre', 1, 3, 'Drama')),
-    )
+def test_every_message_ends_with_a_closed_note_that_explains_the_numbers_and_the_strength():
+    rich = render_game_stats('episode', EPISODE, insight(genres=section([bucketed('Drama', 0.1)])))
+    html = rich['html']
+    assert html.endswith('</details>')
+    note = html[html.rindex('<details>') :]
+    assert '<details open' not in html
+    assert '<summary>Как считаются числа</summary>' in note
+    text = text_of(note)
+    assert 'кадр 11' in text
+    assert 'Сила' in text and '10' in text
+    # The note gives a worked example of the smoothing.
+    assert '2 раунда' in text
 
 
-def rendered_titles(rich):
-    return [
-        paragraph for paragraph in RichParser(rich['html']).paragraphs if paragraph.startswith(('Framed', 'Episode'))
-    ]
+def test_game_stats_without_insight_keep_the_numbers_and_the_note():
+    html = render_game_stats('framed', FRAMED)['html']
+    assert '<h4>' not in html
+    assert 'Раунды 9' in html
+    assert html.endswith('</details>')
 
 
-def test_short_insights_are_not_trimmed():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(1), long_insight(1)))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    assert len(RichParser(rich['html']).tables[1]) == 8
-    assert len(rendered_titles(rich)) == 10
+def huge_insight(width):
+    many = [bucketed('G' * width + str(index), 0.1) for index in range(19)]
+    people = section([bucketed('P' * width + str(index), 0.1, role='cast') for index in range(5)])
+    return insight(genres=section(many), decades=section(many[:10]), people=people)
 
 
-def test_long_insights_first_shrink_best_and_worst_to_two():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(10), long_insight(10)))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    genres = RichParser(rich['html']).tables[1]
-    assert [row[0] for row in genres[1:]] == ['B' * 10 + '0', 'B' * 10 + '1', '…', 'W' * 10 + '1', 'W' * 10 + '2']
-    assert len(rendered_titles(rich)) == 10
+def test_a_normal_full_message_is_not_trimmed():
+    rich = render_game_stats('framed', FRAMED, huge_insight(20))
+    assert re.findall(r'<h4>(.*?)</h4>', rich['html']) == ['Жанры', 'Десятилетия', 'Люди']
+    assert len(text_of(rich['html'])) <= STATS_TEXT_LIMIT
 
 
-def test_longer_insights_then_drop_the_people_sections():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(30), long_insight(30)))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    titles = rendered_titles(rich)
-    assert 'Framed: люди' not in titles and 'Episode: люди' not in titles
-    assert len(titles) == 8
+def test_a_message_over_the_text_limit_drops_the_people_then_all_insight():
+    no_people = render_game_stats('framed', FRAMED, huge_insight(880))
+    assert re.findall(r'<h4>(.*?)</h4>', no_people['html']) == ['Жанры', 'Десятилетия']
+    assert len(text_of(no_people['html'])) <= STATS_TEXT_LIMIT
+    nothing = render_game_stats('framed', FRAMED, huge_insight(3000))
+    assert '<h4>' not in nothing['html']
+    assert 'Раунды 9' in nothing['html']
+    assert len(text_of(nothing['html'])) <= STATS_TEXT_LIMIT
 
 
-def test_longest_insights_then_drop_the_episode_sections():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(80), long_insight(80)))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    titles = rendered_titles(rich)
-    assert all(title.startswith('Framed') for title in titles)
-    assert 'Framed: люди' not in titles
-    assert len(titles) == 4
-
-
-def test_insights_that_never_fit_are_left_out_so_telegram_accepts_the_message():
-    rich = render_stats(FRAMED, EPISODE, insights=insights(long_insight(400), long_insight(400)))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    assert rendered_titles(rich) == []
-    # The main table and its explanation stay.
-    assert 'Прочерк значит' in rich['html']
-
-
-def test_trimmed_section_with_all_buckets_keeps_two_best_and_two_worst():
-    genres = section([bucket(f'G{index}' + 'x' * 90, 5.0 - index) for index in range(6)])
-    both = insight(genres=genres, decades=genres)
-    rich = render_stats(FRAMED, EPISODE, insights=insights(both, both))
-    assert len(rich['html']) <= STATS_HTML_LIMIT
-    rows = RichParser(rich['html']).tables[1]
-    assert [row[0][:2] for row in rows[1:]] == ['G0', 'G1', '…', 'G4', 'G5']
+def test_a_message_over_the_block_limit_drops_sections():
+    many = section([bucketed(f'G{index}', 0.1) for index in range(300)])
+    rich = render_game_stats('framed', FRAMED, insight(genres=many, decades=many))
+    assert block_count(rich['html']) <= STATS_BLOCK_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -340,7 +319,7 @@ def test_league_takes_numbers_from_rows_and_names_from_profiles():
         'genre',
         18,
         'Drama & Co',
-        (LeagueRow(5_000_000_123, 'Старое имя', 4.1234, 20.5, 0.6), LeagueRow(7, '李', 3.0, 15, 0.0)),
+        (LeagueRow(5_000_000_123, 'Старое имя', 4.1234, 20.5, 0.6, 0.4567), LeagueRow(7, '李', 3.0, 15, 0.0, -0.6667)),
     )
     profiles = (
         _ResolvedTopResult(5_000_000_123, 'Свежее <имя>', 4.1234, 'fresh_owner'),
@@ -350,22 +329,25 @@ def test_league_takes_numbers_from_rows_and_names_from_profiles():
     parsed = RichParser(rich['html'])
     assert parsed.paragraphs[0] == 'Framed: лига жанра Drama & Co'
     assert parsed.tables[0] == [
-        ['#', 'Имя', 'Очки', 'Раунды', 'Победы'],
-        ['1', 'Свежее <имя>', '4.12', '20.5', '60%'],
-        ['2', '李', '3.00', '15', '0%'],
+        ['#', 'Имя', 'Раунды', 'Победы', 'Сила'],
+        ['1', 'Свежее <имя>', '20.5', '60%', '+0.46'],
+        ['2', '李', '15', '0%', '−0.67'],
     ]
     assert parsed.links == [{'href': 'https://t.me/fresh_owner?profile'}, {'href': 'tg://user?id=7'}]
     assert '<table bordered striped compact>' in rich['html']
     assert rich['html'].index('не меньше 15 раундов') > rich['html'].index('</table>')
+    note = rich['html'][rich['html'].rindex('<details>') :]
+    assert '<summary>Как считается сила</summary>' in note
+    assert 'всех игроков' in text_of(note)
     assert rich['skip_entity_detection'] is True
 
 
 def test_decade_league_title_and_rows_without_profiles_fall_back_to_the_rows():
-    league = League('decade', 1990, '1990-е', (LeagueRow(7, 'Имя', 3.0, 15, 0.5),))
+    league = League('decade', 1990, '1990-е', (LeagueRow(7, 'Имя', 3.0, 15, 0.5, 0.25),))
     rich = render_league('episode', league, league.rows)
     parsed = RichParser(rich['html'])
     assert parsed.paragraphs[0] == 'Episode: лига десятилетия 1990-е'
-    assert parsed.tables[0][1] == ['1', 'Имя', '3.00', '15', '50%']
+    assert parsed.tables[0][1] == ['1', 'Имя', '15', '50%', '+0.25']
     assert parsed.links == [{'href': 'tg://user?id=7'}]
     assert 'делит' not in rich['html']
 
