@@ -173,3 +173,35 @@ async def test_recording_keeps_a_good_image_and_its_length(tmp_path: Path) -> No
 
 def fetch_headers(cache: Any) -> str | None:
     return next(iter(cache.index.values())).get('length')
+
+
+@pytest.mark.parametrize('headers', [{'Content-Type': 'text/html'}, {}], ids=['html', 'no-type'])
+@pytest.mark.asyncio
+async def test_recording_does_not_read_a_rejected_image_response(tmp_path: Path, headers: dict[str, str]) -> None:
+    headers = {**headers, 'Content-Length': '3000000'}
+    direct, recorded, stream, cache = await direct_and_recorded(tmp_path, headers, [b'x' * 3_000_000])
+    assert direct == recorded == []
+    assert stream.read == 0
+    (entry,) = cache.index.values()
+    assert entry['rejected'] is True
+    assert await fetch_image(eval_matching.ReplayTransport(cache, None)) == []
+
+
+@pytest.mark.asyncio
+async def test_recording_does_not_read_a_non_200_image_response(tmp_path: Path) -> None:
+    stream = CountingStream([b'x' * 3_000_000])
+    live = httpx.MockTransport(lambda _: httpx.Response(404, headers={'Content-Type': 'image/jpeg'}, stream=stream))
+    cache = eval_matching.ReplayCache.load(tmp_path)
+    assert await fetch_image(eval_matching.ReplayTransport(cache, live)) == []
+    assert stream.read == 0
+    assert await fetch_image(eval_matching.ReplayTransport(cache, None)) == []
+
+
+@pytest.mark.asyncio
+async def test_recording_keeps_a_non_image_body_of_an_api_request(tmp_path: Path) -> None:
+    live = httpx.MockTransport(lambda _: httpx.Response(200, json={'results': []}))
+    cache = eval_matching.ReplayCache.load(tmp_path)
+    async with httpx.AsyncClient(transport=eval_matching.ReplayTransport(cache, live)) as client:
+        assert (await client.get('https://api.themoviedb.org/3/search/movie?query=a')).json() == {'results': []}
+    (entry,) = cache.index.values()
+    assert 'rejected' not in entry

@@ -37,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from answers.assets import MODES, current_mode_day, parse_asset  # noqa: E402
 from answers.embedder import DIMENSIONS, ProcessEmbedder  # noqa: E402
-from answers.images import MAX_IMAGE_BYTES, ImageFetcher  # noqa: E402
+from answers.images import FRAME_BASE, MAX_IMAGE_BYTES, TMDB_IMAGE_BASE, ImageFetcher  # noqa: E402
 from answers.pipeline import Resolution, Resolver, TmdbVisualSource, sibling_years  # noqa: E402
 from answers.ratelimit import API_RATE, CDN_RATE, SITE_RATE, RateLimiter  # noqa: E402
 from answers.tmdb import TmdbClient  # noqa: E402
@@ -55,6 +55,14 @@ class ReplayMiss(Exception):
 def request_key(request: httpx.Request) -> str:
     query = urlencode(sorted(request.url.params.multi_items()))
     return f'{request.method} {request.url.scheme}://{request.url.host}{request.url.path}?{query}'
+
+
+IMAGE_PREFIXES = (*(f'{base}/' for base in FRAME_BASE.values()), TMDB_IMAGE_BASE + '/')
+
+
+def is_image_request(request: httpx.Request) -> bool:
+    """The requests that ImageFetcher makes: frames on the game sites and images on the TMDB CDN."""
+    return str(request.url).startswith(IMAGE_PREFIXES)
 
 
 @dataclass
@@ -123,7 +131,7 @@ class ReplayTransport(httpx.AsyncBaseTransport):
             raise ReplayMiss(key)
         response = await self._live.handle_async_request(request)
         try:
-            body, rejected = await self._read(response)
+            body, rejected = await self._read(request, response)
         finally:
             await response.aclose()
         status = response.status_code
@@ -148,10 +156,12 @@ class ReplayTransport(httpx.AsyncBaseTransport):
         return httpx.Response(status, headers=headers, content=body, request=request)
 
     @staticmethod
-    async def _read(response: httpx.Response) -> tuple[bytes, bool]:
-        """Read the body as ImageFetcher does: an image over the bound is rejected before or while it is read."""
-        if not response.headers.get('Content-Type', '').startswith('image/'):
+    async def _read(request: httpx.Request, response: httpx.Response) -> tuple[bytes, bool]:
+        """Read the body as ImageFetcher does: a rejected image response is not read, an image over the bound stops."""
+        if not is_image_request(request):
             return await response.aread(), False
+        if response.status_code != 200 or not response.headers.get('Content-Type', '').startswith('image/'):
+            return b'', True
         declared = response.headers.get('Content-Length', '')
         if declared.isascii() and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
             return b'', True
