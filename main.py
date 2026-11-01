@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -54,13 +55,24 @@ from answers.scraper import BundleEntry, fetch_entries
 from answers.store import DbAnswerStore
 from answers.sync import AnswerSync
 from answers.tmdb import TmdbClient, TmdbError
+from insight import Choice, Dimension, game_insight, hard_titles, league, league_choices
 from models import FramedResult, User
 from models.episode_result import EpisodeResult
 from models.group import Group
 from models.migrate import upgrade_database
 from models.top import top_results
 from reaction_delivery import ReactionDelivery, ReactionIntent
-from rich_tables import TOP_WIN_LABELS, enrich_top_profiles, render_stats, render_top, send_rich_message
+from rich_tables import (
+    TOP_WIN_LABELS,
+    RichMessage,
+    enrich_top_profiles,
+    render_hard_titles,
+    render_league,
+    render_league_picker,
+    render_stats,
+    render_top,
+    send_rich_message,
+)
 from stats import get_user_stats
 from top_type import TopType
 
@@ -281,17 +293,6 @@ class ResultSaver(Protocol):
     async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool: ...
 
 
-async def delete_message_task(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    if job is None:
-        return
-    chat_id = job.chat_id
-    message_id = job.data
-    if chat_id is None or not isinstance(message_id, int):
-        return
-    await context.bot.delete_message(chat_id, message_id)
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None:
@@ -346,6 +347,15 @@ async def new_episode_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_results(update, context, episode_pattern, EpisodeResult)
 
 
+@dataclass(frozen=True, slots=True)
+class StatsOwner:
+    """The user who asked for /stats, in the shape that enrich_top_profiles reads."""
+
+    user_id: int
+    name: str
+    score: None = None
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     effective_user = update.effective_user
     effective_chat = update.effective_chat
@@ -360,21 +370,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     framed_stats, episode_stats = user_stats
-
-    reply_message = await send_rich_message(
+    today = utc_today()
+    insights = {game: await game_insight(effective_user.id, game, today) for game in GAMES}
+    (owner,) = await enrich_top_profiles(
         context.bot,
-        effective_chat.id,
-        render_stats(framed_stats, episode_stats),
-        reply_to_message_id=message.id,
+        [StatsOwner(effective_user.id, effective_user.full_name)],
+        group_chat_id=effective_chat.id if effective_chat.type in ('group', 'supergroup') else None,
     )
 
-    job_queue = context.job_queue
-    if job_queue is None:
-        return
-
-    job_queue.run_once(delete_message_task, timedelta(seconds=30), message.id, chat_id=effective_chat.id)
-
-    job_queue.run_once(delete_message_task, timedelta(seconds=30), reply_message.id, chat_id=effective_chat.id)
+    # The message is long, so the bot keeps it. The first line names the owner of the stats.
+    await send_rich_message(
+        context.bot,
+        effective_chat.id,
+        render_stats(framed_stats, episode_stats, owner=owner, insights=insights),
+        reply_to_message_id=message.id,
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,6 +477,11 @@ TOP_GAME_EMOJI: dict[Game, str] = {'framed': '🎥', 'episode': '📺'}
 TOP_CALLBACK_PATTERN = r'^top:(framed|episode):([1-4])$'
 # Buttons of the JSON format, for example {"top": 2}, stay in old messages. The bot ignores them.
 LEGACY_TOP_CALLBACK_PATTERN = r'^{"top": [\d]+}$'
+# The metadata screens of /top: two pickers, one league of each picker, and the hard titles.
+TOP_SCREEN_LABELS: dict[str, str] = {'genres': 'Жанры', 'decades': 'Десятилетия', 'hard': 'Сложные'}
+TOP_SCREEN_PATTERN = r'^top:(framed|episode):(genres|decades|hard|genre:[0-9]{1,9}|decade:[0-9]{4})$'
+PICKER_COLUMNS = 3
+BACK_LABEL = '← Назад'
 
 
 def top_callback_data(game: Game, top_type: TopType) -> str:
@@ -502,6 +517,10 @@ def top_reply_markup(game: Game, top_type: TopType) -> InlineKeyboardMarkup:
                     callback_data=top_callback_data(game, _type),
                 )
                 for _type, label in metric_labels.items()
+            ],
+            [
+                InlineKeyboardButton(label, callback_data=f'top:{game}:{screen}')
+                for screen, label in TOP_SCREEN_LABELS.items()
             ],
             [
                 InlineKeyboardButton(
@@ -570,21 +589,9 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_chat_id=query_message.chat_id if query_message.chat.type in ('group', 'supergroup') else None,
     )
     try:
-        # PTB's typed edit_message_text still requires text; the public API bridge
-        # allows the new rich_message parameter without sending a plain text field.
-        await context.bot.do_api_request(
-            'editMessageText',
-            api_kwargs={
-                'chat_id': query_message.chat_id,
-                'message_id': query_message.message_id,
-                'rich_message': render_top(game, top_type, profiles),
-                'reply_markup': top_reply_markup(game, top_type),
-            },
+        await edit_rich_message(
+            context, query_message, render_top(game, top_type, profiles), top_reply_markup(game, top_type)
         )
-    except BadRequest as error:
-        # Two fast taps can ask for the same leaderboard. Telegram then rejects the second edit.
-        if 'message is not modified' not in str(error).lower():
-            raise
     finally:
         await query.answer()
 
@@ -592,6 +599,85 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ignore_legacy_top(update: Update, _context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is not None:
+        await query.answer()
+
+
+def back_markup(callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(BACK_LABEL, callback_data=callback_data)]])
+
+
+def picker_markup(game: Game, dimension: Dimension, choices: Sequence[Choice]) -> InlineKeyboardMarkup:
+    """Only leagues that have a board get a button. Back opens the main score board of the game."""
+    buttons = [
+        InlineKeyboardButton(choice.label, callback_data=f'top:{game}:{dimension}:{choice.key}') for choice in choices
+    ]
+    rows = [buttons[start : start + PICKER_COLUMNS] for start in range(0, len(buttons), PICKER_COLUMNS)]
+    rows.append([InlineKeyboardButton(BACK_LABEL, callback_data=top_callback_data(game, TopType.TOP_SCORE))])
+    return InlineKeyboardMarkup(rows)
+
+
+async def top_screen(
+    context: ContextTypes.DEFAULT_TYPE, message: TelegramMessage, game: Game, screen: str
+) -> tuple[RichMessage, InlineKeyboardMarkup]:
+    today = utc_today()
+    match screen.split(':'):
+        case ['genres' | 'decades' as picker]:
+            dimension: Dimension = 'genre' if picker == 'genres' else 'decade'
+            choices = await league_choices(game, dimension, today)
+            return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
+        case ['genre' | 'decade' as dimension, key]:
+            board = await league(game, dimension, int(key), today)
+            back = back_markup(f'top:{game}:{dimension}s')
+            if board is None:
+                # The board can stop to exist between two taps. The picker then shows the boards that exist.
+                choices = await league_choices(game, dimension, today)
+                return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
+            profiles = await enrich_top_profiles(
+                context.bot,
+                board.rows,
+                group_chat_id=message.chat_id if message.chat.type in ('group', 'supergroup') else None,
+            )
+            return render_league(game, board, profiles), back
+        case _:
+            titles = await hard_titles(game, today)
+            return render_hard_titles(game, titles), back_markup(top_callback_data(game, TopType.TOP_SCORE))
+
+
+async def edit_rich_message(
+    context: ContextTypes.DEFAULT_TYPE, message: TelegramMessage, rich: RichMessage, markup: InlineKeyboardMarkup
+) -> None:
+    try:
+        # PTB's typed edit_message_text still requires text; the public API bridge
+        # allows the new rich_message parameter without sending a plain text field.
+        await context.bot.do_api_request(
+            'editMessageText',
+            api_kwargs={
+                'chat_id': message.chat_id,
+                'message_id': message.message_id,
+                'rich_message': rich,
+                'reply_markup': markup,
+            },
+        )
+    except BadRequest as error:
+        # Two fast taps can ask for the same screen. Telegram then rejects the second edit.
+        if 'message is not modified' not in str(error).lower():
+            raise
+
+
+async def inline_top_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+    match = re.fullmatch(TOP_SCREEN_PATTERN, query.data)
+    game = parse_game(match.group(1)) if match else None
+    query_message = query.message
+    if match is None or game is None or not isinstance(query_message, TelegramMessage):
+        await query.answer()
+        return
+    try:
+        rich, markup = await top_screen(context, query_message, game, match.group(2))
+        await edit_rich_message(context, query_message, rich, markup)
+    finally:
         await query.answer()
 
 
@@ -666,6 +752,9 @@ def build_application() -> ReactionApplication:
 
     inline_top_handler = CallbackQueryHandler(inline_top, pattern=TOP_CALLBACK_PATTERN, block=False)
     application.add_handler(inline_top_handler)
+
+    inline_top_screen_handler = CallbackQueryHandler(inline_top_screen, pattern=TOP_SCREEN_PATTERN, block=False)
+    application.add_handler(inline_top_screen_handler)
 
     legacy_top_handler = CallbackQueryHandler(ignore_legacy_top, pattern=LEGACY_TOP_CALLBACK_PATTERN, block=False)
     application.add_handler(legacy_top_handler)

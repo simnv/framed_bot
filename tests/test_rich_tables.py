@@ -1,7 +1,7 @@
 # The request adapter records real PTB JSON serialization without network access.
 import json
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,6 +15,7 @@ from telegram.warnings import PTBUserWarning
 
 import main
 import rich_tables
+from insight import GameInsight, Section
 from rich_tables import render_stats, render_top
 from stats import Stats
 from top_type import TopType
@@ -319,6 +320,7 @@ def keyboard_rows(reply_markup):
                     ('Фильмы', 'top:framed:3'),
                     ('Участия', 'top:framed:4'),
                 ],
+                [('Жанры', 'top:framed:genres'), ('Десятилетия', 'top:framed:decades'), ('Сложные', 'top:framed:hard')],
                 [('📺 Переключить на Episode', 'top:episode:1')],
             ],
         ),
@@ -331,6 +333,11 @@ def keyboard_rows(reply_markup):
                     ('Кадры', 'top:episode:2'),
                     ('📺 Сериалы', 'top:episode:3'),
                     ('Участия', 'top:episode:4'),
+                ],
+                [
+                    ('Жанры', 'top:episode:genres'),
+                    ('Десятилетия', 'top:episode:decades'),
+                    ('Сложные', 'top:episode:hard'),
                 ],
                 [('🎥 Переключить на Framed', 'top:framed:3')],
             ],
@@ -364,6 +371,7 @@ def test_application_registers_new_and_legacy_top_callbacks(monkeypatch):
     }
     assert handlers == {
         main.inline_top: main.TOP_CALLBACK_PATTERN,
+        main.inline_top_screen: main.TOP_SCREEN_PATTERN,
         main.ignore_legacy_top: main.LEGACY_TOP_CALLBACK_PATTERN,
     }
 
@@ -566,36 +574,33 @@ async def test_legacy_top_button_only_acknowledges(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('has_job_queue', [True, False])
-async def test_stats_uses_read_only_aggregate_and_preserves_thirty_second_deletion(monkeypatch, has_job_queue):
+async def test_stats_sends_one_kept_message_that_names_its_owner(monkeypatch):
     request = TelegramRequest()
-    context = make_context(request, job_queue=has_job_queue)
+    context = make_context(request)
     aggregates = (Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
     get_stats = AsyncMock(return_value=aggregates)
     monkeypatch.setattr(main, 'get_user_stats', get_stats)
+    empty = GameInsight(Section(()), Section(()), Section(()), 0, 0, ())
+    get_insight = AsyncMock(return_value=empty)
+    monkeypatch.setattr(main, 'game_insight', get_insight)
     update_user = AsyncMock()
     monkeypatch.setattr(main.User, 'update_from_tg_user', update_user)
     schedule = Mock()
     monkeypatch.setattr(JobQueue, 'run_once', schedule)
     async with context.bot:
-        if has_job_queue:
-            await main.stats(command_update('/stats'), context)
-        else:
-            with pytest.warns(PTBUserWarning, match='No `JobQueue`'):
-                await main.stats(command_update('/stats'), context)
+        await main.stats(command_update('/stats'), context)
     get_stats.assert_awaited_once_with(99)
+    assert [call.args[:2] for call in get_insight.await_args_list] == [(99, 'framed'), (99, 'episode')]
     update_user.assert_not_awaited()
     params = next(params for endpoint, params in request.calls if endpoint == 'sendRichMessage')
-    assert json.loads(params['rich_message']) == render_stats(*aggregates)
+    html = json.loads(params['rich_message'])['html']
+    assert 'Статистика для' in html
+    # The owner name links to the profile, like a name in /top.
+    assert '?profile">Test</a>' in html
     assert json.loads(params['reply_parameters']) == {'message_id': 456}
-    if has_job_queue:
-        assert schedule.call_count == 2
-        assert {call.args[2] for call in schedule.call_args_list} == {456, 777}
-        for call in schedule.call_args_list:
-            assert call.args[:2] == (main.delete_message_task, timedelta(seconds=30))
-            assert call.kwargs == {'chat_id': -123}
-    else:
-        schedule.assert_not_called()
+    # The long message stays: the bot does not delete the command or the reply.
+    schedule.assert_not_called()
+    assert not any(endpoint == 'deleteMessage' for endpoint, _ in request.calls)
 
 
 @pytest.mark.asyncio
