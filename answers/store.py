@@ -190,6 +190,15 @@ class DbAnswerStore:
             result = await session.execute(site_updates_query(up_to_round))
             return [(number, tmdb_id) for number, tmdb_id in result.all()]
 
+    async def reject_site_id(self, round_number: int, tmdb_id: int) -> None:
+        """Keep fetched days but clear a missing TMDB id, so later syncs use normal matching."""
+        async with AsyncScopedSession() as session, session.begin():
+            await session.execute(
+                update(FramedAsset)
+                .where(FramedAsset.classic_day == round_number, FramedAsset.tmdb_id == tmdb_id)
+                .values(tmdb_id=None)
+            )
+
     async def has_answer(self, game: Game, round_number: int) -> bool:
         async with AsyncScopedSession() as session:
             found = await session.scalar(

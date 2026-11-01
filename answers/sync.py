@@ -15,7 +15,7 @@ from .pipeline import Resolution, sibling_years
 from .ratelimit import Throttled
 from .scraper import BundleEntry, ScrapeError
 from .store import PendingAnswer
-from .tmdb import TitleData, TmdbError
+from .tmdb import TitleData, TmdbError, TmdbNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,8 @@ class AnswerStore(Protocol):
     async def save_asset(self, asset: Asset) -> None: ...
 
     async def site_updates(self, up_to_round: int) -> list[tuple[int, int]]: ...
+
+    async def reject_site_id(self, round_number: int, tmdb_id: int) -> None: ...
 
 
 class TitleSource(Protocol):
@@ -211,15 +213,19 @@ class AnswerSync:
             newest = current_mode_day(mode, today)
             try:
                 for day in await self._store.missing_asset_days(mode, newest):
-                    asset = await assets.fetch(mode, day)
+                    try:
+                        asset = await assets.fetch(mode, day)
+                    except Throttled:
+                        raise
+                    except AssetError as error:
+                        logger.warning('Cannot read Framed %s day %d: %s', mode, day, type(error).__name__)
+                        continue
                     # A 404 on a recent day may mean a late publication: keep it missing to fetch it again.
                     if asset.tmdb_id is None and asset.classic_day is None and day > newest - RECENT_DAYS:
                         continue
                     await self._store.save_asset(asset)
             except Throttled:
                 raise
-            except AssetError as error:
-                logger.warning('Cannot read Framed %s assets: %s', mode, error)
             except SQLAlchemyError as error:
                 logger.warning('Cannot store Framed %s assets: %s', mode, type(error).__name__)
 
@@ -236,7 +242,11 @@ class AnswerSync:
             return
         for round_number, tmdb_id in updates:
             try:
-                await self._save('framed', round_number, tmdb, tmdb_id, 'site')
+                try:
+                    await self._save('framed', round_number, tmdb, tmdb_id, 'site')
+                except TmdbNotFound:
+                    await self._store.reject_site_id(round_number, tmdb_id)
+                    logger.warning('Rejected missing TMDB site id %d for framed round %d', tmdb_id, round_number)
             except Throttled:
                 raise
             except TmdbError as error:

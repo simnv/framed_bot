@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from typing import Any
 
@@ -14,7 +14,7 @@ from answers.ratelimit import Throttled
 from answers.scraper import BundleEntry, ScrapeError
 from answers.store import PendingAnswer
 from answers.sync import AnswerSync
-from answers.tmdb import TitleData, TmdbClient, TmdbError, TmdbRateLimited
+from answers.tmdb import TitleData, TmdbClient, TmdbError, TmdbNotFound, TmdbRateLimited
 
 TITLES = [f'Film {number}' for number in range(1, 201)]
 # Framed round 1695 and Episode round 217; both limits are far above the small rounds in these tests.
@@ -73,6 +73,11 @@ class FakeStore:
     async def save_asset(self, asset: Asset) -> None:
         self.assets.setdefault((asset.mode, asset.day), asset)
 
+    async def reject_site_id(self, round_number: int, tmdb_id: int) -> None:
+        for key, asset in self.assets.items():
+            if asset.classic_day == round_number and asset.tmdb_id == tmdb_id:
+                self.assets[key] = replace(asset, tmdb_id=None)
+
     async def site_updates(self, up_to_round: int) -> list[tuple[int, int]]:
         site = {a.classic_day: a.tmdb_id for a in self.assets.values() if a.classic_day and a.tmdb_id}
         return [
@@ -116,6 +121,7 @@ class FakeTmdb:
     image_ids: list[int | None] = field(default_factory=list)
     siblings: list[dict[str, frozenset[int]]] = field(default_factory=list)
     detail_errors: dict[int, Exception] = field(default_factory=dict)
+    detail_requests: list[int] = field(default_factory=list)
     closed: bool = False
 
     async def resolve(
@@ -140,6 +146,7 @@ class FakeTmdb:
         self.closed = True
 
     async def details(self, kind: Kind, tmdb_id: int) -> TitleData:
+        self.detail_requests.append(tmdb_id)
         if tmdb_id in self.detail_errors:
             raise self.detail_errors[tmdb_id]
         return title_data(tmdb_id, kind)
@@ -147,7 +154,7 @@ class FakeTmdb:
 
 @dataclass
 class FakeAssets:
-    # (mode, day) -> asset; other days return 404 rows. An exception stops the mode.
+    # (mode, day) -> asset; other days return 404 rows.
     found: dict[tuple[Mode, int], Asset | Exception] = field(default_factory=dict)
     requests: list[tuple[Mode, int]] = field(default_factory=list)
 
@@ -551,16 +558,30 @@ async def test_a_new_site_id_replaces_a_text_match_but_text_never_replaces_site(
 
 
 @pytest.mark.asyncio
-async def test_an_asset_error_stops_that_mode_and_matching_continues(caplog: pytest.LogCaptureFixture) -> None:
-    assets = FakeAssets({('titleshot', 2): AssetError('titleshot day 2 returned HTTP 500')})
+async def test_an_asset_error_skips_only_that_day_and_retries_it_next_sync(caplog: pytest.LogCaptureFixture) -> None:
+    assets = FakeAssets(
+        {
+            ('titleshot', 2): AssetError('synthetic sensitive response'),
+            ('titleshot', 3): site_asset('titleshot', 3, 3, 900),
+        }
+    )
     sync, store, _, _, _ = make_sync(today=date(2025, 7, 25), assets=assets)
 
     await sync.sync('framed', 1)
 
-    assert ('titleshot', 3) not in assets.requests
+    assert store.assets[('titleshot', 3)] == site_asset('titleshot', 3, 3, 900)
+    assert ('titleshot', 2) not in store.assets
     assert ('poster', 1) in assets.requests
     assert store.rows[('framed', 1)] == Row('Film 1', 1, 'auto')
-    assert 'HTTP 500' in caplog.text
+    assert 'Cannot read Framed titleshot day 2: AssetError' in caplog.text
+    assert 'synthetic sensitive response' not in caplog.text
+
+    assets.found[('titleshot', 2)] = site_asset('titleshot', 2, 2, 800)
+    await sync.sync('framed', 1)
+
+    assert assets.requests.count(('titleshot', 2)) == 2
+    assert assets.requests.count(('titleshot', 3)) == 1
+    assert store.assets[('titleshot', 2)] == site_asset('titleshot', 2, 2, 800)
 
 
 @pytest.mark.asyncio
@@ -573,6 +594,66 @@ async def test_a_rate_limit_in_the_site_step_stops_the_run() -> None:
 
     assert store.rows[('framed', 1)] == Row('Film 1')
     assert tmdb.finds == []
+
+
+@pytest.mark.asyncio
+async def test_a_missing_site_title_is_skipped_by_later_syncs_and_falls_back_to_matching() -> None:
+    assets = FakeAssets({('titleshot', 1): site_asset('titleshot', 1, 1, 900)})
+    tmdb = FakeTmdb(detail_errors={900: TmdbNotFound('HTTP 404')})
+    sync, store, _, _, _ = make_sync(tmdb=tmdb, today=date(2025, 6, 5), assets=assets)
+
+    await sync.sync('framed', 1)
+    # Recreate the sync: rejection must survive beyond the in-memory worker.
+    restarted, _, _, _, _ = make_sync(store=store, tmdb=tmdb, today=date(2025, 6, 5), assets=assets)
+    await restarted.sync('framed', 1)
+
+    assert tmdb.detail_requests == [900, 1]
+    assert store.rows[('framed', 1)] == Row('Film 1', 1, 'auto')
+    assert tmdb.finds == [('movie', 'Film 1')]
+    assert assets.requests == [('titleshot', 1)]
+    assert await store.site_updates(1) == []
+
+
+@pytest.mark.parametrize('error', [TmdbError('HTTP 500'), TmdbError('unexpected shape'), TmdbError('timeout')])
+@pytest.mark.asyncio
+async def test_other_site_title_errors_are_retried_on_the_next_sync(error: TmdbError) -> None:
+    assets = FakeAssets({('titleshot', 1): site_asset('titleshot', 1, 1, 900)})
+    tmdb = FakeTmdb(detail_errors={900: error})
+    sync, store, _, _, _ = make_sync(tmdb=tmdb, today=date(2025, 6, 5), assets=assets)
+
+    await sync.sync('framed', 1)
+    tmdb.detail_errors.clear()
+    await sync.sync('framed', 1)
+
+    assert tmdb.detail_requests == [900, 1, 900]
+    assert store.rows[('framed', 1)] == Row('Film 1', 900, 'site')
+
+
+@pytest.mark.asyncio
+async def test_a_failed_site_rejection_is_retried_and_does_not_stop_other_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assets = FakeAssets({('titleshot', 1): site_asset('titleshot', 1, 1, 900)})
+    tmdb = FakeTmdb(detail_errors={900: TmdbNotFound('HTTP 404')})
+    sync, store, _, _, _ = make_sync(tmdb=tmdb, today=date(2025, 6, 5), assets=assets)
+
+    async def failed_rejection(round_number: int, tmdb_id: int) -> None:
+        raise SQLAlchemyError('synthetic database secret')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, 'reject_site_id', failed_rejection)
+        await sync.sync('framed', 2)
+
+    assert store.rows[('framed', 2)] == Row('Film 2', 2, 'auto')
+    assert await store.site_updates(2) == [(1, 900)]
+    assert 'SQLAlchemyError' in caplog.text
+    assert 'synthetic database secret' not in caplog.text
+
+    await sync.sync('framed', 2)
+
+    assert tmdb.detail_requests == [900, 1, 2, 900]
+    assert await store.site_updates(2) == []
 
 
 @pytest.mark.asyncio
