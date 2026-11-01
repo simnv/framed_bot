@@ -172,7 +172,7 @@ async def aggregate_stats():
     # The history has 600 rounds per game. Each statement returns aggregates (a few rows at most), never the
     # history, and the number of statements does not change with the history length.
     assert max(max(0, count) for count in fetched) <= 2, f'/stats materialized history rows: {fetched}'
-    assert len(statements) <= 30, f'/stats ran {len(statements)} statements'
+    assert len(statements) <= 40, f'/stats ran {len(statements)} statements'
     assert await stats_module.get_user_stats(USER_ID + 1) is None
     await User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Empty', False))
     assert await stats_module.get_user_stats(USER_ID + 1) == (

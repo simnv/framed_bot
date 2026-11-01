@@ -311,6 +311,25 @@ async def test_exact_league_tie_on_a_rounding_boundary_falls_to_the_name(databas
 
 
 @pytest.mark.asyncio
+async def test_league_rows_rank_by_strength_against_all_players_and_carry_the_personal_strength(database):
+    add_title(database, 1, genres=(1,))
+    add_title(database, 2, genres=(2,))
+    # 15 genre 1 rounds each: user 1 at 6 points, user 2 at 3, user 3 at 1. User 1 also misses 10 genre 2 rounds.
+    add_rounds(database, user=1, start=1, count=15, title=1, frame=1)
+    add_rounds(database, user=2, start=1, count=15, title=1, frame=4)
+    add_rounds(database, user=3, start=1, count=15, title=1, frame=None)
+    add_rounds(database, user=1, start=101, count=10, title=2, frame=None)
+
+    board = await insight.league('framed', 'genre', 1, TODAY)
+
+    # All players: mean 160 / 55 = 32 / 11. Own means: 4, 3 and 1. Strength = n * (average - mean) / (n + 10).
+    assert board is not None
+    assert [row.user_id for row in board.rows] == [1, 2, 3]
+    assert [row.strength for row in board.rows] == pytest.approx([102 / 55, 3 / 55, -63 / 55])
+    assert [row.personal for row in board.rows] == pytest.approx([1.2, 0.0, 0.0])
+
+
+@pytest.mark.asyncio
 async def test_league_needs_three_players_with_fifteen_weighted_rounds(database):
     add_title(database, genres=(1, 2))
     add_rounds(database, user=1, count=30)

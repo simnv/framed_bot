@@ -319,7 +319,10 @@ def test_league_takes_numbers_from_rows_and_names_from_profiles():
         'genre',
         18,
         'Drama & Co',
-        (LeagueRow(5_000_000_123, 'Старое имя', 4.1234, 20.5, 0.6, 0.4567), LeagueRow(7, '李', 3.0, 15, 0.0, -0.6667)),
+        (
+            LeagueRow(5_000_000_123, 'Старое имя', 4.1234, 20.5, 0.6, 0.4567, 0.1),
+            LeagueRow(7, '李', 3.0, 15, 0.0, -0.6667, 0.25),
+        ),
     )
     profiles = (
         _ResolvedTopResult(5_000_000_123, 'Свежее <имя>', 4.1234, 'fresh_owner'),
@@ -329,25 +332,27 @@ def test_league_takes_numbers_from_rows_and_names_from_profiles():
     parsed = RichParser(rich['html'])
     assert parsed.paragraphs[0] == 'Framed: лига жанра Drama & Co'
     assert parsed.tables[0] == [
-        ['#', 'Имя', 'Раунды', 'Победы', 'Сила'],
-        ['1', 'Свежее <имя>', '20.5', '60%', '+0.46'],
-        ['2', '李', '15', '0%', '−0.67'],
+        ['#', 'Имя', 'Раунды', 'Победы', 'Общая', 'Личная'],
+        ['1', 'Свежее <имя>', '20.5', '60%', '+0.46', '+0.10'],
+        ['2', '李', '15', '0%', '−0.67', '+0.25'],
     ]
     assert parsed.links == [{'href': 'https://t.me/fresh_owner?profile'}, {'href': 'tg://user?id=7'}]
     assert '<table bordered striped compact>' in rich['html']
     assert rich['html'].index('не меньше 15 раундов') > rich['html'].index('</table>')
     note = rich['html'][rich['html'].rindex('<details>') :]
     assert '<summary>Как считается сила</summary>' in note
-    assert 'всех игроков' in text_of(note)
+    # The note explains both columns: against all players and against the own level.
+    assert 'Общая' in text_of(note) and 'всех игроков' in text_of(note)
+    assert 'Личная' in text_of(note) and '/stats' in text_of(note)
     assert rich['skip_entity_detection'] is True
 
 
 def test_decade_league_title_and_rows_without_profiles_fall_back_to_the_rows():
-    league = League('decade', 1990, '1990-е', (LeagueRow(7, 'Имя', 3.0, 15, 0.5, 0.25),))
+    league = League('decade', 1990, '1990-е', (LeagueRow(7, 'Имя', 3.0, 15, 0.5, 0.25, -0.5),))
     rich = render_league('episode', league, league.rows)
     parsed = RichParser(rich['html'])
     assert parsed.paragraphs[0] == 'Episode: лига десятилетия 1990-е'
-    assert parsed.tables[0][1] == ['1', 'Имя', '15', '50%', '+0.25']
+    assert parsed.tables[0][1] == ['1', 'Имя', '15', '50%', '+0.25', '−0.50']
     assert parsed.links == [{'href': 'tg://user?id=7'}]
     assert 'делит' not in rich['html']
 

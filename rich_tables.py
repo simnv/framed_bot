@@ -312,6 +312,7 @@ _GAME_SITES: dict[Game, str] = {'framed': 'https://framed.wtf/', 'episode': 'htt
 _ROLE_LABELS = {'director': 'режиссёр', 'creator': 'создатель', 'cast': 'актёр'}
 _BOARD_LABELS = {'score': 'очки', 'frame': 'кадры', 'rounds': 'участия'}
 _LEAGUE_ALIGNMENTS: tuple[Literal['left', 'center'], ...] = ('center', 'left', 'center', 'center', 'center')
+_LEAGUE_COLUMNS: tuple[Literal['left', 'center'], ...] = (*_LEAGUE_ALIGNMENTS, 'center')
 
 
 def _numbers_line(stats: GameStats) -> str:
@@ -459,16 +460,27 @@ def render_league_picker(game: Game, dimension: Dimension, choices: Sequence[Cho
 def render_league(game: Game, league: League, profiles: Sequence[TopResult]) -> RichMessage:
     """Numbers come from league.rows, linked names from profiles, which follow the same order."""
     rows = [
-        (rank, _profile_name(profile), _rounds(row.rounds), _percent(row.win_rate), _strength(row.strength))
+        (
+            rank,
+            _profile_name(profile),
+            _rounds(row.rounds),
+            _percent(row.win_rate),
+            _strength(row.strength),
+            _strength(row.personal),
+        )
         for rank, (row, profile) in enumerate(zip(league.rows, profiles, strict=True), 1)
     ]
     html = f'<p>{_GAME_TITLES[game]}: лига {_DIMENSION_WORDS[league.dimension][3]} {escape(league.label)}</p>'
-    html += _table(('#', 'Имя', 'Раунды', 'Победы', 'Сила'), rows, alignments=_LEAGUE_ALIGNMENTS)
+    html += _table(('#', 'Имя', 'Раунды', 'Победы', 'Общая', 'Личная'), rows, alignments=_LEAGUE_COLUMNS)
     html += f'<p>{_league_rule(league.dimension)}</p>'
     note = (
-        '<p>Сила — насколько игрок играет лучше (+) или хуже (\u2212) среднего уровня всех игроков, '
+        '<p>Общая сила — насколько игрок играет лучше (+) или хуже (\u2212) среднего уровня всех игроков, '
         f'в очках за раунд. К раундам игрока в лиге бот добавляет {SMOOTHING} раундов со средними очками '
-        'всех игроков, поэтому несколько удачных раундов не поднимают игрока на первое место.</p>'
+        'всех игроков, поэтому несколько удачных раундов не поднимают игрока на первое место. '
+        'Лига сортирует игроков по общей силе.</p>'
+        '<p>Личная сила — насколько игрок играет здесь лучше или хуже своего обычного уровня, как в /stats. '
+        f'Бот добавляет {SMOOTHING} раундов со средними очками самого игрока. Высокая личная сила '
+        'показывает знатока этой лиги, даже если в целом игрок слабее других.</p>'
     )
     if league.dimension == 'genre':
         note += (

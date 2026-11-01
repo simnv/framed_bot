@@ -318,6 +318,11 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
 
 async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
     mean = await _mean(_mean_statement(eligible))
+    # The own mean of each player gives the personal strength, the same number as in /stats.
+    own = {
+        row.user_id: Fraction(int(row.total), int(row.count))
+        for row in await _rows(_mean_statement(eligible).add_columns(eligible.c.user_id).group_by(eligible.c.user_id))
+    }
     rows = await _rows(_bucket_statement(eligible, dimension))
     grouped: dict[int, list[LeagueRow]] = {}
     labels: dict[int, str] = {}
@@ -327,7 +332,15 @@ async def _league_boards(eligible: CTE, dimension: Dimension) -> list[League]:
         bucket = _bucket(row, mean, dimension)
         labels[row.key] = bucket.label
         grouped.setdefault(row.key, []).append(
-            LeagueRow(row.user_id, row.name, bucket.points, bucket.rounds, bucket.win_rate, bucket.strength)
+            LeagueRow(
+                row.user_id,
+                row.name,
+                bucket.points,
+                bucket.rounds,
+                bucket.win_rate,
+                bucket.strength,
+                _bucket(row, own[row.user_id], dimension).strength,
+            )
         )
     boards = []
     for key, players in grouped.items():

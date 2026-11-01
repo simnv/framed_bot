@@ -86,6 +86,8 @@ class LeagueRow:
     win_rate: float
     # The score minus the mean of all players of the game: above 0 is better than the average player.
     strength: float = 0.0
+    # The strength against the own mean of the player, as in /stats: above 0 is better than usual.
+    personal: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
