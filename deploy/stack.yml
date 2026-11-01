@@ -56,8 +56,8 @@ services:
     deploy:
       <<: *service
       resources:
-        limits: {cpus: '0.5', memory: 256M}
-        reservations: {memory: 64M}
+        limits: {cpus: '1.0', memory: 1536M}
+        reservations: {memory: 256M}
   db:
     image: postgres:18.6-trixie
     environment:

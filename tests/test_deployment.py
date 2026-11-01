@@ -1,6 +1,7 @@
 """Opt-in real local Docker/PostgreSQL checks. Never start the Telegram application."""
 import hashlib
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -249,6 +250,7 @@ def test_release_payload_includes_runtime_packages():
     files = runpy.run_path(str(ROOT / 'deploy/prepare_release.py'))['FILES']
     for name in ('answers/__init__.py', 'models/migrations/env.py', 'models/migrations/versions/0001_baseline.py'):
         assert name in files
+    assert 'deploy/fetch-model.py' in files
     assert 'COPY answers/ ./answers/' in (ROOT / 'Dockerfile').read_text()
 
 
@@ -287,3 +289,68 @@ def test_failed_partial_initialization_stays_unhealthy(tmp_path):
         assert all(value not in logs for value in passwords)
     finally:
         docker('rm', '-fv', name, check=False)
+
+
+def test_dockerfile_downloads_the_pinned_clip_model():
+    from answers.clip_model import DEFAULT_MODEL_PATH, MODEL_BYTES, MODEL_SHA256, MODEL_URL
+
+    dockerfile = (ROOT / 'Dockerfile').read_text()
+    assert re.fullmatch(r'https://huggingface\.co/[\w.-]+/[\w.-]+/resolve/[0-9a-f]{40}/[\w./-]+\.onnx', MODEL_URL)
+    assert re.fullmatch(r'[0-9a-f]{64}', MODEL_SHA256)
+    assert f'ARG CLIP_URL={MODEL_URL}\n' in dockerfile
+    assert f'ARG CLIP_SHA256={MODEL_SHA256}\n' in dockerfile
+    assert f'ARG CLIP_BYTES={MODEL_BYTES}\n' in dockerfile
+    assert f'"$CLIP_BYTES" {DEFAULT_MODEL_PATH}\n' in dockerfile
+    assert 'COPY --from=clip /opt/clip/ /opt/clip/\n' in dockerfile
+    assert f"or '{DEFAULT_MODEL_PATH}'" in (ROOT / 'config.py').read_text()
+
+
+def test_stack_gives_the_bot_one_cpu_and_one_gigabyte():
+    stack = (ROOT / 'deploy/stack.yml').read_text()
+    bot = stack.split('  bot:\n', 1)[1].split('\n  db:\n', 1)[0]
+    assert "limits: {cpus: '1.0', memory: 1536M}" in bot
+
+
+def load_fetch_model():
+    import runpy
+    return runpy.run_path(str(ROOT / 'deploy/fetch-model.py'))['fetch']
+
+
+def test_fetch_model_writes_a_read_only_file_with_the_pinned_hash(tmp_path):
+    import io
+    fetch, body = load_fetch_model(), b'model-bytes' * 100
+    target = tmp_path / 'clip' / 'model.onnx'
+    digest = hashlib.sha256(body).hexdigest()
+
+    fetch('https://example.test/m.onnx', digest, len(body), target, lambda url: io.BytesIO(body))
+
+    assert target.read_bytes() == body
+    assert target.stat().st_mode & 0o777 == 0o444
+
+
+@pytest.mark.parametrize(('url', 'size', 'digest'), [
+    ('http://example.test/m.onnx', 10, None),
+    ('https://example.test/m.onnx', 9, None),
+    ('https://example.test/m.onnx', 11, None),
+    ('https://example.test/m.onnx', 10, '0' * 64),
+], ids=['not-https', 'too-large', 'too-small', 'wrong-hash'])
+def test_fetch_model_rejects_a_changed_download(tmp_path, url, size, digest):
+    import io
+    fetch, body = load_fetch_model(), b'0123456789'
+    target = tmp_path / 'model.onnx'
+
+    with pytest.raises(SystemExit):
+        fetch(url, digest or hashlib.sha256(body).hexdigest(), size, target, lambda address: io.BytesIO(body))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.skipif(os.environ.get('FRAMED_DEPLOY_TEST') != '1', reason='Opt-in disposable Docker integration')
+def test_image_contains_the_pinned_clip_model():
+    from answers.clip_model import DEFAULT_MODEL_PATH, MODEL_SHA256
+
+    image = os.environ.get('FRAMED_TEST_IMAGE', 'framed-bot:local-validation')
+    script = ('import hashlib, os, sys; p = sys.argv[1]; h = hashlib.sha256(open(p, "rb").read()).hexdigest(); '
+              'print(h, os.access(p, os.W_OK))')
+    result = docker('run', '--rm', '--network', 'none', image, 'python', '-c', script, DEFAULT_MODEL_PATH)
+    assert result.stdout.split() == [MODEL_SHA256, 'False']

@@ -7,7 +7,11 @@ dependencies = [
     "alembic>=1.17",
     "asyncpg>=0.32.0",
     "httpx>=0.28.1",
+    "numpy>=2.5.4",
+    "onnxruntime>=1.31.1",
+    "pillow>=13.0.0",
     "python-telegram-bot[job-queue,rate-limiter]>=22.8",
+    "rapidfuzz>=3.14.6",
     "sqlalchemy[asyncio]>=2.1.6",
 ]
 

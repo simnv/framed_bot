@@ -49,3 +49,5 @@ ADMIN_USER_ID: Final = _required_int_env('ADMIN_USER_ID')
 # Optional: without it the bot stores game answers but no TMDB title data.
 TMDB_API_KEY: Final = _optional_secret('TMDB_API_KEY')
 BOT_DATA_PATH: Final = os.environ.get('BOT_DATA_PATH') or 'bot_data'
+# The CLIP model for the visual tie-break; without the file the bot matches by text only.
+CLIP_MODEL_PATH: Final = os.environ.get('CLIP_MODEL_PATH') or '/opt/clip/vision_model.onnx'
