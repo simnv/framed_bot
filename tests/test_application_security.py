@@ -71,6 +71,7 @@ def test_application_security(isolated_postgres, scenario):
         'rich_tables.py',
         'stats.py',
         'top_type.py',
+        'insight.py',
         'config.py',
         'safe_logging.py',
         'models',
