@@ -99,6 +99,22 @@ def test_markers_track_the_latest_posted_period_per_chat_kind_and_game():
     assert last_posted(bot_data, 'monthly', CHAT, 'episode') is None
 
 
+@pytest.mark.parametrize('game', ['framed', 'episode'])
+@pytest.mark.parametrize('year', [2024, 2025])
+def test_yearly_periods_before_the_first_year_are_never_due(game, year):
+    assert not is_due({}, 'yearly', CHAT, game, Period('yearly', year))
+
+
+@pytest.mark.parametrize('game', ['framed', 'episode'])
+def test_first_yearly_top_becomes_due_at_the_2026_december_31_post_time(game):
+    before = latest_due('yearly', datetime(2026, 12, 31, 8, 59, tzinfo=UTC))
+    at_post_time = latest_due('yearly', datetime(2026, 12, 31, 9, 0, tzinfo=UTC))
+
+    assert not is_due({}, 'yearly', CHAT, game, before)
+    assert at_post_time == Period('yearly', 2026)
+    assert is_due({}, 'yearly', CHAT, game, at_post_time)
+
+
 def test_move_markers_renames_the_keys_of_one_chat():
     bot_data = {
         f'periodic_top:monthly:{CHAT}:framed': '2026-10',

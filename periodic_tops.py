@@ -10,17 +10,22 @@ from __future__ import annotations
 import asyncio
 import calendar
 import dataclasses
+import functools
 import logging
 import re
-from collections.abc import Awaitable, Callable, MutableMapping
+from collections.abc import Awaitable, Callable, MutableMapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Final, Literal
 
+from telegram import Bot
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.ext import ContextTypes, JobQueue
 
 from answers import GAMES, Game, current_round, round_date
 from models.group import Group
-from models.top import MIN_ROUNDS_FOR_AVERAGE
+from models.top import MIN_ROUNDS_FOR_AVERAGE, top_results
+from rich_tables import RichMessage, TopResult, enrich_top_profiles, render_period_top, send_rich_message
+from top_type import TopType
 
 type Kind = Literal['monthly', 'yearly']
 type Outcome = Literal['sent', 'skipped', 'removed', 'failed']
@@ -29,6 +34,7 @@ KINDS: Final[tuple[Kind, ...]] = ('monthly', 'yearly')
 # 12:00 Europe/Moscow is UTC+3 all year, so the job runs at 09:00 UTC.
 POST_TIME: Final = time(9, 0, tzinfo=UTC)
 MARKER_PREFIX: Final = 'periodic_top'
+FIRST_YEARLY_YEAR: Final = 2026
 GAME_NAMES: Final[dict[Game, str]] = {'framed': 'Framed', 'episode': 'Episode'}
 # Genitive month names: 'итоги октября', '1–31 октября'.
 MONTHS: Final = (
@@ -135,6 +141,8 @@ def last_posted(bot_data: MutableMapping[str, str], kind: Kind, chat_id: int, ga
 
 
 def is_due(bot_data: MutableMapping[str, str], kind: Kind, chat_id: int, game: Game, period: Period) -> bool:
+    if period.kind == 'yearly' and period.year < FIRST_YEARLY_YEAR:
+        return False
     last = last_posted(bot_data, kind, chat_id, game)
     return last is None or period.id > last
 
@@ -192,3 +200,88 @@ async def deliver(chat_id: int, send: Callable[[], Awaitable[object]]) -> Outcom
             logging.warning('Message failed for recipient %s', chat_id)
             return 'failed'
     return 'failed'
+
+
+async def _build_game_message(bot: Bot, chat_id: int, period: Period, game: Game) -> RichMessage | None:
+    rounds = period.rounds(game)
+    gate = frame_gate(len(rounds))
+    boards: dict[TopType, Sequence[TopResult]] = {}
+    for top_type in TopType:
+        rows = await top_results(game, top_type, chat_id, rounds=rounds, min_rounds=gate)
+        boards[top_type] = await enrich_top_profiles(bot, rows, group_chat_id=chat_id)
+    if not boards[TopType.TOP_ROUNDS]:
+        return None
+    return render_period_top(game, period.heading(game), period.rounds_line(game), boards, frame_gate=gate)
+
+
+async def build_messages(bot: Bot, chat_id: int, period: Period) -> list[RichMessage]:
+    """Build one static message per game with results, Framed first, for an admin preview."""
+    messages = []
+    for game in GAMES:
+        message = await _build_game_message(bot, chat_id, period, game)
+        if message is not None:
+            messages.append(message)
+    return messages
+
+
+async def post_period(
+    bot: Bot,
+    bot_data: MutableMapping[str, str],
+    chat_id: int,
+    period: Period,
+    *,
+    games: Sequence[Game] = GAMES,
+) -> Outcome:
+    """Force-post the selected games and mark each sent or empty game immediately.
+
+    The job selects only due games; an admin post defaults to both games regardless of markers.
+    A failed game keeps its marker and does not stop the other game. A removed chat stops delivery.
+    """
+    outcome: Outcome = 'skipped'
+    for game in GAMES:
+        if game not in games:
+            continue
+        message = await _build_game_message(bot, chat_id, period, game)
+        if message is None:
+            mark_posted(bot_data, period.kind, chat_id, game, period)
+            continue
+        result = await deliver(chat_id, functools.partial(send_rich_message, bot, chat_id, message))
+        if result == 'removed':
+            return result
+        if result == 'sent':
+            mark_posted(bot_data, period.kind, chat_id, game, period)
+            if outcome == 'skipped':
+                outcome = 'sent'
+        else:
+            outcome = 'failed'
+    return outcome
+
+
+# The startup and daily jobs can overlap on a restart at 09:00 UTC.
+_run_lock = asyncio.Lock()
+
+
+async def post_due_tops(bot: Bot, bot_data: MutableMapping[str, str], now: datetime | None = None) -> None:
+    """Post only the latest due period of each kind, retrying each unfinished game separately."""
+    async with _run_lock:
+        now = now or datetime.now(UTC)
+        for group in await Group.get_all():
+            for kind in KINDS:
+                period = latest_due(kind, now)
+                games = tuple(game for game in GAMES if is_due(bot_data, kind, group.id, game, period))
+                if not games:
+                    continue
+                if await post_period(bot, bot_data, group.id, period, games=games) == 'removed':
+                    break
+
+
+async def post_due_tops_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await post_due_tops(context.bot, context.bot_data)
+    # Persist the markers before the next scheduled persistence update.
+    await context.application.update_persistence()
+
+
+def schedule(job_queue: JobQueue[ContextTypes.DEFAULT_TYPE]) -> None:
+    job_queue.run_daily(post_due_tops_job, POST_TIME, name='periodic-tops')
+    # The queue starts after post_init; keep the startup run even if it is late.
+    job_queue.run_once(post_due_tops_job, 0, name='periodic-tops', job_kwargs={'misfire_grace_time': None})
