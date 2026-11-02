@@ -70,6 +70,7 @@ from periodic_tops import (
     move_markers,
     parse_period,
     post_period,
+    run_lock,
 )
 from periodic_tops import schedule as schedule_periodic_tops
 from reaction_delivery import ReactionDelivery, ReactionIntent
@@ -481,8 +482,9 @@ async def migrate_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_id, new_id = message.migrate_from_chat_id, chat.id
     else:
         return
-    await move_chat(old_id, new_id)
-    move_markers(context.bot_data, old_id, new_id)
+    async with run_lock:
+        await move_chat(old_id, new_id)
+        move_markers(context.bot_data, old_id, new_id)
     await context.application.update_persistence()
     logging.info('Moved chat %s to %s', old_id, new_id)
 
@@ -514,7 +516,9 @@ async def post_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target = int(args[0])
     if len(args) == 3:
-        outcome = await post_period(context.bot, context.bot_data, target, period)
+        # The same lock as the job and the chat migration, so a forced post cannot interleave with them.
+        async with run_lock:
+            outcome = await post_period(context.bot, context.bot_data, target, period)
         await context.application.update_persistence()
         await context.bot.send_message(chat_id=chat.id, text=POST_TOP_OUTCOMES[outcome])
         return

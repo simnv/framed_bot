@@ -1,7 +1,9 @@
 """The /post_top admin command, the supergroup move and the job start."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -11,7 +13,7 @@ from telegram.warnings import PTBUserWarning
 
 import main
 import periodic_tops
-from periodic_tops import POST_TIME, Period, marker_key, post_due_tops_job
+from periodic_tops import POST_TIME, Period, marker_key, post_due_tops, post_due_tops_job
 
 ADMIN = 1
 
@@ -131,6 +133,55 @@ async def test_migrate_chat_moves_results_group_and_markers(monkeypatch, directi
     move.assert_awaited_once_with(old, new)
     assert context.bot_data == {marker_key('monthly', new, 'framed'): '2026-10'}
     persisted.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_migration_waits_for_an_in_flight_periodic_send(monkeypatch):
+    old, new = -100, -1001000000100
+    now = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+    sends = []
+    send_started, release_send = asyncio.Event(), asyncio.Event()
+
+    async def send(bot, chat_id, message):
+        sends.append(chat_id)
+        send_started.set()
+        await release_send.wait()
+
+    async def top_results(game, top_type, chat_id, *, rounds=None, min_rounds=10):
+        return [SimpleNamespace(user_id=1, name='A', score=5)] if game == 'framed' else []
+
+    async def enrich(bot, results, *, group_chat_id=None):
+        return tuple(results)
+
+    groups = AsyncMock(return_value=[SimpleNamespace(id=old)])
+    monkeypatch.setattr(periodic_tops, 'send_rich_message', send)
+    monkeypatch.setattr(periodic_tops, 'top_results', top_results)
+    monkeypatch.setattr(periodic_tops, 'enrich_top_profiles', enrich)
+    monkeypatch.setattr(periodic_tops.Group, 'get_all', groups)
+    monkeypatch.setattr(main, 'move_chat', AsyncMock())
+    bot_data: dict[str, str] = {}
+    # A lock that was contended in another test's event loop cannot be reused here.
+    lock = asyncio.Lock()
+    monkeypatch.setattr(periodic_tops, 'run_lock', lock)
+    monkeypatch.setattr(main, 'run_lock', lock)
+    context = SimpleNamespace(
+        bot=AsyncMock(), bot_data=bot_data, application=SimpleNamespace(update_persistence=AsyncMock())
+    )
+    update = Update(1, message=Message(1, now, Chat(old, 'group'), migrate_to_chat_id=new))
+
+    job = asyncio.create_task(post_due_tops(context.bot, bot_data, now))
+    await send_started.wait()
+    migration = asyncio.create_task(main.migrate_chat(update, cast(ContextTypes.DEFAULT_TYPE, context)))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release_send.set()
+    await asyncio.gather(job, migration)
+
+    assert sends == [old]
+    assert all(f':{old}:' not in key for key in bot_data)
+    groups.return_value = [SimpleNamespace(id=new)]
+    await post_due_tops(context.bot, bot_data, now)
+    assert sends == [old]
 
 
 def test_application_registers_the_migrate_handler():

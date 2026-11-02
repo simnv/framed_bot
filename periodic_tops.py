@@ -258,12 +258,13 @@ async def post_period(
 
 
 # The startup and daily jobs can overlap on a restart at 09:00 UTC.
-_run_lock = asyncio.Lock()
+# A chat migration also takes this lock, so it cannot run between a send and its marker write.
+run_lock = asyncio.Lock()
 
 
 async def post_due_tops(bot: Bot, bot_data: MutableMapping[str, str], now: datetime | None = None) -> None:
     """Post only the latest due period of each kind, retrying each unfinished game separately."""
-    async with _run_lock:
+    async with run_lock:
         now = now or datetime.now(UTC)
         for group in await Group.get_all():
             for kind in KINDS:
