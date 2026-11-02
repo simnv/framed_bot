@@ -13,6 +13,8 @@ import insight
 from answers import round_date
 
 TODAY = date(2026, 11, 1)
+CHAT = -100
+OTHER_CHAT = -200
 
 
 @pytest.fixture(params=[False, True], ids=['sqlite', 'postgres-averages'])
@@ -20,8 +22,10 @@ def database(monkeypatch, request):
     connection = sqlite3.connect(':memory:')
     connection.executescript(
         'CREATE TABLE user (id INTEGER PRIMARY KEY, full_name TEXT);'
-        'CREATE TABLE framed_result (user_id INTEGER, framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
-        'CREATE TABLE episode_result (user_id INTEGER, framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
+        'CREATE TABLE framed_result (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, framed_round INTEGER, '
+        'won BOOLEAN, win_frame INTEGER);'
+        'CREATE TABLE episode_result (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, framed_round INTEGER, '
+        'won BOOLEAN, win_frame INTEGER);'
         'CREATE TABLE game_answer (game TEXT, round INTEGER, title_id INTEGER, match_status TEXT);'
         'CREATE TABLE title (id INTEGER PRIMARY KEY, name TEXT, year INTEGER, kind TEXT);'
         'CREATE TABLE genre (id INTEGER PRIMARY KEY, name TEXT);'
@@ -62,12 +66,12 @@ def add_title(database, key=1, *, genres=(1,), year=1999, kind='movie'):
         database.execute('INSERT INTO title_genre VALUES (?, ?)', (key, genre))
 
 
-def add_rounds(database, user=1, *, start=1, count=1, title=1, frame=1, game='framed', status='auto'):
+def add_rounds(database, user=1, *, start=1, count=1, title=1, frame=1, game='framed', status='auto', chat=CHAT):
     database.execute('INSERT OR IGNORE INTO user VALUES (?, ?)', (user, f'User {user:02}'))
     for round_id in range(start, start + count):
         database.execute(
-            f'INSERT INTO {game}_result VALUES (?, ?, ?, ?)',  # noqa: S608 -- game is a test literal
-            (user, round_id, frame is not None, frame),
+            f'INSERT INTO {game}_result (chat_id, user_id, framed_round, won, win_frame) VALUES (?, ?, ?, ?, ?)',  # noqa: S608
+            (chat, user, round_id, frame is not None, frame),
         )
         if not database.execute('SELECT 1 FROM game_answer WHERE game = ? AND round = ?', (game, round_id)).fetchone():
             database.execute('INSERT INTO game_answer VALUES (?, ?, ?, ?)', (game, round_id, title, status))
@@ -82,7 +86,7 @@ async def test_personal_buckets_split_genres_and_use_own_eligible_mean(database)
     # Another player's low scores do not change the personal mean of 65 / 15.
     add_rounds(database, user=2, count=10, frame=None)
 
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
 
     assert [(b.key, b.rounds, b.win_rate) for b in result.genres.best] == [(1, 5.0, 1.0), (2, 5.0, 1.0)]
     assert [b.points for b in result.genres.best] == pytest.approx([4.8888888889, 4.8888888889])
@@ -110,7 +114,7 @@ async def test_metadata_filters_closed_valid_matched_rounds_and_game_kind(databa
     # At round 36, its results and all later results are still open.
     add_rounds(database, start=36, count=5, game=game)
 
-    result = await insight.game_insight(1, game, round_date(game, 36))
+    result = await insight.game_insight(1, game, round_date(game, 36), CHAT)
 
     assert [(b.rounds, b.points, b.win_rate) for b in result.genres.best] == [(5.0, score, 1.0)]
     assert [(b.key, b.rounds, b.points) for b in result.decades.best] == [(1990, 5.0, score)]
@@ -138,7 +142,7 @@ async def test_people_use_game_role_and_first_three_cast_with_three_round_gate(d
     add_rounds(database, count=3, game=game, frame=2)
     add_rounds(database, start=4, count=2, title=2, game=game, frame=None)
 
-    result = await insight.game_insight(1, game, TODAY)
+    result = await insight.game_insight(1, game, TODAY, CHAT)
 
     assert [(b.key, b.role, b.rounds) for b in result.people.best] == [
         (1 if game == 'framed' else 2, role, 3.0),
@@ -164,7 +168,7 @@ async def test_a_person_with_two_roles_is_one_row_and_counts_each_round_once(dat
     add_rounds(database, count=2, frame=2)
     add_rounds(database, start=3, title=2, frame=2)
 
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
 
     # 2 director rounds and 1 cast round pass the gate of 3 together, and the directing role wins.
     assert [(b.key, b.role, b.rounds, b.win_rate) for b in result.people.best] == [(1, 'director', 3.0, 1.0)]
@@ -179,7 +183,7 @@ async def test_equal_smoothed_points_tie_exactly_and_sort_by_label(database):
     add_rounds(database, count=46, frame=4)
     add_rounds(database, start=47, count=20, title=2, frame=4)
 
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
 
     assert [b.points for b in result.genres.best] == [3.0, 3.0, 3.0, 3.0]
     assert [b.key for b in result.genres.best] == [1, 2, 3, 4]
@@ -195,7 +199,7 @@ async def test_fractional_rounds_do_not_split_an_exact_tie_by_rounding(database)
         for block in range(start, start + count, 11):
             database.execute('UPDATE framed_result SET won = 1, win_frame = 1 WHERE framed_round = ?', (block,))
 
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
 
     assert [b.points for b in result.genres.best] == pytest.approx([16 / 11] * 4)
     assert len({b.points for b in result.genres.best}) == 1
@@ -206,7 +210,7 @@ async def test_fractional_rounds_do_not_split_an_exact_tie_by_rounding(database)
 async def test_a_won_round_without_a_frame_breaks_the_streak(database):
     add_rounds(database, count=5, frame=1, title=None)
     database.execute('UPDATE framed_result SET win_frame = NULL WHERE framed_round = 3')
-    result = await insight.game_insight(1, 'framed', round_date('framed', 6))
+    result = await insight.game_insight(1, 'framed', round_date('framed', 6), CHAT)
     assert (result.current_streak, result.best_streak) == (2, 2)
 
 
@@ -225,7 +229,7 @@ async def test_a_won_round_without_a_frame_breaks_the_streak(database):
 async def test_streaks_use_all_results_and_break_on_gaps_or_losses(database, history, today_round, current, best):
     for round_id, won in history:
         add_rounds(database, start=round_id, frame=1 if won else None, title=None)
-    result = await insight.game_insight(1, 'framed', round_date('framed', today_round))
+    result = await insight.game_insight(1, 'framed', round_date('framed', today_round), CHAT)
     assert (result.current_streak, result.best_streak) == (current, best)
     assert result.genres.best == result.decades.best == result.people.best == ()
 
@@ -234,7 +238,7 @@ async def test_streaks_use_all_results_and_break_on_gaps_or_losses(database, his
 async def test_current_board_ranks_include_players_outside_top_ten_and_no_metadata(database):
     for user in range(1, 13):
         add_rounds(database, user=user, count=10, frame=6 if user == 12 else 1, title=None)
-    result = await insight.game_insight(12, 'framed', TODAY)
+    result = await insight.game_insight(12, 'framed', TODAY, CHAT)
     assert [(rank.board, rank.place, rank.total, rank.label) for rank in result.ranks] == [
         ('score', 12, 12, None),
         ('frame', 12, 12, None),
@@ -248,13 +252,13 @@ async def test_frame_rank_needs_ten_valid_rounds_and_missing_player_has_no_ranks
     add_rounds(database, count=9, title=None)
     add_rounds(database, start=10, title=None)
     database.execute('UPDATE framed_result SET win_frame = NULL WHERE framed_round = 10')
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
     assert [(rank.board, rank.place, rank.total) for rank in result.ranks] == [
         ('score', 1, 1),
         ('win', 1, 1),
         ('rounds', 1, 1),
     ]
-    assert (await insight.game_insight(2, 'framed', TODAY)).ranks == ()
+    assert (await insight.game_insight(2, 'framed', TODAY, CHAT)).ranks == ()
 
 
 @pytest.mark.asyncio
@@ -269,11 +273,11 @@ async def test_leagues_use_split_weights_global_game_mean_and_picker_order(datab
     add_title(database, 3, kind='tv')
     add_rounds(database, user=1, count=50, game='episode', title=3)
 
-    choices = await insight.league_choices('framed', 'genre', TODAY)
+    choices = await insight.league_choices('framed', 'genre', TODAY, CHAT)
     assert [(choice.key, choice.label) for choice in choices] == [(2, 'Action'), (1, 'Zebra')]
-    assert await insight.league_choices('episode', 'genre', TODAY) == ()
-    assert await insight.league('framed', 'genre', 999, TODAY) is None
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    assert await insight.league_choices('episode', 'genre', TODAY, CHAT) == ()
+    assert await insight.league('framed', 'genre', 999, TODAY, CHAT) is None
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
     assert board is not None
     assert (board.dimension, board.key, board.label) == ('genre', 1, 'Zebra')
     assert [(row.user_id, row.name, row.rounds, row.win_rate) for row in board.rows] == [
@@ -282,11 +286,13 @@ async def test_leagues_use_split_weights_global_game_mean_and_picker_order(datab
         (3, 'User 03', 15.0, 0.0),
     ]
     assert [row.score for row in board.rows] == pytest.approx([5.16, 3.96, 2.16])
-    decade = await insight.league('framed', 'decade', 1990, TODAY)
+    decade = await insight.league('framed', 'decade', 1990, TODAY, CHAT)
     assert decade is not None
     assert [row.score for row in decade.rows] == pytest.approx([5.475, 3.975, 1.725])
     assert [row.rounds for row in decade.rows] == [30.0, 30.0, 30.0]
-    assert [(c.key, c.label) for c in await insight.league_choices('framed', 'decade', TODAY)] == [(1990, '1990-е')]
+    assert [(c.key, c.label) for c in await insight.league_choices('framed', 'decade', TODAY, CHAT)] == [
+        (1990, '1990-е')
+    ]
 
 
 @pytest.mark.asyncio
@@ -300,7 +306,7 @@ async def test_exact_league_tie_on_a_rounding_boundary_falls_to_the_name(databas
     add_rounds(database, user=3, start=301, count=59, title=1, frame=None)
     add_rounds(database, user=3, start=360, title=1, frame=3)
 
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
 
     assert board is not None
     assert [row.user_id for row in board.rows] == [1, 2, 3]
@@ -320,7 +326,7 @@ async def test_league_rows_rank_by_strength_against_all_players_and_carry_the_pe
     add_rounds(database, user=3, start=1, count=15, title=1, frame=None)
     add_rounds(database, user=1, start=101, count=10, title=2, frame=None)
 
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
 
     # All players: mean 160 / 55 = 32 / 11. Own means: 4, 3 and 1. Strength = n * (average - mean) / (n + 10).
     assert board is not None
@@ -335,8 +341,8 @@ async def test_weekly_episode_leagues_need_five_rounds_and_framed_leagues_fiftee
     add_title(database, genres=(1,), kind=kind)
     for user in (1, 2, 3):
         add_rounds(database, user=user, count=5, frame=2, game=game)
-    board = await insight.league(game, 'genre', 1, TODAY)
-    choices = await insight.league_choices(game, 'genre', TODAY)
+    board = await insight.league(game, 'genre', 1, TODAY, CHAT)
+    choices = await insight.league_choices(game, 'genre', TODAY, CHAT)
     assert (board is not None) is exists
     assert [choice.key for choice in choices] == ([1] if exists else [])
 
@@ -347,10 +353,10 @@ async def test_league_needs_three_players_with_fifteen_weighted_rounds(database)
     add_rounds(database, user=1, count=30)
     add_rounds(database, user=2, count=30)
     add_rounds(database, user=3, count=29)
-    assert await insight.league('framed', 'genre', 1, TODAY) is None
-    assert await insight.league_choices('framed', 'genre', TODAY) == ()
+    assert await insight.league('framed', 'genre', 1, TODAY, CHAT) is None
+    assert await insight.league_choices('framed', 'genre', TODAY, CHAT) == ()
     add_rounds(database, user=3, start=30)
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
     assert board is not None
     assert [row.user_id for row in board.rows] == [1, 2, 3]
 
@@ -361,10 +367,10 @@ async def test_league_ranks_use_full_board_and_league_ties_use_rounds_name_and_i
     for user in range(1, 13):
         add_rounds(database, user=user, count=16 if user == 1 else 15)
     database.execute("UPDATE user SET full_name = 'A' WHERE id IN (2, 3)")
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
     assert board is not None
     assert [row.user_id for row in board.rows] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    result = await insight.game_insight(12, 'framed', TODAY)
+    result = await insight.game_insight(12, 'framed', TODAY, CHAT)
     assert [(r.board, r.place, r.total, r.label) for r in result.ranks if r.board in ('genre', 'decade')] == [
         ('genre', 12, 12, 'Genre 1'),
         ('decade', 12, 12, '1990-е'),
@@ -379,13 +385,13 @@ async def test_best_league_rank_uses_place_then_larger_board_then_label(database
         for user in users:
             add_rounds(database, user=user, start=key * 20, count=15, title=key)
     database.execute("UPDATE genre SET name = 'A' WHERE id = 5")
-    result = await insight.game_insight(5, 'framed', TODAY)
+    result = await insight.game_insight(5, 'framed', TODAY, CHAT)
     assert [(r.board, r.place, r.total, r.label) for r in result.ranks if r.board in ('genre', 'decade')] == [
         ('genre', 1, 4, 'A'),
         ('decade', 1, 4, '1990-е'),
     ]
     # The 2000s board has the same place and size; the earlier decade label wins.
-    assert [(c.key, c.label) for c in await insight.league_choices('framed', 'decade', TODAY)] == [
+    assert [(c.key, c.label) for c in await insight.league_choices('framed', 'decade', TODAY, CHAT)] == [
         (1960, '1960-е'),
         (1970, '1970-е'),
         (1980, '1980-е'),
@@ -411,7 +417,7 @@ async def test_hard_titles_count_rounds_not_titles_and_sort_ties_by_players_then
         add_rounds(database, user=user, start=10, game=game, status='unmatched')
         add_rounds(database, user=user, start=11, game=game)
 
-    result = await insight.hard_titles(game, round_date(game, 11))
+    result = await insight.hard_titles(game, round_date(game, 11), CHAT)
 
     assert [row.round for row in result.hardest] == [3, 2, 1, 4, 7]
     assert [row.round for row in result.easiest] == [7, 6, 5, 4, 3]
@@ -428,7 +434,7 @@ async def test_hard_titles_count_rounds_not_titles_and_sort_ties_by_players_then
 
 @pytest.mark.asyncio
 async def test_hard_titles_empty_game_has_no_rows(database):
-    result = await insight.hard_titles('episode', TODAY)
+    result = await insight.hard_titles('episode', TODAY, CHAT)
     assert result.hardest == result.easiest == ()
 
 
@@ -444,7 +450,7 @@ async def test_genres_come_by_rounds_and_decades_by_strength_against_the_own_mea
     add_rounds(database, start=31, count=8, title=3, frame=4)
     add_rounds(database, start=41, count=4, title=4, frame=2)
 
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
 
     # The own mean is 122 / 30 = 61 / 15. Strength = n * (average - mean) / (n + 10).
     assert [(b.key, b.rounds) for b in result.genres.best] == [(1, 12.0), (3, 8.0), (2, 6.0)]
@@ -464,7 +470,7 @@ async def test_people_show_all_up_to_eight_else_the_best_five_and_worst_three(da
         database.execute('INSERT INTO title_person VALUES (?, ?, ?, ?)', (key, key, 'creator', 0))
         # Person k gets 11 - k points a round, so the strength falls with k.
         add_rounds(database, start=key * 10, count=3, title=key, frame=key, game='episode')
-    result = await insight.game_insight(1, 'episode', TODAY)
+    result = await insight.game_insight(1, 'episode', TODAY, CHAT)
     assert [b.key for b in result.people.best] == best
     assert [b.key for b in result.people.worst] == worst
 
@@ -474,11 +480,11 @@ async def test_fractional_genres_at_exact_gates_do_not_lose_players_to_float_err
     add_title(database, genres=(1, 2, 3, 4, 5, 6))
     for user in (1, 2, 3):
         add_rounds(database, user=user, count=90)
-    board = await insight.league('framed', 'genre', 1, TODAY)
+    board = await insight.league('framed', 'genre', 1, TODAY, CHAT)
     assert board is not None
     assert [row.rounds for row in board.rows] == pytest.approx([15.0, 15.0, 15.0])
     assert [row.score for row in board.rows] == pytest.approx([6.0, 6.0, 6.0])
-    assert len(await insight.league_choices('framed', 'genre', TODAY)) == 6
+    assert len(await insight.league_choices('framed', 'genre', TODAY, CHAT)) == 6
 
 
 @pytest.mark.asyncio
@@ -487,7 +493,55 @@ async def test_genre_win_rates_use_the_same_split_weights_as_points(database):
     add_title(database, 2, genres=(1,))
     add_rounds(database, count=10)
     add_rounds(database, start=11, count=5, title=2, frame=None)
-    result = await insight.game_insight(1, 'framed', TODAY)
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
     # Genres come most played first.
     assert [(b.key, b.rounds, b.win_rate) for b in result.genres.best] == [(1, 10.0, 0.5), (2, 5.0, 1.0)]
     assert [b.points for b in result.genres.best] == pytest.approx([3.9166666667, 4.8888888889])
+
+
+@pytest.mark.asyncio
+async def test_a_group_board_ignores_the_results_of_other_chats(database):
+    add_title(database)
+    add_rounds(database, count=10)
+    add_rounds(database, user=2, count=10, frame=2)
+    add_rounds(database, user=3, count=10, frame=3, chat=OTHER_CHAT)
+
+    result = await insight.game_insight(1, 'framed', TODAY, CHAT)
+    other = await insight.game_insight(3, 'framed', TODAY, CHAT)
+
+    assert [(rank.board, rank.place, rank.total) for rank in result.ranks if rank.board == 'score'] == [('score', 1, 2)]
+    assert other.ranks == () and other.genres.best == () and other.best_streak == 0
+    assert (await insight.hard_titles('framed', TODAY, CHAT)).hardest == ()
+
+
+@pytest.mark.asyncio
+async def test_a_private_chat_merges_chats_and_counts_the_first_saved_row(database):
+    add_title(database)
+    # Round 1 came first in CHAT as a frame-1 win, then in OTHER_CHAT as a loss. Rounds 2-10 are in OTHER_CHAT only.
+    add_rounds(database, count=1)
+    add_rounds(database, count=1, frame=None, chat=OTHER_CHAT)
+    add_rounds(database, start=2, count=9, frame=1, chat=OTHER_CHAT)
+
+    merged = await insight.game_insight(1, 'framed', TODAY, None)
+    group = await insight.game_insight(1, 'framed', TODAY, OTHER_CHAT)
+
+    assert [(b.rounds, b.win_rate) for b in merged.genres.best] == [(10.0, 1.0)]
+    assert (merged.current_streak, merged.best_streak) == (0, 10)
+    assert [(b.rounds, b.win_rate) for b in group.genres.best] == [(10.0, 0.9)]
+    assert group.best_streak == 9
+
+
+@pytest.mark.asyncio
+async def test_leagues_and_hard_titles_are_per_chat(database):
+    add_title(database)
+    for user in (1, 2, 3):
+        add_rounds(database, user=user, count=15, frame=user)
+    for user in (4, 5):
+        add_rounds(database, user=user, count=15, frame=1, chat=OTHER_CHAT)
+
+    assert [c.key for c in await insight.league_choices('framed', 'genre', TODAY, CHAT)] == [1]
+    assert await insight.league_choices('framed', 'genre', TODAY, OTHER_CHAT) == ()
+    board = await insight.league('framed', 'genre', 1, TODAY, None)
+    # Users 1, 4 and 5 tie on frame 1; the name 'User 01' sorts first.
+    assert board is not None and [row.user_id for row in board.rows] == [1, 4, 5, 2, 3]
+    assert [t.players for t in (await insight.hard_titles('framed', TODAY, None)).hardest][:1] == [5]

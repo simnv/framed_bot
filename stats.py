@@ -2,10 +2,9 @@ import dataclasses
 
 from sqlalchemy import func, select
 
-from answers import FRAMES
+from answers import FRAMES, GAMES
 from models.db import AsyncScopedSession
-from models.episode_result import EpisodeResult
-from models.framed_result import FramedResult
+from models.top import scoped_results
 from models.user import User
 
 
@@ -38,24 +37,26 @@ class MissingWinFrameError(Exception):
         super().__init__('winning result has no win_frame')
 
 
-async def get_user_stats(user_id: int) -> tuple[Stats, Stats] | None:
-    """Return fixed-size aggregates without hydrating either result history."""
+async def get_user_stats(user_id: int, chat_id: int | None) -> tuple[Stats, Stats] | None:
+    """Fixed-size aggregates of one chat, or of all chats merged, without hydrating either result history."""
     async with AsyncScopedSession() as session:
         if (await session.execute(select(User.id).where(User.id == user_id))).scalar_one_or_none() is None:
             return None
         game_stats: list[Stats] = []
-        for model, frames in ((FramedResult, FRAMES['framed']), (EpisodeResult, FRAMES['episode'])):
+        for game in GAMES:
+            results = scoped_results(game, chat_id)
+            won = results.c.won.is_(True)
             rounds, wins, win_frames, missing = (
                 await session.execute(
                     select(
-                        func.count(model.id),
-                        func.count(model.id).filter(model.won.is_(True)),
-                        func.sum(model.win_frame).filter(model.won.is_(True)),
-                        func.count(model.id).filter(model.won.is_(True), model.win_frame.is_(None)),
-                    ).where(model.user_id == user_id)
+                        func.count(results.c.id),
+                        func.count(results.c.id).filter(won),
+                        func.sum(results.c.win_frame).filter(won),
+                        func.count(results.c.id).filter(won, results.c.win_frame.is_(None)),
+                    ).where(results.c.user_id == user_id)
                 )
             ).one()
             if missing:
                 raise MissingWinFrameError
-            game_stats.append(Stats.from_totals(rounds, wins, win_frames or 0, frames=frames))
+            game_stats.append(Stats.from_totals(rounds, wins, win_frames or 0, frames=FRAMES[game]))
         return game_stats[0], game_stats[1]

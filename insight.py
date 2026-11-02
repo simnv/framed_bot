@@ -1,6 +1,7 @@
 """Personal insight and metadata leaderboards from TMDB title data.
 
-See docs/superpowers/specs/2026-11-01-metadata-stats-design.md for every rule.
+See docs/superpowers/specs/2026-11-01-metadata-stats-design.md for every rule. Every number is per chat: a group sees
+its own results, a private chat sees all chats merged (see `models.top.scoped_results`).
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from insight_types import (
 from models.db import AsyncScopedSession
 from models.game_answer import GameAnswer
 from models.title import Genre, Person, Title, TitleGenre, TitlePerson
-from models.top import MODELS, top_statement
+from models.top import scoped_results, top_statement
 from models.user import User
 from top_type import TopType
 
@@ -83,27 +84,27 @@ __all__ = [
 ]
 
 
-def _eligible(game: Game, today: date) -> CTE:
-    model = MODELS[game]
-    won = model.won.is_(True)
+def _eligible(game: Game, today: date, chat_id: int | None) -> CTE:
+    results = scoped_results(game, chat_id)
+    won = results.c.won.is_(True)
     return (
         select(
-            model.user_id.label('user_id'),
+            results.c.user_id.label('user_id'),
             User.full_name.label('name'),
-            model.framed_round.label('round'),
+            results.c.framed_round.label('round'),
             Title.id.label('title_id'),
             Title.name.label('title_name'),
             Title.year.label('year'),
-            case((won, FRAMES[game] + 1 - model.win_frame), else_=1).label('points'),
+            case((won, FRAMES[game] + 1 - results.c.win_frame), else_=1).label('points'),
             case((won, 1), else_=0).label('won'),
         )
-        .select_from(model)
-        .join(User, User.id == model.user_id)
-        .join(GameAnswer, and_(GameAnswer.game == game, GameAnswer.round == model.framed_round))
+        .select_from(results)
+        .join(User, User.id == results.c.user_id)
+        .join(GameAnswer, and_(GameAnswer.game == game, GameAnswer.round == results.c.framed_round))
         .join(Title, Title.id == GameAnswer.title_id)
         .where(
-            ~and_(won, model.win_frame.is_(None)),
-            model.framed_round < current_round(game, today),
+            ~and_(won, results.c.win_frame.is_(None)),
+            results.c.framed_round < current_round(game, today),
             GameAnswer.match_status.in_(ELIGIBLE_STATUSES),
             Title.kind == KIND_BY_GAME[game],
         )
@@ -236,13 +237,13 @@ async def _people(eligible: CTE, user_id: int, game: Game, mean: Fraction) -> Se
     return Section(tuple(buckets[:PEOPLE_BEST]), tuple(buckets[-PEOPLE_WORST:]))
 
 
-async def _streaks(user_id: int, game: Game, today: date) -> tuple[int, int]:
+async def _streaks(user_id: int, game: Game, today: date, chat_id: int | None) -> tuple[int, int]:
     """Win runs over consecutive round numbers, found in SQL so the bot does not load the history."""
-    model = MODELS[game]
-    won = model.won.is_(True)
+    results = scoped_results(game, chat_id)
+    won = results.c.won.is_(True)
     valid = (
-        select(model.framed_round.label('round'), won.label('won'))
-        .where(model.user_id == user_id, ~and_(won, model.win_frame.is_(None)))
+        select(results.c.framed_round.label('round'), won.label('won'))
+        .where(results.c.user_id == user_id, ~and_(won, results.c.win_frame.is_(None)))
         .subquery()
     )
     wins = (
@@ -271,7 +272,7 @@ async def _streaks(user_id: int, game: Game, today: date) -> tuple[int, int]:
     return int(current), int(row.best)
 
 
-async def _board_ranks(user_id: int, game: Game) -> list[Rank]:
+async def _board_ranks(user_id: int, game: Game, chat_id: int | None) -> list[Rank]:
     ranks = []
     boards: tuple[tuple[TopType, RankBoard], ...] = (
         (TopType.TOP_SCORE, 'score'),
@@ -280,7 +281,7 @@ async def _board_ranks(user_id: int, game: Game) -> list[Rank]:
         (TopType.TOP_ROUNDS, 'rounds'),
     )
     for metric, board in boards:
-        rows = await _rows(top_statement(game, metric, limit=None))
+        rows = await _rows(top_statement(game, metric, chat_id, limit=None))
         for place, row in enumerate(rows, 1):
             if row.user_id == user_id:
                 ranks.append(Rank(board, place, len(rows)))
@@ -288,8 +289,8 @@ async def _board_ranks(user_id: int, game: Game) -> list[Rank]:
     return ranks
 
 
-async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
-    eligible = _eligible(game, today)
+async def game_insight(user_id: int, game: Game, today: date, chat_id: int | None) -> GameInsight:
+    eligible = _eligible(game, today, chat_id)
     mean = await _mean(_mean_statement(eligible).where(eligible.c.user_id == user_id))
     sections = []
     for dimension in ('genre', 'decade'):
@@ -299,8 +300,8 @@ async def game_insight(user_id: int, game: Game, today: date) -> GameInsight:
                 [_bucket(row, mean, dimension) for row in rows if _exact(row.rounds) >= MIN_STATS_BUCKET], dimension
             )
         )
-    current, best = await _streaks(user_id, game, today)
-    ranks = await _board_ranks(user_id, game)
+    current, best = await _streaks(user_id, game, today, chat_id)
+    ranks = await _board_ranks(user_id, game, chat_id)
     dimensions: tuple[Dimension, ...] = ('genre', 'decade')
     for dimension in dimensions:
         candidates = []
@@ -351,23 +352,23 @@ async def _league_boards(eligible: CTE, game: Game, dimension: Dimension) -> lis
     return boards
 
 
-async def league_choices(game: Game, dimension: Dimension, today: date) -> tuple[Choice, ...]:
-    boards = await _league_boards(_eligible(game, today), game, dimension)
+async def league_choices(game: Game, dimension: Dimension, today: date, chat_id: int | None) -> tuple[Choice, ...]:
+    boards = await _league_boards(_eligible(game, today, chat_id), game, dimension)
     boards.sort(key=lambda board: board.key if dimension == 'decade' else board.label)
     return tuple(Choice(board.key, board.label) for board in boards)
 
 
-async def league(game: Game, dimension: Dimension, key: int, today: date) -> League | None:
+async def league(game: Game, dimension: Dimension, key: int, today: date, chat_id: int | None) -> League | None:
     """None when the board does not exist (unknown key or fewer than MIN_LEAGUE_PLAYERS players)."""
-    boards = await _league_boards(_eligible(game, today), game, dimension)
+    boards = await _league_boards(_eligible(game, today, chat_id), game, dimension)
     for board in boards:
         if board.key == key:
             return dataclasses.replace(board, rows=board.rows[:LEAGUE_LIMIT])
     return None
 
 
-async def hard_titles(game: Game, today: date) -> HardTitles:
-    eligible = _eligible(game, today)
+async def hard_titles(game: Game, today: date, chat_id: int | None) -> HardTitles:
+    eligible = _eligible(game, today, chat_id)
     rows = await _rows(
         select(
             eligible.c.round,
