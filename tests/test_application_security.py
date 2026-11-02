@@ -67,6 +67,7 @@ def test_application_security(isolated_postgres, scenario):
     # Mount only public application source. Never expose the checkout's environment or secrets.
     for filename in (
         'main.py',
+        'periodic_tops.py',
         'reaction_delivery.py',
         'rich_tables.py',
         'stats.py',

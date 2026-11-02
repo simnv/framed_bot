@@ -16,6 +16,7 @@ from telegram.warnings import PTBUserWarning
 import main
 import rich_tables
 from insight import GameInsight, Section
+from insight_types import Choice, HardTitles, League, LeagueRow
 from rich_tables import render_top
 from stats import Stats
 from top_type import TopType
@@ -354,7 +355,7 @@ async def test_top_sends_native_table_with_reply_keyboard_and_rate_limiting(
     monkeypatch.setattr(type(limiter), 'process_request', process)
     async with context.bot:
         await main.top(command_update('/top', chat_type=chat_type), context)
-    query.assert_awaited_once_with('framed', TopType.TOP_SCORE)
+    query.assert_awaited_once_with('framed', TopType.TOP_SCORE, -123 if chat_type in ('group', 'supergroup') else None)
     endpoint, params = next(call for call in request.calls if call[0] == 'sendRichMessage')
     assert endpoint == 'sendRichMessage'
     uses_group_lookup = private_lookup_fails and chat_type in ('group', 'supergroup')
@@ -423,7 +424,7 @@ async def test_sort_callback_edits_native_table_in_place_and_acknowledges(
     async with context.bot:
         with pytest.warns(PTBUserWarning, match='editMessageText'):
             await main.inline_top(update, context)
-    query.assert_awaited_once_with(game, kind)
+    query.assert_awaited_once_with(game, kind, -123 if chat_type in ('group', 'supergroup') else None)
     params = next(params for endpoint, params in request.calls if endpoint == 'editMessageText')
     assert params['message_id'] == '456'
     assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
@@ -534,7 +535,8 @@ async def test_legacy_top_button_only_acknowledges(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stats_sends_one_kept_message_per_played_game_that_names_its_owner(monkeypatch):
+@pytest.mark.parametrize('chat_type', ['group', 'supergroup', 'private'])
+async def test_stats_sends_one_kept_message_per_played_game_that_names_its_owner(monkeypatch, chat_type):
     request = TelegramRequest()
     context = make_context(request)
     aggregates = (Stats(9, 5, 2.4, 29, 4.0), Stats(4, 0, None, 4, 11.0))
@@ -548,8 +550,10 @@ async def test_stats_sends_one_kept_message_per_played_game_that_names_its_owner
     schedule = Mock()
     monkeypatch.setattr(JobQueue, 'run_once', schedule)
     async with context.bot:
-        await main.stats(command_update('/stats'), context)
-    get_stats.assert_awaited_once_with(99)
+        await main.stats(command_update('/stats', chat_type=chat_type), context)
+    scope = -123 if chat_type in ('group', 'supergroup') else None
+    get_stats.assert_awaited_once_with(99, scope)
+    assert all(call.args[-1] == scope for call in get_insight.await_args_list)
     assert [call.args[:2] for call in get_insight.await_args_list] == [(99, 'framed'), (99, 'episode')]
     update_user.assert_not_awaited()
     sent = [params for endpoint, params in request.calls if endpoint == 'sendRichMessage']
@@ -621,3 +625,49 @@ def test_profile_link_escapes_name_instead_of_accepting_markup():
     assert table.rows[-1] == ['1', name, '1']
     assert table.links == [{'href': 'tg://user?id=42'}]
     assert 'script' not in table.tags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat_type', ['group', 'supergroup', 'private'])
+@pytest.mark.parametrize('game', ['framed', 'episode'])
+@pytest.mark.parametrize('screen', ['genres', 'decades', 'genre:18', 'decade:1990', 'hard', 'genre:999'])
+async def test_metadata_callback_uses_the_message_chat_scope(monkeypatch, chat_type, game, screen):
+    request = TelegramRequest()
+    context = make_context(request)
+    today = datetime(2026, 11, 2, tzinfo=UTC).date()
+    monkeypatch.setattr(main, 'utc_today', lambda: today)
+    choices = AsyncMock(return_value=(Choice(18, 'Drama'),))
+    board = None
+    if screen.startswith(('genre:', 'decade:')) and screen != 'genre:999':
+        dimension, key = screen.split(':')
+        board = League(dimension, int(key), 'Drama', (LeagueRow(99, 'Test', 3.0, 15.0, 0.5),))
+    league = AsyncMock(return_value=board)
+    hard = AsyncMock(return_value=HardTitles((), ()))
+    monkeypatch.setattr(main, 'league_choices', choices)
+    monkeypatch.setattr(main, 'league', league)
+    monkeypatch.setattr(main, 'hard_titles', hard)
+    profiles = AsyncMock(side_effect=lambda bot, rows, **kwargs: rows)
+    monkeypatch.setattr(main, 'enrich_top_profiles', profiles)
+    update = top_callback(context, f'top:{game}:{screen}', chat_type=chat_type, shown=None)
+
+    async with context.bot:
+        with pytest.warns(PTBUserWarning, match='editMessageText'):
+            await main.inline_top_screen(update, context)
+
+    scope = -123 if chat_type in ('group', 'supergroup') else None
+    if screen == 'hard':
+        hard.assert_awaited_once_with(game, today, scope)
+    elif screen in ('genres', 'decades', 'genre:999'):
+        dimension = 'decade' if screen == 'decades' else 'genre'
+        choices.assert_awaited_once_with(game, dimension, today, scope)
+        if screen == 'genre:999':
+            league.assert_awaited_once_with(game, 'genre', 999, today, scope)
+    else:
+        dimension, key = screen.split(':')
+        league.assert_awaited_once_with(game, dimension, int(key), today, scope)
+        assert board is not None
+        profiles.assert_awaited_once_with(context.bot, board.rows, group_chat_id=scope)
+    assert [endpoint for endpoint, _ in request.calls][-1] == 'answerCallbackQuery'
+    params = next(params for endpoint, params in request.calls if endpoint == 'editMessageText')
+    assert params['chat_id'] == ('99' if chat_type == 'private' else '-123')
+    assert json.loads(params['rich_message'])['skip_entity_detection'] is True

@@ -132,7 +132,7 @@ async def test_startup_batch_retries_all_seventeen_without_resaving_or_text(monk
 
     class Results:
         @staticmethod
-        async def save_result(user_id, framed_round, won, win_frame):
+        async def save_result(user_id, framed_round, won, win_frame, *, chat_id):
             persisted[framed_round] += 1
             return True
 

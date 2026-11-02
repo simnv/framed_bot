@@ -1,11 +1,11 @@
 # ruff: noqa: E402
 # Configure redaction before importing configuration, models, or Telegram.
 import asyncio
+import functools
 import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -20,6 +20,7 @@ from config import ADMIN_USER_ID, BOT_DATA_PATH, BOT_TOKEN, CLIP_MODEL_PATH, DB_
 configure_logging((BOT_TOKEN, DB_CONNECTION_STRING, TMDB_API_KEY or ''))
 
 from telegram import (
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReactionTypeEmoji,
@@ -29,7 +30,7 @@ from telegram import (
     Message as TelegramMessage,
 )
 from telegram.constants import ReactionEmoji
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -57,10 +58,20 @@ from answers.sync import AnswerSync
 from answers.tmdb import TmdbClient, TmdbError
 from insight import Choice, Dimension, game_insight, hard_titles, league, league_choices
 from models import FramedResult, User
+from models.chat_move import move_chat
 from models.episode_result import EpisodeResult
 from models.group import Group
 from models.migrate import upgrade_database
 from models.top import top_results
+from periodic_tops import (
+    FIRST_YEARLY_YEAR,
+    build_messages,
+    deliver,
+    move_markers,
+    parse_period,
+    post_period,
+)
+from periodic_tops import schedule as schedule_periodic_tops
 from reaction_delivery import ReactionDelivery, ReactionIntent
 from rich_tables import (
     TOP_WIN_LABELS,
@@ -290,7 +301,9 @@ EPISODE_FILTER = EpisodeFilter(name='EpisodeFilter')
 
 class ResultSaver(Protocol):
     @staticmethod
-    async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool: ...
+    async def save_result(
+        user_id: int, framed_round: int, won: bool, win_frame: int | None, *, chat_id: int
+    ) -> bool: ...
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,7 +341,9 @@ async def save_results(
     data_won = '🟩' in data_result
     data_win_frame = data_result.count('🟥') + 1 if data_won else None
 
-    saved = await result_class.save_result(effective_user.id, data_round, data_won, data_win_frame)
+    saved = await result_class.save_result(
+        effective_user.id, data_round, data_won, data_win_frame, chat_id=effective_chat.id
+    )
 
     reaction = saved_reaction_for(data_win_frame) if saved else duplicate_result_reaction
 
@@ -356,6 +371,11 @@ class StatsOwner:
     score: None = None
 
 
+def chat_scope(chat: Chat) -> int | None:
+    """A group counts its own results. A private chat merges every chat."""
+    return chat.id if chat.type in ('group', 'supergroup') else None
+
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     effective_user = update.effective_user
     effective_chat = update.effective_chat
@@ -363,7 +383,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if effective_user is None or effective_chat is None or message is None:
         return
 
-    user_stats = await get_user_stats(effective_user.id)
+    scope = chat_scope(effective_chat)
+    user_stats = await get_user_stats(effective_user.id, scope)
 
     if user_stats is None:
         await context.bot.send_message(chat_id=effective_chat.id, text='Я тебя не знаю', reply_to_message_id=message.id)
@@ -380,10 +401,10 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (owner,) = await enrich_top_profiles(
         context.bot,
         [StatsOwner(effective_user.id, effective_user.full_name)],
-        group_chat_id=effective_chat.id if effective_chat.type in ('group', 'supergroup') else None,
+        group_chat_id=scope,
     )
     for game, game_stats in played:
-        insight = await game_insight(effective_user.id, game, today)
+        insight = await game_insight(effective_user.id, game, today, scope)
         await send_rich_message(
             context.bot,
             effective_chat.id,
@@ -444,36 +465,65 @@ async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, _, announcement_text = effective_message.text.partition(' ')
     if not announcement_text:
         return
-    groups = await Group.get_all()
-    for group in groups:
-        for attempt in range(3):
-            try:
-                await context.bot.send_message(chat_id=group.id, text=announcement_text)
-                break
-            except Forbidden:
-                await Group.remove(group.id)
-                logging.info('Removed unavailable announcement recipient %s', group.id)
-                break
-            except BadRequest as error:
-                if str(error).lower() in ('chat not found', 'group chat was deactivated'):
-                    await Group.remove(group.id)
-                logging.warning('Announcement rejected for recipient %s', group.id)
-                break
-            except RetryAfter as error:
-                delay = error.retry_after
-                seconds = delay.total_seconds() if isinstance(delay, timedelta) else delay
-                if attempt == 2 or seconds > 5:
-                    logging.warning('Announcement rate limit exceeded for recipient %s', group.id)
-                    break
-                await asyncio.sleep(seconds)
-            except NetworkError:
-                if attempt == 2:
-                    logging.warning('Announcement network retries exhausted for recipient %s', group.id)
-                    break
-                await asyncio.sleep(attempt + 1)
-            except TelegramError:
-                logging.warning('Announcement failed for recipient %s', group.id)
-                break
+    for group in await Group.get_all():
+        await deliver(group.id, functools.partial(context.bot.send_message, chat_id=group.id, text=announcement_text))
+
+
+async def migrate_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Move results and post markers for either Telegram supergroup migration message."""
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if message.migrate_to_chat_id is not None:
+        old_id, new_id = chat.id, message.migrate_to_chat_id
+    elif message.migrate_from_chat_id is not None:
+        old_id, new_id = message.migrate_from_chat_id, chat.id
+    else:
+        return
+    await move_chat(old_id, new_id)
+    move_markers(context.bot_data, old_id, new_id)
+    await context.application.update_persistence()
+    logging.info('Moved chat %s to %s', old_id, new_id)
+
+
+POST_TOP_USAGE = 'Использование: /post_top <chat_id> <ГГГГ-ММ|ГГГГ> [post]'
+POST_TOP_OUTCOMES: dict[str, str] = {
+    'sent': 'Отправлено',
+    'skipped': 'Нет результатов за период, отмечено как отправленное',
+    'removed': 'Чат недоступен, группа удалена',
+    'failed': 'Не отправлено, попробуй позже',
+}
+
+
+async def post_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Preview a period top, or force-post it to the target chat and persist its markers."""
+    chat = update.effective_chat
+    if chat is None:
+        return
+    args = context.args or []
+    period = parse_period(args[1]) if len(args) in (2, 3) else None
+    if (
+        period is None
+        or period.year < 1
+        or re.fullmatch(r'-?[0-9]{1,19}', args[0]) is None
+        or not -(2**63) <= int(args[0]) < 2**63
+        or (len(args) == 3 and (args[2] != 'post' or (period.kind == 'yearly' and period.year < FIRST_YEARLY_YEAR)))
+    ):
+        await context.bot.send_message(chat_id=chat.id, text=POST_TOP_USAGE)
+        return
+    target = int(args[0])
+    if len(args) == 3:
+        outcome = await post_period(context.bot, context.bot_data, target, period)
+        await context.application.update_persistence()
+        await context.bot.send_message(chat_id=chat.id, text=POST_TOP_OUTCOMES[outcome])
+        return
+    messages = await build_messages(context.bot, target, period)
+    if not messages:
+        await context.bot.send_message(chat_id=chat.id, text='Нет результатов за период')
+        return
+    for message in messages:
+        await send_rich_message(context.bot, chat.id, message)
 
 
 TOP_GAME_NAMES: dict[Game, str] = {'framed': 'Framed', 'episode': 'Episode'}
@@ -570,11 +620,12 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     game: Game = 'framed'
     top_type = TopType.TOP_SCORE
-    results = await top_results(game, top_type)
+    scope = chat_scope(effective_chat)
+    results = await top_results(game, top_type, scope)
     profiles = await enrich_top_profiles(
         context.bot,
         results,
-        group_chat_id=effective_chat.id if effective_chat.type in ('group', 'supergroup') else None,
+        group_chat_id=scope,
     )
     await send_rich_message(
         context.bot,
@@ -595,11 +646,12 @@ async def inline_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
     game, top_type = selected
-    results = await top_results(game, top_type)
+    scope = chat_scope(query_message.chat)
+    results = await top_results(game, top_type, scope)
     profiles = await enrich_top_profiles(
         context.bot,
         results,
-        group_chat_id=query_message.chat_id if query_message.chat.type in ('group', 'supergroup') else None,
+        group_chat_id=scope,
     )
     try:
         await edit_rich_message(
@@ -635,26 +687,27 @@ async def top_screen(
     context: ContextTypes.DEFAULT_TYPE, message: TelegramMessage, game: Game, screen: str
 ) -> tuple[RichMessage, InlineKeyboardMarkup]:
     today = utc_today()
+    scope = chat_scope(message.chat)
     match screen.split(':'):
         case ['genres' | 'decades' as picker]:
             dimension: Dimension = 'genre' if picker == 'genres' else 'decade'
-            choices = await league_choices(game, dimension, today)
+            choices = await league_choices(game, dimension, today, scope)
             return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
         case ['genre' | 'decade' as dimension, key]:
-            board = await league(game, dimension, int(key), today)
+            board = await league(game, dimension, int(key), today, scope)
             back = back_markup(top_screen_data(game, PICKER_SCREENS[dimension]))
             if board is None:
                 # Between two taps, a board can disappear. Then the picker shows the boards that exist now.
-                choices = await league_choices(game, dimension, today)
+                choices = await league_choices(game, dimension, today, scope)
                 return render_league_picker(game, dimension, choices), picker_markup(game, dimension, choices)
             profiles = await enrich_top_profiles(
                 context.bot,
                 board.rows,
-                group_chat_id=message.chat_id if message.chat.type in ('group', 'supergroup') else None,
+                group_chat_id=scope,
             )
             return render_league(game, board, profiles), back
         case _:
-            titles = await hard_titles(game, today)
+            titles = await hard_titles(game, today, scope)
             return render_hard_titles(game, titles), back_markup(top_callback_data(game, TopType.TOP_SCORE))
 
 
@@ -696,6 +749,12 @@ async def inline_top_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
 
+def start_periodic_tops(application: ReactionApplication) -> None:
+    job_queue = application.job_queue
+    if job_queue is not None:
+        schedule_periodic_tops(job_queue)
+
+
 async def initialize_database(
     _application: Application[
         ExtBot[None],
@@ -709,6 +768,7 @@ async def initialize_database(
     await upgrade_database()
     reaction_delivery_for(_application).start()
     start_answers(answer_application_for(_application))
+    start_periodic_tops(answer_application_for(_application))
 
 
 async def stop_reaction_delivery(application: object) -> None:
@@ -747,11 +807,19 @@ def build_application() -> ReactionApplication:
     )
     application.add_handler(set_title_handler)
 
+    post_top_handler = CommandHandler(
+        'post_top', post_top, filters.ChatType.PRIVATE & filters.User(ADMIN_USER_ID), block=False
+    )
+    application.add_handler(post_top_handler)
+
     help_handler = CommandHandler('help', help_command, block=False)
     application.add_handler(help_handler)
 
     chat_update_handler = MessageHandler(filters.ChatType.GROUPS, update_chat_data, block=True)
     application.add_handler(chat_update_handler, -1)
+
+    migrate_handler = MessageHandler(filters.StatusUpdate.MIGRATE, migrate_chat, block=True)
+    application.add_handler(migrate_handler)
 
     framed_data_handler = MessageHandler(filters.ChatType.GROUPS & FRAMED_FILTER, new_framed_data, block=True)
     application.add_handler(framed_data_handler)

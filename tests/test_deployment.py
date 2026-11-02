@@ -328,7 +328,8 @@ def test_postgres_backup_restart_and_container_packaging(tmp_path):
         assert sql('SELECT last_value FROM future_grant_id_seq', database='restore_check').stdout.strip() == '1'
         assert (
             sql(
-                "SELECT count(*) FROM pg_constraint WHERE contype='u' AND pg_get_constraintdef(oid)='UNIQUE (user_id, framed_round)'",
+                "SELECT count(*) FROM pg_constraint WHERE contype='u' "
+                "AND pg_get_constraintdef(oid)='UNIQUE (chat_id, user_id, framed_round)'",
                 database='restore_check',
             ).stdout.strip()
             == '2'
@@ -710,7 +711,7 @@ def test_migration_0004_and_answer_locks_on_a_seeded_database():
         assert summary == {
             'reset': 1917, 'manual_kept': 3, 'titles_kept': True, 'dangling': 0, 'site_kept': 'site',
             'bogus_status_rejected': True, 'bogus_mode_rejected': True, 'parallel_upserts': 'ok',
-            'after_downgrade_site_visual': 2, 'after_downgrade_manual': 4, 'asset_table_dropped': True, 'head': '0007',
+            'after_downgrade_site_visual': 2, 'after_downgrade_manual': 4, 'asset_table_dropped': True, 'head': '0008',
             'unescaped_names': "Sci-Fi & Fantasy|A &lt; B|Drama|O'Neil",
         }
     finally:

@@ -8,14 +8,16 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import CheckConstraint, MetaData, event, func, inspect, insert, select, text
+from sqlalchemy import event, func, insert, inspect, select, text
 from sqlalchemy.exc import IntegrityError
-from telegram import Chat, Message, Update, User as TelegramUser
+from telegram import Chat, Message, Update
+from telegram import User as TelegramUser
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
-from telegram.ext import ContextTypes, ApplicationBuilder, ExtBot
+from telegram.ext import ApplicationBuilder, ContextTypes, ExtBot
 
 import main
 import stats as stats_module
@@ -23,10 +25,11 @@ from models.db import Base, engine
 from models.episode_result import EpisodeResult
 from models.framed_result import FramedResult
 from models.group import Group
-from models.migrate import BASELINE_TABLES, PartialSchemaError, alembic_config, upgrade_database
+from models.migrate import PartialSchemaError, alembic_config, upgrade_database
 from models.user import User
 
 USER_ID = 5_000_000_123
+CHAT_ID = -1001
 
 
 async def drop_schema():
@@ -47,7 +50,13 @@ async def seed_history():
             await conn.execute(
                 insert(model),
                 [
-                    dict(user_id=USER_ID, framed_round=i, won=i % 2 == 0, win_frame=2 if i % 2 == 0 else None)
+                    dict(
+                        chat_id=CHAT_ID,
+                        user_id=USER_ID,
+                        framed_round=i,
+                        won=i % 2 == 0,
+                        win_frame=2 if i % 2 == 0 else None,
+                    )
                     for i in range(600)
                 ],
             )
@@ -105,26 +114,29 @@ async def duplicates():
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Synthetic', False))
     await User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Second', False))
     for model in (FramedResult, EpisodeResult):
-        results = await asyncio.gather(*(model.save_result(USER_ID, 77, True, 2) for _ in range(12)))
+        results = await asyncio.gather(*(model.save_result(USER_ID, 77, True, 2, chat_id=CHAT_ID) for _ in range(12)))
         async with engine.connect() as conn:
             count = (
                 await conn.execute(
-                    text(f'SELECT count(*) FROM {model.__tablename__} WHERE user_id=:id AND framed_round=77'),
-                    {'id': USER_ID},
+                    select(func.count())
+                    .select_from(model)
+                    .where(model.chat_id == CHAT_ID, model.user_id == USER_ID, model.framed_round == 77),
                 )
             ).scalar_one()
         assert sum(results) == count == 1, (model.__tablename__, sum(results), count)
         # Enforce the invariant even for future callers that bypass save_result.
         try:
             async with engine.begin() as conn:
-                await conn.execute(insert(model).values(user_id=USER_ID, framed_round=77, won=False, win_frame=None))
+                await conn.execute(
+                    insert(model).values(chat_id=CHAT_ID, user_id=USER_ID, framed_round=77, won=False, win_frame=None)
+                )
         except IntegrityError:
             pass
         else:
             raise AssertionError(f'{model.__tablename__} has no database uniqueness boundary')
-        assert await model.save_result(USER_ID, 78, False, None)
-        assert await model.save_result(USER_ID, 79, True, 1)
-        assert await model.save_result(USER_ID + 1, 77, True, 3)
+        assert await model.save_result(USER_ID, 78, False, None, chat_id=CHAT_ID)
+        assert await model.save_result(USER_ID, 79, True, 1, chat_id=CHAT_ID)
+        assert await model.save_result(USER_ID + 1, 77, True, 3, chat_id=CHAT_ID)
         print(f'{model.__tablename__}: 12 concurrent saves, 1 success, 1 stored row; direct duplicate rejected')
 
 
@@ -149,7 +161,7 @@ async def aggregate_stats():
         message = Message(
             17,
             datetime.now(UTC),
-            Chat(123, 'group'),
+            Chat(CHAT_ID, 'group'),
             from_user=TelegramUser(USER_ID, 'Synthetic', False),
             text='/stats',
         )
@@ -173,16 +185,20 @@ async def aggregate_stats():
     # history, and the number of statements does not change with the history length.
     assert max(max(0, count) for count in fetched) <= 2, f'/stats materialized history rows: {fetched}'
     assert len(statements) <= 40, f'/stats ran {len(statements)} statements'
-    assert await stats_module.get_user_stats(USER_ID + 1) is None
+    assert await stats_module.get_user_stats(USER_ID + 1, None) is None
     await User.update_from_tg_user(TelegramUser(USER_ID + 1, 'Empty', False))
-    assert await stats_module.get_user_stats(USER_ID + 1) == (
+    assert await stats_module.get_user_stats(USER_ID + 1, None) == (
         stats_module.Stats(0, 0, None, 0, None),
         stats_module.Stats(0, 0, None, 0, None),
     )
     async with engine.begin() as conn:
-        await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=1, won=False, win_frame=None))
-        await conn.execute(insert(EpisodeResult).values(user_id=USER_ID + 1, framed_round=1, won=True, win_frame=3))
-    assert await stats_module.get_user_stats(USER_ID + 1) == (
+        await conn.execute(
+            insert(FramedResult).values(chat_id=CHAT_ID, user_id=USER_ID + 1, framed_round=1, won=False, win_frame=None)
+        )
+        await conn.execute(
+            insert(EpisodeResult).values(chat_id=CHAT_ID, user_id=USER_ID + 1, framed_round=1, won=True, win_frame=3)
+        )
+    assert await stats_module.get_user_stats(USER_ID + 1, None) == (
         stats_module.Stats(1, 0, None, 1, 7.0),
         stats_module.Stats(1, 1, 3.0, 8, 3.0),
     )
@@ -190,19 +206,27 @@ async def aggregate_stats():
     for model, frame in ((FramedResult, None), (FramedResult, 7), (EpisodeResult, 11), (EpisodeResult, 0)):
         try:
             async with engine.begin() as conn:
-                await conn.execute(insert(model).values(user_id=USER_ID + 1, framed_round=2, won=True, win_frame=frame))
+                await conn.execute(
+                    insert(model).values(
+                        chat_id=CHAT_ID, user_id=USER_ID + 1, framed_round=2, won=True, win_frame=frame
+                    )
+                )
         except IntegrityError:
             pass
         else:
             raise AssertionError(f'{model.__tablename__} accepted a winning row with win_frame={frame}')
     try:
         async with engine.begin() as conn:
-            await conn.execute(insert(FramedResult).values(user_id=USER_ID + 1, framed_round=2, won=False, win_frame=2))
+            await conn.execute(
+                insert(FramedResult).values(
+                    chat_id=CHAT_ID, user_id=USER_ID + 1, framed_round=2, won=False, win_frame=2
+                )
+            )
     except IntegrityError:
         pass
     else:
         raise AssertionError('framed_result accepted a lost row with a frame')
-    assert await stats_module.get_user_stats(USER_ID + 1) == (
+    assert await stats_module.get_user_stats(USER_ID + 1, None) == (
         stats_module.Stats(1, 0, None, 1, 7.0),
         stats_module.Stats(1, 1, 3.0, 8, 3.0),
     )
@@ -294,18 +318,17 @@ async def migrations():
     assert version == head and diff == [], (version, diff)
     await upgrade_database()
     assert await schema_state() == (tables, head, [])
-    # A schema that create_all made before Alembic keeps its rows and is adopted at the baseline.
+    # Reproduce the pre-Alembic schema, before chat_id and result checks existed.
     await drop_schema()
     async with engine.begin() as conn:
-        # create_all before Alembic made only the baseline tables, without the checks that later revisions add.
-        legacy = MetaData()
-        for name in BASELINE_TABLES:
-            table = Base.metadata.tables[name].to_metadata(legacy)
-            for constraint in [c for c in table.constraints if isinstance(c, CheckConstraint)]:
-                table.constraints.discard(constraint)
-        await conn.run_sync(legacy.create_all)
+        await conn.run_sync(lambda sync: command.upgrade(alembic_config(sync), '0001'))
+        await conn.execute(text('DROP TABLE alembic_version'))
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Legacy', False))
-    assert await FramedResult.save_result(USER_ID, 1, True, 2)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text('INSERT INTO framed_result (user_id, framed_round, won, win_frame) VALUES (:user, 1, true, 2)'),
+            {'user': USER_ID},
+        )
     await upgrade_database()
     assert await schema_state() == (tables, head, [])
     async with engine.connect() as conn:
@@ -347,7 +370,7 @@ async def answers():
     succession = show(76331, 'Succession', [Credit(2, 'Jesse Armstrong', 'creator', 0)])
     await User.update_from_tg_user(TelegramUser(USER_ID, 'Synthetic', False))
     assert await store.max_result_round('episode') is None
-    assert await EpisodeResult.save_result(USER_ID, 3, True, 2)
+    assert await EpisodeResult.save_result(USER_ID, 3, True, 2, chat_id=CHAT_ID)
     assert await store.max_result_round('episode') == 3
     assert await store.missing_rounds('episode', 3) == [1, 2, 3]
     await store.insert_answers('episode', {1: 'The Wire', 2: 'Succession', 3: 'The Wire'})

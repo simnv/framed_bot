@@ -153,11 +153,13 @@ async def finish_delivery(test_context: RecordedContext) -> None:
 
 def make_result_model(saved: bool):
     class ResultModel:
-        calls: list[tuple[int, int, bool, int | None]] = []
+        calls: list[tuple[int, int, bool, int | None, int]] = []
 
         @staticmethod
-        async def save_result(user_id: int, framed_round: int, won: bool, win_frame: int | None) -> bool:
-            ResultModel.calls.append((user_id, framed_round, won, win_frame))
+        async def save_result(
+            user_id: int, framed_round: int, won: bool, win_frame: int | None, *, chat_id: int
+        ) -> bool:
+            ResultModel.calls.append((user_id, framed_round, won, win_frame, chat_id))
             return saved
 
     return ResultModel
@@ -175,7 +177,7 @@ async def test_save_results_uses_saved_reaction_when_saved(monkeypatch: pytest.M
     await finish_delivery(test_context)
 
     update_from_user.assert_awaited_once_with(update.effective_user)
-    assert result_model.calls == [(99, 42, True, 2)]
+    assert result_model.calls == [(99, 42, True, 2, 123)]
     assert test_context.bot.reaction_calls == [
         ReactionCall(chat_id=123, message_id=456, reaction=main.saved_result_reaction)
     ]
@@ -196,7 +198,7 @@ async def test_save_results_uses_trophy_reaction_when_saved_on_first_frame(
     await main.save_results(update, test_context.context, main.framed_pattern, result_model)
     await finish_delivery(test_context)
 
-    assert result_model.calls == [(99, 42, True, 1)]
+    assert result_model.calls == [(99, 42, True, 1, 123)]
     assert test_context.bot.reaction_calls == [
         ReactionCall(chat_id=123, message_id=456, reaction=main.first_frame_saved_result_reaction)
     ]
@@ -215,7 +217,7 @@ async def test_save_results_uses_duplicate_reaction_when_duplicate(monkeypatch: 
     await main.save_results(update, test_context.context, main.framed_pattern, result_model)
     await finish_delivery(test_context)
 
-    assert result_model.calls == [(99, 42, True, 2)]
+    assert result_model.calls == [(99, 42, True, 2, 123)]
     assert test_context.bot.reaction_calls == [
         ReactionCall(chat_id=123, message_id=456, reaction=main.duplicate_result_reaction)
     ]
@@ -261,7 +263,7 @@ async def test_save_results_uses_only_reactions_for_acknowledgment(
     await main.save_results(update, test_context.context, pattern, result_model)
     await finish_delivery(test_context)
 
-    assert result_model.calls == [(99, 42, True, win_frame)]
+    assert result_model.calls == [(99, 42, True, win_frame, 123)]
     expected_attempts = 3 if isinstance(reaction_error, NetworkError) else 1
     assert (
         test_context.bot.reaction_calls
@@ -378,7 +380,7 @@ async def test_answer_check_error_does_not_change_reaction(monkeypatch: pytest.M
     await main.save_results(make_update(), test_context.context, main.framed_pattern, result_model)
     await finish_delivery(test_context)
 
-    assert result_model.calls == [(99, 42, True, 2)]
+    assert result_model.calls == [(99, 42, True, 2, 123)]
     assert recorder.calls == []
     assert test_context.bot.reaction_calls == [
         ReactionCall(chat_id=123, message_id=456, reaction=main.saved_result_reaction)

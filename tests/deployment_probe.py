@@ -13,6 +13,8 @@ from models.framed_result import FramedResult
 from models.migrate import upgrade_database
 from models.user import User
 
+CHAT_ID = -1001
+
 
 async def result_counts(user_id):
     async with engine.connect() as conn:
@@ -26,10 +28,10 @@ async def main():
     await upgrade_database()
     user_id = 5_000_000_123
     await User.update_from_tg_user(TelegramUser(user_id, 'Integration', False, username='integration'))
-    assert await FramedResult.save_result(user_id, 123, True, 2)
-    assert await EpisodeResult.save_result(user_id, 456, True, 3)
-    assert not await FramedResult.save_result(user_id, 123, True, 2)
-    assert not await EpisodeResult.save_result(user_id, 456, True, 3)
+    assert await FramedResult.save_result(user_id, 123, True, 2, chat_id=CHAT_ID)
+    assert await EpisodeResult.save_result(user_id, 456, True, 3, chat_id=CHAT_ID)
+    assert not await FramedResult.save_result(user_id, 123, True, 2, chat_id=CHAT_ID)
+    assert not await EpisodeResult.save_result(user_id, 456, True, 3, chat_id=CHAT_ID)
     user = await User.get(user_id)
     assert user is not None and user.id == user_id
     assert await result_counts(user_id) == [1, 1]
@@ -38,14 +40,17 @@ async def main():
             (
                 await conn.execute(
                     text(
-                        "SELECT data_type FROM information_schema.columns WHERE (table_name = 'user' AND column_name = 'id') OR (table_name IN ('framed_result', 'episode_result') AND column_name = 'user_id')"
+                        'SELECT data_type FROM information_schema.columns '
+                        "WHERE (table_name = 'user' AND column_name = 'id') "
+                        "OR (table_name IN ('framed_result', 'episode_result') "
+                        "AND column_name IN ('user_id', 'chat_id'))"
                     )
                 )
             )
             .scalars()
             .all()
         )
-        assert types == ['bigint'] * 3
+        assert types == ['bigint'] * 5
     persistence = PicklePersistence(filepath='/data/bot_data')
     await persistence.update_bot_data({'probe': user_id})
     await persistence.flush()
