@@ -14,6 +14,8 @@ from models.top import top_results, top_statement
 from top_type import TopType
 
 FIRST_USER_ID = 5_000_000_123
+CHAT = -100
+OTHER_CHAT = -200
 LOSS = (False, None)
 # A broken row: the player won, but the bot has no frame for the win.
 BROKEN = (True, None)
@@ -59,14 +61,16 @@ def test_framed_and_episode_have_separate_frame_counts():
 def test_top_statement_keeps_row_shape_sorting_and_minimum(game, top_type, score_fragment, order, having):
     table = f'{game}_result'
     miss = {'framed': 7, 'episode': 11}[game]
-    statement = top_statement(game, top_type)
+    statement = top_statement(game, top_type, CHAT)
     assert list(statement.selected_columns.keys()) == ['user_id', 'name', 'score']
     sql = ' '.join(str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True})).split())
-    assert f'{table}.user_id AS user_id' in sql
-    assert f'JOIN "user" ON "user".id = {table}.user_id' in sql
-    assert f'GROUP BY {table}.user_id, "user".full_name' in sql
-    assert score_fragment.format(table=table, miss=miss) in sql
-    assert sql.endswith(order.format(table=table) + ' LIMIT 10')
+    assert 'results.user_id AS user_id' in sql
+    assert f'FROM (SELECT {table}.id AS id, {table}.chat_id AS chat_id' in sql
+    assert f'WHERE {table}.chat_id = -100) AS results' in sql
+    assert 'JOIN "user" ON "user".id = results.user_id' in sql
+    assert 'GROUP BY results.user_id, "user".full_name' in sql
+    assert score_fragment.format(table='results', miss=miss) in sql
+    assert sql.endswith(order.format(table='results') + ' LIMIT 10')
     assert ('HAVING count(*) >= 10' in sql) is having
     other = 'episode_result' if game == 'framed' else 'framed_result'
     assert other not in sql
@@ -80,30 +84,50 @@ async def test_top_results_reads_without_commit(monkeypatch):
     session.__aenter__.return_value = session
     monkeypatch.setattr(top_module, 'AsyncScopedSession', lambda: session)
 
-    assert await top_results('episode', TopType.TOP_ROUNDS) is rows
+    assert await top_results('episode', TopType.TOP_ROUNDS, CHAT) is rows
     session.execute.assert_awaited_once()
     session.commit.assert_not_awaited()
 
 
-async def run_top(monkeypatch, game, top_type, histories, names=None):
+async def run_top(
+    monkeypatch,
+    game,
+    top_type,
+    histories,
+    names=None,
+    *,
+    chat_id=CHAT,
+    rounds=None,
+    min_rounds=top_module.MIN_ROUNDS_FOR_AVERAGE,
+    extra=(),
+):
     """Store one history per user in memory and run the real leaderboard statement on it."""
     with closing(sqlite3.connect(':memory:')) as connection:
         connection.executescript(
             'CREATE TABLE user (id INTEGER PRIMARY KEY, full_name TEXT);'
-            'CREATE TABLE framed_result (user_id INTEGER, framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
-            'CREATE TABLE episode_result (user_id INTEGER, framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
+            'CREATE TABLE framed_result (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, '
+            'framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
+            'CREATE TABLE episode_result (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, '
+            'framed_round INTEGER, won BOOLEAN, win_frame INTEGER);'
         )
         for offset, history in enumerate(histories):
             user_id = FIRST_USER_ID + offset
             name = names[offset] if names else f'User {offset}'
             connection.execute('INSERT INTO user VALUES (?, ?)', (user_id, name))
             connection.executemany(
-                f'INSERT INTO {game}_result VALUES (?, ?, ?, ?)',  # noqa: S608 -- game is a test literal
-                [(user_id, round_id, won, frame) for round_id, (won, frame) in enumerate(history, 1)],
+                f'INSERT INTO {game}_result (chat_id, user_id, framed_round, won, win_frame) VALUES (?, ?, ?, ?, ?)',  # noqa: S608 -- game is a test literal
+                [(CHAT, user_id, round_id, won, frame) for round_id, (won, frame) in enumerate(history, 1)],
             )
+        connection.executemany(
+            f'INSERT INTO {game}_result (chat_id, user_id, framed_round, won, win_frame) VALUES (?, ?, ?, ?, ?)',  # noqa: S608
+            [(chat, FIRST_USER_ID + offset, round_id, won, frame) for chat, offset, round_id, won, frame in extra],
+        )
         other = 'episode' if game == 'framed' else 'framed'
         # A row of the other game must never change this game's leaderboard.
-        connection.execute(f'INSERT INTO {other}_result VALUES (?, 1, 1, 1)', (FIRST_USER_ID,))  # noqa: S608
+        connection.execute(
+            f'INSERT INTO {other}_result (chat_id, user_id, framed_round, won, win_frame) VALUES (?, ?, 1, 1, 1)',  # noqa: S608
+            (CHAT, FIRST_USER_ID),
+        )
 
         async def execute(statement):
             assert statement.is_select
@@ -118,7 +142,7 @@ async def run_top(monkeypatch, game, top_type, histories, names=None):
         session.execute.side_effect = execute
         session.__aenter__.return_value = session
         monkeypatch.setattr(top_module, 'AsyncScopedSession', lambda: session)
-        rows = await top_results(game, top_type)
+        rows = await top_results(game, top_type, chat_id, rounds=rounds, min_rounds=min_rounds)
         session.commit.assert_not_awaited()
         return [(row.user_id - FIRST_USER_ID, row.score) for row in rows]
 
@@ -239,9 +263,56 @@ async def test_player_with_only_broken_rows_is_absent(monkeypatch):
 def test_top_statement_filters_won_rows_without_frame(top_type):
     sql = ' '.join(
         str(
-            top_statement('framed', top_type).compile(
+            top_statement('framed', top_type, CHAT).compile(
                 dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True}
             )
         ).split()
     )
-    assert 'WHERE NOT (framed_result.won IS true AND framed_result.win_frame IS NULL)' in sql
+    assert 'WHERE NOT (results.won IS true AND results.win_frame IS NULL)' in sql
+
+
+def test_merged_scope_keeps_the_first_row_of_each_user_and_round():
+    sql = ' '.join(
+        str(
+            top_statement('framed', TopType.TOP_SCORE, None).compile(
+                dialect=postgresql.dialect(), compile_kwargs={'literal_binds': True}
+            )
+        ).split()
+    )
+    assert (
+        'WHERE framed_result.id IN (SELECT min(framed_result.id) AS min_1 FROM framed_result '
+        'GROUP BY framed_result.user_id, framed_result.framed_round)) AS results'
+    ) in sql
+    assert 'chat_id =' not in sql
+
+
+@pytest.mark.asyncio
+async def test_a_group_counts_only_its_own_results(monkeypatch):
+    histories = [[(True, 1)], [(True, 1)]]
+    extra = [(OTHER_CHAT, 0, 2, True, 1), (OTHER_CHAT, 0, 3, True, 1)]
+    assert await run_top(monkeypatch, 'framed', TopType.TOP_ROUNDS, histories, extra=extra) == [(0, 1), (1, 1)]
+    assert await run_top(monkeypatch, 'framed', TopType.TOP_ROUNDS, histories, chat_id=OTHER_CHAT, extra=extra) == [
+        (0, 2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_private_chat_merges_chats_and_the_first_saved_row_wins(monkeypatch):
+    # User 0 posted round 1 first in CHAT (frame 1, id 1) and later in OTHER_CHAT (a loss).
+    histories = [[(True, 1)]]
+    extra = [(OTHER_CHAT, 0, 1, False, None), (OTHER_CHAT, 0, 2, True, 6)]
+    assert await run_top(monkeypatch, 'framed', TopType.TOP_SCORE, histories, chat_id=None, extra=extra) == [(0, 7)]
+    assert await run_top(monkeypatch, 'framed', TopType.TOP_SCORE, histories, chat_id=OTHER_CHAT, extra=extra) == [
+        (0, 2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_round_range_and_frame_gate_limit_a_period_board(monkeypatch):
+    # Rounds 1-6: user 0 wins frame 1; rounds 4-6 only: user 1 wins frame 2.
+    histories = [[(True, 1)] * 6, [LOSS, LOSS, LOSS, (True, 2), (True, 2), (True, 2)]]
+    rows = await run_top(monkeypatch, 'framed', TopType.TOP_FRAME, histories, rounds=range(4, 7), min_rounds=2)
+    assert rows == [(0, 1.0), (1, 2.0)]
+    rows = await run_top(monkeypatch, 'framed', TopType.TOP_ROUNDS, histories, rounds=range(4, 7))
+    assert rows == [(0, 3), (1, 3)]
+    assert await run_top(monkeypatch, 'framed', TopType.TOP_ROUNDS, histories, rounds=range(7, 9)) == []

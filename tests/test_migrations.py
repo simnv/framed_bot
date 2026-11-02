@@ -171,3 +171,55 @@ def test_revision_0007_downgrade_changes_only_the_version() -> None:
 
     assert 'UPDATE genre' not in sql and 'UPDATE title' not in sql
     assert "UPDATE alembic_version SET version_num='0006' WHERE alembic_version.version_num = '0007'" in sql
+
+
+RESULT_TABLES = ('framed_result', 'episode_result')
+BACKFILL_CHAT_ID = -1001390409915
+
+
+def test_revision_0008_adds_chat_id_backfills_and_swaps_the_unique_keys() -> None:
+    sql = offline_sql('upgrade', '0007:0008')
+
+    for table in RESULT_TABLES:
+        add = sql.index(f'ALTER TABLE {table} ADD COLUMN chat_id BIGINT')
+        fill = sql.index(f'UPDATE {table} SET chat_id = {BACKFILL_CHAT_ID}')  # noqa: S608 - fixed test names
+        not_null = sql.index(f'ALTER TABLE {table} ALTER COLUMN chat_id SET NOT NULL')
+        index = sql.index(f'CREATE INDEX ix_{table}_chat_id ON {table} (chat_id)')
+        drop = sql.index(f'ALTER TABLE {table} DROP CONSTRAINT {table}_user_id_framed_round_key')
+        add_key = sql.index(
+            f'ALTER TABLE {table} ADD CONSTRAINT {table}_chat_id_user_id_framed_round_key '
+            'UNIQUE (chat_id, user_id, framed_round)'
+        )
+        assert add < fill < not_null < index < drop < add_key
+    assert 'DELETE' not in sql and 'DROP TABLE' not in sql
+    assert sql.count('DROP CONSTRAINT') == 2
+    assert "UPDATE alembic_version SET version_num='0008' WHERE alembic_version.version_num = '0007'" in sql
+
+
+def test_revision_0008_downgrade_keeps_the_first_row_of_each_user_and_round() -> None:
+    sql = offline_sql('downgrade', '0008:0007')
+
+    for table in RESULT_TABLES:
+        drop_key = sql.index(f'ALTER TABLE {table} DROP CONSTRAINT {table}_chat_id_user_id_framed_round_key')
+        dedupe = sql.index(
+            f'DELETE FROM {table} WHERE id NOT IN (SELECT min(id) FROM {table} GROUP BY user_id, framed_round)'  # noqa: S608
+        )
+        old_key = sql.index(
+            f'ALTER TABLE {table} ADD CONSTRAINT {table}_user_id_framed_round_key UNIQUE (user_id, framed_round)'
+        )
+        drop_column = sql.index(f'ALTER TABLE {table} DROP COLUMN chat_id')
+        assert drop_key < dedupe < old_key < drop_column
+        assert f'DROP INDEX ix_{table}_chat_id' in sql
+
+
+def test_result_models_declare_chat_id_and_the_per_chat_unique_key() -> None:
+    from sqlalchemy import BigInteger, UniqueConstraint
+
+    from models import Base
+
+    for table in RESULT_TABLES:
+        column = Base.metadata.tables[table].columns['chat_id']
+        assert isinstance(column.type, BigInteger) and not column.nullable and column.index
+        unique = next(c for c in Base.metadata.tables[table].constraints if isinstance(c, UniqueConstraint))
+        assert unique.name == f'{table}_chat_id_user_id_framed_round_key'
+        assert [c.name for c in unique.columns] == ['chat_id', 'user_id', 'framed_round']
