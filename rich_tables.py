@@ -6,7 +6,7 @@ Use the public do_api_request bridge until PTB exposes sendRichMessage directly.
 
 import asyncio
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html import escape, unescape
 from typing import Literal, Protocol, TypedDict, TypeGuard
@@ -286,6 +286,42 @@ def render_top(game: Game, top_type: TopType, results: Sequence[TopResult]) -> R
     if not results:
         html += '<p>Пока нет результатов.</p>'
     html += f'<p>{_top_explanation(game, top_type)}</p>'
+    return {'html': html, 'skip_entity_detection': True}
+
+
+_PERIOD_BOARDS: tuple[tuple[TopType, str], ...] = (
+    (TopType.TOP_SCORE, 'Очки'),
+    (TopType.TOP_FRAME, 'Средний кадр'),
+    (TopType.TOP_WIN, ''),
+    (TopType.TOP_ROUNDS, 'Участия'),
+)
+
+
+def render_period_top(
+    game: Game,
+    heading: str,
+    rounds_line: str,
+    boards: Mapping[TopType, Sequence[TopResult]],
+    *,
+    frame_gate: int,
+) -> RichMessage:
+    """One static message with the four boards of a period. The rows are already ranked."""
+    html = f'<h3>{escape(heading)}</h3><p>{escape(rounds_line)}</p>'
+    for top_type, column in _PERIOD_BOARDS:
+        column = column or TOP_WIN_LABELS[game]
+        results = boards.get(top_type, ())
+        rows = [
+            (rank, _profile_name(result), _average(result.score) if top_type == TopType.TOP_FRAME else result.score)
+            for rank, result in enumerate(results, 1)
+        ]
+        html += f'<p><b>{column}</b></p>'
+        html += _table(('#', 'Имя', column), rows, alignments=('center', 'left', 'center'))
+        if not results:
+            html += '<p>Пока нет результатов.</p>'
+    html += (
+        f'<p>Очки и кадры считаются как в /top. В таблицу среднего кадра попадают игроки, '
+        f'у которых не меньше {frame_gate} раундов за период.</p>'
+    )
     return {'html': html, 'skip_entity_detection': True}
 
 
